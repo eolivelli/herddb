@@ -148,4 +148,15 @@ public class OptimizerTaskTest {
     public void schemaVersionFieldIsOneByDefault() {
         assertEquals(1, sampleTask().getSchemaVersion());
     }
+
+    @Test
+    public void missingStateFieldDefaultsToPending() throws Exception {
+        // Forward-rolled writer or buggy producer may emit a JSON without
+        // "state" — the @JsonCreator must default to PENDING rather than NPE.
+        String json = "{\"taskId\":\"t\",\"tablespaceUuid\":\"ts\",\"indexUuid\":\"ix\","
+                + "\"attempts\":0,\"createdAtEpochMillis\":0,\"leaderEpoch\":0,"
+                + "\"targetOwnerInstanceId\":0}";
+        OptimizerTask t = OptimizerTask.deserialize(json.getBytes(StandardCharsets.UTF_8));
+        assertEquals(OptimizerTaskState.PENDING, t.getState());
+    }
 }

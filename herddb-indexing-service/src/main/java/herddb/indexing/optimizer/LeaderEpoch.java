@@ -44,6 +44,9 @@ public final class LeaderEpoch {
 
     public static final String SUBPATH_PREFIX = "/index-optimizer/leader-epoch-";
 
+    /** Bounded retry budget for the rare bump-then-delete race (see {@link #bumpEpoch}). */
+    private static final int CREATE_RACE_RETRIES = 3;
+
     private final Supplier<ZooKeeper> zkSupplier;
     private final String optimizerRootPath;
     private final String path;
@@ -52,7 +55,7 @@ public final class LeaderEpoch {
         this.zkSupplier = Objects.requireNonNull(zkSupplier, "zkSupplier");
         Objects.requireNonNull(basePath, "basePath");
         Objects.requireNonNull(tablespaceUuid, "tablespaceUuid");
-        this.optimizerRootPath = basePath + "/index-optimizer";
+        this.optimizerRootPath = basePath + OptimizerTaskRegistry.OPTIMIZER_SUBPATH;
         this.path = basePath + SUBPATH_PREFIX + tablespaceUuid;
     }
 
@@ -87,27 +90,39 @@ public final class LeaderEpoch {
      * (a stale leader) can abort its tick.
      */
     public long bumpEpoch() throws OptimizerTaskRegistryException {
+        // Bounded retry loop to absorb the rare race where the znode is created
+        // by another bumper and then deleted by a third party (or recreated)
+        // before our inner re-read sees it. Each iteration covers one full
+        // read → CAS or create attempt. Steady-state happy path completes on
+        // the first iteration.
         try {
-            Stat stat = new Stat();
-            byte[] data;
-            try {
-                data = zk().getData(path, false, stat);
-            } catch (KeeperException.NoNodeException missing) {
-                // First-ever bump: create the parent optimizer-root and the
-                // epoch znode with value 1.
-                ensureOptimizerRoot();
+            for (int attempt = 0; attempt < CREATE_RACE_RETRIES; attempt++) {
+                Stat stat = new Stat();
+                byte[] data;
                 try {
-                    zk().create(path, encode(1L), ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
-                    return 1L;
-                } catch (KeeperException.NodeExistsException raceLost) {
-                    // Another bumper won the create race; re-read and retry the
-                    // setData branch instead of returning a stale "1L".
                     data = zk().getData(path, false, stat);
+                } catch (KeeperException.NoNodeException missing) {
+                    ensureOptimizerRoot();
+                    try {
+                        zk().create(path, encode(1L), ZooDefs.Ids.OPEN_ACL_UNSAFE,
+                                CreateMode.PERSISTENT);
+                        return 1L;
+                    } catch (KeeperException.NodeExistsException raceLost) {
+                        // Another bumper won the create race; loop around so the
+                        // top-of-loop getData re-reads with a fresh Stat. If the
+                        // znode is deleted again between our create and re-read
+                        // we'll retry up to CREATE_RACE_RETRIES times before
+                        // surfacing the failure.
+                        continue;
+                    }
                 }
+                long next = parseEpoch(data) + 1L;
+                zk().setData(path, encode(next), stat.getVersion());
+                return next;
             }
-            long next = parseEpoch(data) + 1L;
-            zk().setData(path, encode(next), stat.getVersion());
-            return next;
+            throw new OptimizerTaskRegistryException(
+                    "failed to bump leader epoch at " + path + " after "
+                            + CREATE_RACE_RETRIES + " retries (create-delete race)");
         } catch (KeeperException.BadVersionException e) {
             throw new OptimizerTaskRegistryException.VersionMismatch("leader-epoch", -1);
         } catch (KeeperException | InterruptedException e) {

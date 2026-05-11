@@ -95,7 +95,10 @@ public final class OptimizerTask {
                 ? Collections.emptyMap()
                 : Map.copyOf(inputSegmentExpectedVersions);
         this.targetOwnerInstanceId = targetOwnerInstanceId;
-        this.state = Objects.requireNonNull(state, "state");
+        // Default missing/null state to PENDING — matches the builder default
+        // and ensures a forward-rolled writer that drops the field still
+        // deserialises into a legal task instead of NPE inside @JsonCreator.
+        this.state = state == null ? OptimizerTaskState.PENDING : state;
         this.attempts = attempts;
         this.lastError = lastError;
         this.claim = claim;

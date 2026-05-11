@@ -293,4 +293,21 @@ public class OptimizerTaskRegistryIntegrationTest {
         assertNotNull(registry.getRegistryRootPath());
         assertTrue(registry.getRegistryRootPath().endsWith("/index-optimizer/tasks"));
     }
+
+    @Test
+    public void corruptedTaskZnodeSurfacesAsTypedException() throws Exception {
+        // Pre-create a real task so the path layout exists.
+        registry.createTask(sampleTask("t-corrupt"));
+        String taskPath = registry.taskPath(TS_UUID, "t-corrupt");
+        // Overwrite the task's payload with bytes that are not valid OptimizerTask JSON.
+        zk.setData(taskPath, "{not valid json}".getBytes(), -1);
+        try {
+            registry.getTask(TS_UUID, "t-corrupt");
+            fail("expected OptimizerTaskRegistryException");
+        } catch (OptimizerTaskRegistryException ok) {
+            // expected — typed exception wraps the underlying IOException
+            assertTrue("message must mention the task id, got: " + ok.getMessage(),
+                    ok.getMessage().contains("t-corrupt"));
+        }
+    }
 }

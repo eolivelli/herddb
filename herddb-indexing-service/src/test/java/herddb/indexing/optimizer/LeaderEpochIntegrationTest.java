@@ -193,4 +193,48 @@ public class LeaderEpochIntegrationTest {
             // expected
         }
     }
+
+    @Test
+    public void parallelFirstBumpAcrossTwoThreadsYieldsOneAndTwo() throws Exception {
+        // Two threads race the first bump on a non-existing znode. Both must
+        // return a legal value; the set {1, 2} must be observed and the final
+        // currentEpoch() must be 2 (no lost increments).
+        LeaderEpoch a = new LeaderEpoch(() -> zk, BASE_PATH, TS_UUID);
+        ZooKeeper zk2 = openZk();
+        try {
+            LeaderEpoch b = new LeaderEpoch(() -> zk2, BASE_PATH, TS_UUID);
+            java.util.concurrent.CountDownLatch starter = new java.util.concurrent.CountDownLatch(1);
+            java.util.concurrent.atomic.AtomicLong fromA = new java.util.concurrent.atomic.AtomicLong(-1);
+            java.util.concurrent.atomic.AtomicLong fromB = new java.util.concurrent.atomic.AtomicLong(-1);
+            Thread tA = new Thread(() -> {
+                try {
+                    starter.await();
+                    fromA.set(a.bumpEpoch());
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+            Thread tB = new Thread(() -> {
+                try {
+                    starter.await();
+                    fromB.set(b.bumpEpoch());
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+            tA.start();
+            tB.start();
+            starter.countDown();
+            tA.join(10_000);
+            tB.join(10_000);
+            assertTrue("both threads must complete", !tA.isAlive() && !tB.isAlive());
+            java.util.TreeSet<Long> observed = new java.util.TreeSet<>();
+            observed.add(fromA.get());
+            observed.add(fromB.get());
+            assertEquals(java.util.Set.of(1L, 2L), observed);
+            assertEquals(2L, a.currentEpoch());
+        } finally {
+            zk2.close();
+        }
+    }
 }
