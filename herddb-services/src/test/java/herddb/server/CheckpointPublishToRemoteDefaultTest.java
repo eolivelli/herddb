@@ -35,6 +35,7 @@ import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Properties;
+import java.util.stream.Stream;
 import org.apache.curator.test.TestingServer;
 import org.junit.Rule;
 import org.junit.Test;
@@ -186,7 +187,7 @@ public class CheckpointPublishToRemoteDefaultTest {
      * so we scan recursively).
      */
     private static boolean latestCheckpointExists(Path rootDir) throws IOException {
-        try (java.util.stream.Stream<Path> stream = Files.walk(rootDir)) {
+        try (Stream<Path> stream = Files.walk(rootDir)) {
             return stream.anyMatch(p -> p.getFileName() != null
                     && "latest.checkpoint".equals(p.getFileName().toString())
                     && p.getParent() != null
@@ -196,7 +197,7 @@ public class CheckpointPublishToRemoteDefaultTest {
 
     private Properties loadClusterProps(String zkAddress, String zkPath) throws Exception {
         Properties props = new Properties();
-        try (InputStream in = SimpleClusterTest.class.getResourceAsStream(
+        try (InputStream in = CheckpointPublishToRemoteDefaultTest.class.getResourceAsStream(
                 "/conf/test.server_cluster.properties")) {
             props.load(in);
         }

@@ -195,7 +195,14 @@ public final class ServerConfiguration {
 
     /**
      * When true, the leader publishes checkpoint metadata to remote storage (S3)
-     * so that shared-storage read replicas can consume it.
+     * so that shared-storage read replicas and the Index Optimizer can consume it.
+     *
+     * <p>This static constant ({@code false}) is the default for
+     * {@code storage.mode=local} and {@code storage.mode=memory}.
+     * When {@code storage.mode=remote}, {@link herddb.server.Server#buildDataStorageManager}
+     * overrides the effective runtime default to {@code true} so that the Index Optimizer
+     * works out of the box without requiring an explicit operator setting.
+     * Operators can still set the property to {@code false} explicitly to suppress publication.
      */
     public static final String PROPERTY_CHECKPOINT_PUBLISH_TO_REMOTE = "server.checkpoint.publish.to.remote";
     public static final boolean PROPERTY_CHECKPOINT_PUBLISH_TO_REMOTE_DEFAULT = false;
