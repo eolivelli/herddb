@@ -201,6 +201,33 @@ public final class OptimizerConfiguration {
             "indexoptimizer.remote.file.client.max.inflight.write.bytes";
     public static final long PROPERTY_REMOTE_FILE_MAX_INFLIGHT_WRITE_BYTES_DEFAULT = 256L * 1024L * 1024L;
 
+    // -------------------------------------------------------------------------
+    // K-way single-pass merge (issue #524)
+    // -------------------------------------------------------------------------
+
+    /**
+     * K-way merge max (issue #524). When {@code >= 2}, the
+     * {@link MergePolicy.AggressivePolicy} picks up to this many sub-target
+     * segments per cycle and merges them in a single pass, bypassing the
+     * {@code perCycleMaxBytes} cap. This collapses N segments into one merge
+     * round instead of the O(N) rounds that the byte-cap forces, cutting
+     * cumulative vector-processing work from O(N²) to O(N).
+     *
+     * <p>Default {@code 0} (disabled = legacy byte-cap mode): existing deployments
+     * are not silently affected by the larger per-cycle input footprint that k-way
+     * implies. Operators opt in by setting this to {@code >= 2} (recommended
+     * {@code 8} for the gist1m / 8-initial-segments workload that motivated the
+     * issue; raise further for tablespaces with more initial segments) once they
+     * have verified the optimizer pod has sufficient heap and local disk for the
+     * fan-in. Set back to {@code 0} to revert to legacy byte-cap behaviour
+     * ({@code perCycleMaxBytes} re-applies).
+     *
+     * <p>The hard ceiling {@code optimizer.merge.max.count} (default 200) is
+     * always respected regardless of this setting.
+     */
+    public static final String PROPERTY_MERGE_KWAY_MAX = "indexoptimizer.merge.kway.max";
+    public static final int PROPERTY_MERGE_KWAY_MAX_DEFAULT = 0;
+
     private final Properties properties;
 
     public OptimizerConfiguration(Properties properties) {
