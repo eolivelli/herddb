@@ -134,7 +134,7 @@ public class IndexOptimizerEngineKwayMergeTest {
         volatile Runnable mergeHook;
 
         @Override
-        public SegmentMetadata merge(List<SegmentMetadata> inputs, int newOwnerInstance) {
+        public SegmentMetadata merge(List<SegmentMetadata> inputs, int newOwnerInstance) throws Exception {
             invocations.incrementAndGet();
             lastInputCount.set(inputs.size());
             Runnable hook = mergeHook;
@@ -142,6 +142,11 @@ public class IndexOptimizerEngineKwayMergeTest {
                 hook.run();
             }
             return delegate.merge(inputs, newOwnerInstance);
+        }
+
+        @Override
+        public void abandon(SegmentMetadata produced) {
+            delegate.abandon(produced);
         }
 
         int getInvocations() {
@@ -332,5 +337,8 @@ public class IndexOptimizerEngineKwayMergeTest {
         assertEquals("7 inputs remain ACTIVE (seg-1..seg-7)", 7L, activeCount);
         assertEquals("seg-0 is TRANSFERRING (drifted)", 1L, transferringCount);
         assertEquals("no other znodes created (output must be abandoned)", 8L, all.size());
+
+        // Verify the hook captured "seg-0" (round-trip check on the UUID).
+        assertEquals("drift hook captured seg-0's UUID", "seg-0", firstInputUuid.get());
     }
 }
