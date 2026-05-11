@@ -19,9 +19,11 @@
  */
 package herddb.indexing.optimizer;
 
+import java.util.Collections;
 import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.regex.PatternSyntaxException;
 
 /**
  * Identifies whether the current optimizer pod is the leader (produces and may
@@ -52,6 +54,9 @@ public enum OptimizerRole {
     WORKER;
 
     public static OptimizerRole detect(OptimizerConfiguration configuration, Map<String, String> env) {
+        if (env == null) {
+            env = Collections.emptyMap();
+        }
         String explicit = configuration.getString(
                 OptimizerConfiguration.PROPERTY_ROLE_IS_LEADER,
                 OptimizerConfiguration.PROPERTY_ROLE_IS_LEADER_DEFAULT);
@@ -97,7 +102,7 @@ public enum OptimizerRole {
         Matcher matcher;
         try {
             matcher = Pattern.compile(regex).matcher(hostname);
-        } catch (java.util.regex.PatternSyntaxException badPattern) {
+        } catch (PatternSyntaxException badPattern) {
             return null;
         }
         if (!matcher.matches() || matcher.groupCount() < 1) {

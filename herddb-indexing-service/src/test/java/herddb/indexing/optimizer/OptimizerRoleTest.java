@@ -133,4 +133,10 @@ public class OptimizerRoleTest {
         assertEquals(OptimizerRole.WORKER,
                 OptimizerRole.detect(cfg(new Properties()), env("POD_ORDINAL", "-1")));
     }
+
+    @Test
+    public void nullEnvTreatedAsEmpty() {
+        assertEquals(OptimizerRole.WORKER,
+                OptimizerRole.detect(cfg(new Properties()), null));
+    }
 }

@@ -30,6 +30,7 @@ package herddb.indexing.optimizer;
  * {@link SegmentMerger#merge(java.util.List, int)} when stamping the output
  * segment.
  */
+@FunctionalInterface
 public interface OwnerSelector {
 
     /**

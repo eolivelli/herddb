@@ -21,6 +21,7 @@ package herddb.indexing.optimizer;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.function.IntSupplier;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -47,7 +48,7 @@ public final class OwnerSelectorFactory {
         String policy = configuration.getString(
                 OptimizerConfiguration.PROPERTY_OWNER_SELECTOR_POLICY,
                 OptimizerConfiguration.PROPERTY_OWNER_SELECTOR_POLICY_DEFAULT);
-        switch (policy.trim().toUpperCase(java.util.Locale.ROOT)) {
+        switch (policy.trim().toUpperCase(Locale.ROOT)) {
             case "FIXED_ZERO":
                 return new Fixed0OwnerSelector();
             case "ROUND_ROBIN":
