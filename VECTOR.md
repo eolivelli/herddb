@@ -68,7 +68,7 @@ HerdDB's vector indexing uses a **two-component architecture** where vector inde
 
 5. **DML parallelism via striped workers.** The `IndexingServiceEngine` routes DML from committed transactions to a pool of single-threaded apply workers, striped by PK hash, ensuring per-key ordering while exploiting multi-core throughput.
 
-6. **Pluggable compaction (segmented-v2).** When `indexing.optimizer.enabled=true`, segments are registered in a ZooKeeper registry with mutable per-segment ownership and compaction is offloaded to a singleton `index-optimizer` service. Tombstones live in a per-segment overlay file in remote storage so segments stay byte-immutable across ownership transfers. See [Segmented-v2: external `index-optimizer` service & movable segment ownership](#segmented-v2-external-index-optimizer-service--movable-segment-ownership) for the full design.
+6. **Pluggable compaction (segmented-v2).** When `indexing.optimizer.enabled=true`, segments are registered in a ZooKeeper registry with mutable per-segment ownership and compaction is offloaded to the `index-optimizer` service — **horizontally scalable** since the horizontal-scale refactor (leader at pod ordinal 0 produces tasks via a ZK-backed task queue; pods 1..N-1 are pure workers; `LeastLoadedOwnerSelector` distributes merge-output ownership across the live indexing-service instances). Tombstones live in a per-segment overlay file in remote storage so segments stay byte-immutable across ownership transfers. See [Segmented-v2: external `index-optimizer` service & movable segment ownership](#segmented-v2-external-index-optimizer-service--movable-segment-ownership) for the full design.
 
 ---
 
@@ -646,7 +646,7 @@ Legacy compaction (above) keeps every segment glued to the IS instance that crea
 
 1. **Segments have a globally-unique UUID and live in a ZooKeeper registry.** Each sealed segment is registered at `/{basePath}/index-segments/{tablespaceUuid}/{indexUuid}/{segmentUuid}` with full metadata: state, owner instance, S3 paths for graph/map/tombstone overlay, LSN watermarks, generation, `replacedBy` lineage, retention deadline.
 2. **Segment ownership is mutable.** A CAS protocol on the znode moves a segment from one IS instance to another with no data loss and continuous read availability (a brief read-overlap is tolerated; the server-side `SearchResultMerger` dedups duplicate PKs by keeping the highest score).
-3. **Compaction runs in a dedicated singleton service, `index-optimizer`.** Packaged in `herddb-services` and deployed via the Helm chart as a StatefulSet with `replicas: 1` and a `tmp` PVC. The optimizer scans the registry, applies a merge policy, runs the merge, and drives the registry-side state machine. The IS suppresses its in-process compaction loop in this mode.
+3. **Compaction runs in a dedicated horizontally-scalable service, `index-optimizer`.** Packaged in `herddb-services` and deployed via the Helm chart as a StatefulSet with templated `replicas` (leader at pod ordinal 0 produces merge tasks via a ZK-backed task queue; pods 1..N-1 are pure workers) and a per-pod `tmp` PVC. The leader scans the registry, applies a merge policy, picks the target indexing-service owner for each output via a configurable `OwnerSelector`, and enqueues task znodes; workers claim and execute the merges, driving the registry-side state machine. The IS suppresses its in-process compaction loop in this mode.
 
 This is **greenfield-only**: existing legacy indexes continue to use the in-IS compaction path and the `IndexStatus`-based segment list. Indexes created after the upgrade with `indexing.optimizer.enabled=true` opt into the segmented-v2 model.
 
@@ -698,7 +698,15 @@ A separate JVM, packaged inside `herddb-services` and launched via:
 /opt/herddb/bin/service index-optimizer console /opt/herddb/conf/indexoptimizer.properties
 ```
 
-The service is a singleton per tablespace: Helm enforces it with `replicas: 1` on the StatefulSet (`herddb-kubernetes/.../templates/index-optimizer-statefulset.yaml`), and an `OptimizerLeaderLock` ephemeral znode at `/{basePath}/index-optimizer/leader-{tablespaceUuid}` guards against a stray second optimizer racing on the same tablespace during a rolling upgrade. A loser of the leader-lock race idles harmlessly; even without the lock, no corruption is possible because every state transition is a ZK CAS.
+The service is **horizontally scalable** since the horizontal-scale refactor: Helm renders a StatefulSet with templated `replicas` (`herddb-kubernetes/.../templates/index-optimizer-statefulset.yaml`). **Pod ordinal 0** is the **leader** — it scans the segment registry, picks merge candidates via the `MergePolicy`, chooses the target indexing-service instance for each output via a configurable `OwnerSelector` (default `LEAST_LOADED`), and enqueues a task znode under `/{basePath}/index-optimizer/tasks/{tablespaceUuid}/{taskId}`. **Pods 1..N-1** are pure **workers** — they watch the task path, claim the oldest PENDING task by creating an ephemeral `lease` child, run the merge, publish the output, CAS-deprecate the inputs, and mark the task DONE. With `replicas=1` the single pod plays both roles; behaviour is equivalent to the pre-step-7 deployment.
+
+Three fencing primitives guard the leader / worker invariants:
+
+* **`OptimizerLeaderLock`** — the existing ephemeral znode at `/{basePath}/index-optimizer/leader-{tablespaceUuid}` is retained as a liveness fence between successive leader pods during rolling upgrades.
+* **`LeaderEpoch`** — a new monotonic PERSISTENT znode at `/{basePath}/index-optimizer/leader-epoch-{tablespaceUuid}` CAS-bumped at every producer tick. A stale leader whose tick hits BadVersion aborts before enqueueing any task.
+* **Task znode version + ephemeral lease** — every state transition on a task (PENDING→CLAIMED→DONE/FAILED) is a CAS on the task znode's version. A CAS-loser worker deletes its own lease and retries. The lease is a liveness signal: when it vanishes (worker session expired / process died), the leader's `OptimizerOrphanScanner` resets the task to PENDING (with `attempts++` → POISON at the configured max) so another worker can claim it.
+
+**Failure-recovery contract.** Input segments are NEVER mutated until the merge output is published. Every failure path (worker crash, ZK session expiry, revalidate failure, merger throw) leaves the inputs in their ACTIVE state — they get re-picked on the next leader tick. When a worker dies AFTER it has begun deprecating inputs but before all CAS updates complete, the orphan scanner observes "at least one input already DEPRECATED" and deletes the task znode entirely; the engine's stateless re-pick then folds any remaining ACTIVE inputs into a follow-up merge.
 
 `IndexOptimizerEngine.runOnce()` runs once per scheduled tick:
 
@@ -804,6 +812,18 @@ Optimizer-side (`OptimizerConfiguration`, `conf/indexoptimizer.properties`):
 | `indexoptimizer.remote.file.servers` | *(empty)* | Comma-separated static RFS list. Empty → discover via ZK watch on `/{basePath}/fileServers` and late-bind the merger (#507). |
 | `indexoptimizer.remote.file.client.timeout` | `60` | Per-call gRPC deadline (seconds) for `RemoteFileClient`. |
 | `indexoptimizer.remote.file.client.retries` | `3` | Retry budget for idempotent `RemoteFileClient` ops. |
+| `indexoptimizer.role.is.leader` | `auto` | Pod role override. `auto` (default) → `POD_ORDINAL` env var → hostname regex fallback. `true` / `false` forces LEADER / WORKER (test convenience). |
+| `indexoptimizer.role.pod.ordinal.env` | `POD_ORDINAL` | Name of the env var carrying this pod's StatefulSet ordinal. Helm wires this from `metadata.labels['apps.kubernetes.io/pod-index']`. |
+| `indexoptimizer.role.hostname.ordinal.regex` | `^.*-(\d+)$` | Fallback regex extracting the ordinal from `HOSTNAME` when the env var is absent. |
+| `indexoptimizer.role.leader.execute.tasks` | `true` | When `false` the leader produces tasks but never consumes them — "dedicated scheduler" mode, also used by the K8s multi-replica acceptance test to prove a worker pod actually does the merge work. |
+| `indexoptimizer.owner.selector.policy` | `LEAST_LOADED` | Owner-selection policy: `LEAST_LOADED` (load-aware via the registry-backed probe), `ROUND_ROBIN`, `STATIC` (CSV), `FIXED_ZERO` (legacy). |
+| `indexoptimizer.owner.selector.static.assignment` | *(empty)* | Comma-separated CSV of instance ordinals consumed cyclically when policy = `STATIC`. |
+| `indexoptimizer.indexing.num.instances` | `0` | Number of indexing-service instances fallback when ZK ephemerals are empty. `0` (default) → require ZK discovery. |
+| `indexoptimizer.tasks.max.attempts` | `3` | Maximum retries before a failed task is POISONed. |
+| `indexoptimizer.tasks.orphan.reset.ms` | `120000` | Window after which a CLAIMED task with no live lease ephemeral is reclaimed. MUST be ≥ 2 × `zookeeper.session.timeout` (startup-time validation). |
+| `indexoptimizer.tasks.terminal.retention.ms` | `3600000` (1 h) | GC window for terminal DONE/FAILED tasks. |
+| `indexoptimizer.tasks.poison.retention.ms` | `604800000` (7 d) | GC window for POISON tasks (longer so operators have time to investigate). |
+| `indexoptimizer.consumer.max.tasks.per.tick` | `4` | Maximum tasks each pod drains per scheduler tick. Bounds drain time so the leader's producer step still gets cycles. |
 
 Helm values (`indexOptimizer.*`):
 

@@ -7,14 +7,16 @@ metadata:
     {{- include "herddb.labels" . | nindent 4 }}
     app.kubernetes.io/component: index-optimizer
 spec:
-  # Singleton: at most one optimizer per cluster (per the user-approved plan).
-  # Helm replicas: 1 is the only enforcement mechanism — there is no in-process
-  # ZK leader-election to keep the bootstrap simple. Two pods running briefly
-  # during a rolling upgrade will compete on the registry CAS but cannot
-  # corrupt anything.
-  replicas: 1
+  # Horizontal scalability (step 9): replicas is templated. Pod ordinal 0 is
+  # the leader (selects merge candidates, enqueues tasks). Ordinals 1..N-1 are
+  # workers (consume tasks only). With replicas=1 the single pod is both
+  # leader and worker. Behaviour at the cluster level is equivalent across
+  # 1 vs N replicas — adding workers just adds merge throughput.
+  replicas: {{ .Values.indexOptimizer.replicas | default 1 }}
   serviceName: {{ include "herddb.fullname" . }}-index-optimizer
-  podManagementPolicy: OrderedReady
+  # Parallel so a freshly-scaled-up worker pod (e.g. ordinal 2) does not have
+  # to wait for ordinal 1 to be Ready before it can start consuming.
+  podManagementPolicy: Parallel
   selector:
     matchLabels:
       {{- include "herddb.selectorLabels" . | nindent 6 }}
@@ -76,8 +78,20 @@ spec:
               exec /opt/herddb/bin/service index-optimizer console \
                 /opt/herddb/conf/indexoptimizer.properties \
                 -Dindexoptimizer.tmp.dir=/opt/herddb/optimizer-tmp
-          {{- if or .Values.indexOptimizer.javaOpts .Values.indexOptimizer.javaOptsExtra }}
           env:
+            # Pod ordinal sourced from the K8s downward API
+            # (apps.kubernetes.io/pod-index label; K8s >= 1.28). Consumed by
+            # OptimizerRole.detect to decide LEADER (ordinal 0) vs WORKER.
+            - name: POD_ORDINAL
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['apps.kubernetes.io/pod-index']
+            # Fallback for the hostname-regex role detection when the
+            # downward-API field is unavailable.
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
             {{- if .Values.indexOptimizer.javaOpts }}
             - name: JAVA_OPTS
               value: {{ .Values.indexOptimizer.javaOpts | quote }}
@@ -86,7 +100,6 @@ spec:
             - name: JAVA_OPTS_EXTRA
               value: {{ .Values.indexOptimizer.javaOptsExtra | quote }}
             {{- end }}
-          {{- end }}
           ports:
             - name: http
               containerPort: {{ .Values.indexOptimizer.httpPort | default 9853 }}

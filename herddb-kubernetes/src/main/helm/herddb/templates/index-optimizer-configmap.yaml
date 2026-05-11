@@ -25,6 +25,27 @@ data:
     indexoptimizer.merge.target.bytes={{ .Values.indexOptimizer.targetMaxBytes | default 8589934592 | int64 }}
     indexoptimizer.retention.ms={{ .Values.indexOptimizer.retentionMs | default 600000 | int64 }}
     indexoptimizer.event.debounce.ms={{ .Values.indexOptimizer.eventDebounceMs | default 500 | int64 }}
+    # Horizontal scalability (step 9): the leader executes tasks alongside
+    # producing them by default. Set to false to make the leader a pure
+    # scheduler — used by the K8s multi-replica acceptance test to prove a
+    # worker pod actually does the merge work, also a legitimate "dedicated
+    # scheduler" deployment mode for large clusters.
+    indexoptimizer.role.leader.execute.tasks={{ .Values.indexOptimizer.leaderExecuteTasks | default true }}
+    # Owner-selection policy. LEAST_LOADED is the production default — picks
+    # the indexing-service instance with the lowest current byte footprint
+    # so merge outputs distribute across replicas instead of piling onto
+    # ordinal 0. Alternatives: FIXED_ZERO (legacy), ROUND_ROBIN, STATIC.
+    indexoptimizer.owner.selector.policy={{ .Values.indexOptimizer.ownerSelector.policy | default "LEAST_LOADED" }}
+    indexoptimizer.tasks.max.attempts={{ .Values.indexOptimizer.tasks.maxAttempts | default 3 | int64 }}
+    indexoptimizer.tasks.orphan.reset.ms={{ .Values.indexOptimizer.tasks.orphanResetMs | default 120000 | int64 }}
+    indexoptimizer.tasks.terminal.retention.ms={{ .Values.indexOptimizer.tasks.terminalRetentionMs | default 3600000 | int64 }}
+    indexoptimizer.tasks.poison.retention.ms={{ .Values.indexOptimizer.tasks.poisonRetentionMs | default 604800000 | int64 }}
+    indexoptimizer.consumer.max.tasks.per.tick={{ .Values.indexOptimizer.consumer.maxTasksPerTick | default 4 | int64 }}
+    {{- if .Values.indexOptimizer.indexing }}
+    {{- if .Values.indexOptimizer.indexing.numInstances }}
+    indexoptimizer.indexing.num.instances={{ .Values.indexOptimizer.indexing.numInstances | int64 }}
+    {{- end }}
+    {{- end }}
     {{- if .Values.indexOptimizer.merger }}
     {{- with .Values.indexOptimizer.merger }}
     {{- if .dim }}
