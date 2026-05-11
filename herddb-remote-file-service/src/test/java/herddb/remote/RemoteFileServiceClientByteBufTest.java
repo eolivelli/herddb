@@ -1296,6 +1296,9 @@ public class RemoteFileServiceClientByteBufTest {
                 try {
                     tuned.writeFile("test/permits/write/chunked-slow-path.bin", payload);
                 } catch (Throwable t) {
+                    // Catch Throwable so AssertionError or any other Error
+                    // still surfaces via writeError instead of being silently
+                    // swallowed by the daemon thread (per CLAUDE.md guidance).
                     writeError.set(t);
                 } finally {
                     writeDone.countDown();
@@ -1368,6 +1371,9 @@ public class RemoteFileServiceClientByteBufTest {
                 try {
                     tuned.writeFile("test/permits/write/nondivisible-slow-path.bin", payload);
                 } catch (Throwable t) {
+                    // Catch Throwable so AssertionError or any other Error
+                    // still surfaces via writeError instead of being silently
+                    // swallowed by the daemon thread (per CLAUDE.md guidance).
                     writeError.set(t);
                 } finally {
                     writeDone.countDown();
