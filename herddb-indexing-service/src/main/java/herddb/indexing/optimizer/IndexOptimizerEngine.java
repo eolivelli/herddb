@@ -795,36 +795,15 @@ public final class IndexOptimizerEngine {
      * <p>Hot-path note: this is one extra ZK read per candidate per merge cycle.
      * Merges run every 5 min by default and process 4–200 candidates each — the
      * extra reads are inconsequential.
+     *
+     * <p>Step 4 — delegates to the standalone {@link SegmentRevalidator} so the
+     * upcoming step-6 task consumer can call the same logic without depending
+     * on the engine.
      */
     private boolean revalidateInputsStillActive(String indexUuid,
                                                 List<VersionedSegmentMetadata> candidates) {
-        for (VersionedSegmentMetadata v : candidates) {
-            try {
-                java.util.Optional<VersionedSegmentMetadata> latest = registry.getSegment(
-                        tablespaceUuid, indexUuid, v.metadata().getSegmentUuid());
-                if (!latest.isPresent()) {
-                    LOGGER.log(Level.INFO,
-                            "input {0} disappeared from registry between pick and revalidate",
-                            v.metadata().getSegmentUuid());
-                    return false;
-                }
-                VersionedSegmentMetadata l = latest.get();
-                if (l.zkVersion() != v.zkVersion() || l.metadata().getState() != SegmentState.ACTIVE) {
-                    LOGGER.log(Level.INFO,
-                            "input {0} drifted between pick (state=ACTIVE, version={1}) and revalidate"
-                                    + " (state={2}, version={3})",
-                            new Object[]{v.metadata().getSegmentUuid(), v.zkVersion(),
-                                    l.metadata().getState(), l.zkVersion()});
-                    return false;
-                }
-            } catch (SegmentRegistryException e) {
-                LOGGER.log(Level.WARNING,
-                        "revalidate failed for input " + v.metadata().getSegmentUuid()
-                                + ": " + e.getMessage());
-                return false;
-            }
-        }
-        return true;
+        return new SegmentRevalidator(registry, tablespaceUuid)
+                .revalidateInputsStillActive(indexUuid, candidates);
     }
 
     private void deprecateInputSegment(VersionedSegmentMetadata v, String replacementUuid,

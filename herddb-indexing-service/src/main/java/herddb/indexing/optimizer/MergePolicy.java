@@ -23,6 +23,7 @@ import herddb.indexing.segment.VersionedSegmentMetadata;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.function.Predicate;
 
 /**
  * Decides which {@code ACTIVE} segments to merge on a given tick.
@@ -43,6 +44,35 @@ public interface MergePolicy {
      *         list means "no merge".
      */
     List<VersionedSegmentMetadata> pickMergeCandidates(List<VersionedSegmentMetadata> activeSegments);
+
+    /**
+     * Same as {@link #pickMergeCandidates(List)} but with an exclusion predicate
+     * the producer uses to filter out segment UUIDs that are already referenced
+     * by an in-flight (non-terminal) task. The default implementation filters
+     * the input list and delegates to the single-argument overload, so concrete
+     * policies do not need to know about the exclusion concept — they keep
+     * working with the filtered view of the segment set. Wired into the engine
+     * by step 5 once the task producer lands.
+     *
+     * @param activeSegments full set of ACTIVE segments for the index.
+     * @param excludeSegment {@code true} for each segment UUID to drop from
+     *     consideration; {@code null} or always-false predicate is the
+     *     no-exclusion case.
+     */
+    default List<VersionedSegmentMetadata> pickMergeCandidates(
+            List<VersionedSegmentMetadata> activeSegments,
+            Predicate<String> excludeSegment) {
+        if (excludeSegment == null) {
+            return pickMergeCandidates(activeSegments);
+        }
+        List<VersionedSegmentMetadata> filtered = new ArrayList<>(activeSegments.size());
+        for (VersionedSegmentMetadata v : activeSegments) {
+            if (!excludeSegment.test(v.metadata().getSegmentUuid())) {
+                filtered.add(v);
+            }
+        }
+        return pickMergeCandidates(filtered);
+    }
 
     /**
      * Default policy: smallest-first, capped by {@code maxBytes}; fires when
