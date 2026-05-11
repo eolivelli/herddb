@@ -376,10 +376,12 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
         // deadlock on acquireUninterruptibly.
         int toAcquire = Math.min(bytes, writePermits);
         if (bytes > writePermits) {
-            LOGGER.log(Level.WARNING,
+            // Payload exceeds the cap. We will hold up to writePermits permits at
+            // a time; smaller concurrent writes can interleave between chunks.
+            logPreservingInterrupt(Level.WARNING,
                     "remote file client write payload ({0} bytes) exceeds inflight-write cap "
-                            + "({1} bytes); acquiring full budget ({1} bytes) for the duration "
-                            + "of this write — consider raising "
+                            + "({1} bytes); will hold up to {1} permits at a time during "
+                            + "this write — consider raising "
                             + CONFIG_CLIENT_MAX_INFLIGHT_WRITE_BYTES,
                     new Object[]{bytes, writePermits});
         }
@@ -389,27 +391,13 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
         }
         // Slow path: acquire in chunks of blockSize so smaller concurrent
         // writes can interleave. Warn before blocking starts.
-        //
-        // Save/restore the interrupt flag around every LOGGER.log() call.
-        // Some I/O streams that back the log handler (e.g. a pipe that Maven
-        // Surefire uses to capture test output) silently consume the flag when
-        // the calling thread is interrupted. If we leave the flag cleared before
-        // calling acquireUninterruptibly, the AQS will not call selfInterrupt()
-        // on return and the caller's interrupt status will be lost.
-        boolean interruptedBeforeBlock = Thread.interrupted();
-        try {
-            LOGGER.log(Level.WARNING,
-                    "remote file client inflight-write reservation blocked "
-                            + "(requested={0} bytes, available={1}/{2}); waiting — consider raising "
-                            + CONFIG_CLIENT_MAX_INFLIGHT_WRITE_BYTES
-                            + " or reducing concurrent compaction/page-write load",
-                    new Object[]{toAcquire, inflightWriteBytes.availablePermits(),
-                            maxInflightWriteBytes});
-        } finally {
-            if (interruptedBeforeBlock) {
-                Thread.currentThread().interrupt();
-            }
-        }
+        logPreservingInterrupt(Level.WARNING,
+                "remote file client inflight-write reservation blocked "
+                        + "(requested={0} bytes, available={1}/{2}); waiting — consider raising "
+                        + CONFIG_CLIENT_MAX_INFLIGHT_WRITE_BYTES
+                        + " or reducing concurrent compaction/page-write load",
+                new Object[]{toAcquire, inflightWriteBytes.availablePermits(),
+                        maxInflightWriteBytes});
         long startNanos = System.nanoTime();
         int acquired = 0;
         while (acquired < toAcquire) {
@@ -419,28 +407,39 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
         }
         long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
         if (elapsedMs >= PERMIT_ACQUIRE_WARN_THRESHOLD_MS) {
-            // Also preserve interrupt around the post-unblock log: acquireUninterruptibly
-            // calls selfInterrupt() when the thread was interrupted during the wait, and
-            // logging afterwards must not silently consume that restored flag.
-            boolean interruptedAfterBlock = Thread.interrupted();
-            try {
-                LOGGER.log(Level.WARNING,
-                        "remote file client inflight-write reservation unblocked after {0}ms "
-                                + "(requested={1} bytes, available={2}/{3}); consider raising "
-                                + CONFIG_CLIENT_MAX_INFLIGHT_WRITE_BYTES,
-                        new Object[]{elapsedMs, toAcquire, inflightWriteBytes.availablePermits(),
-                                maxInflightWriteBytes});
-            } finally {
-                if (interruptedAfterBlock) {
-                    Thread.currentThread().interrupt();
-                }
-            }
+            logPreservingInterrupt(Level.WARNING,
+                    "remote file client inflight-write reservation unblocked after {0}ms "
+                            + "(requested={1} bytes, available={2}/{3}); consider raising "
+                            + CONFIG_CLIENT_MAX_INFLIGHT_WRITE_BYTES,
+                    new Object[]{elapsedMs, toAcquire, inflightWriteBytes.availablePermits(),
+                            maxInflightWriteBytes});
         }
         return toAcquire;
     }
 
     private void releaseInflightWriteBytes(int bytes) {
         inflightWriteBytes.release(bytes);
+    }
+
+    /**
+     * Emits a log record at the given level while preserving the calling
+     * thread's interrupt status.
+     *
+     * <p>Some I/O streams that back the log handler (e.g. a pipe that Maven
+     * Surefire uses to capture test output) silently consume the interrupt
+     * flag. Callers that need interrupt-sensitive semantics around
+     * {@link java.util.concurrent.Semaphore#acquireUninterruptibly} must
+     * use this wrapper so that the flag survives the log call.
+     */
+    private static void logPreservingInterrupt(Level level, String msg, Object[] params) {
+        boolean interrupted = Thread.interrupted();
+        try {
+            LOGGER.log(level, msg, params);
+        } finally {
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
     }
 
     /**

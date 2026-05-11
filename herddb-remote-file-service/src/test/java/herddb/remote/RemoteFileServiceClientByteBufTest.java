@@ -1254,4 +1254,146 @@ public class RemoteFileServiceClientByteBufTest {
                     cap, tuned.availableInflightWriteBytes());
         }
     }
+
+    /**
+     * Exercises the slow-path chunked-acquisition while-loop in
+     * {@code acquireInflightWriteBytes}: reflectively drains the write-byte
+     * semaphore to 0 so that {@code tryAcquire(toAcquire)} fails and the
+     * loop runs. The semaphore is then restored by the main thread while the
+     * oversized writer is parked, verifying that each chunk wakes up and the
+     * full loop completes correctly.
+     *
+     * <p>Config: {@code cap = 2 × blockSize} (two loop iterations), payload
+     * {@code = 3 × blockSize} ({@code toAcquire = cap}). The slow-path loop
+     * must execute both iterations ({@code blockSize} + {@code blockSize}
+     * permits), and the budget must be fully restored afterwards.
+     */
+    @Test(timeout = 30_000)
+    public void testInflightWriteBytes_oversizedWriteSlowPathChunkedLoop() throws Exception {
+        int blockSize = 4096;
+        long cap = 2L * blockSize; // 2 chunks so both loop iterations run
+        Map<String, Object> cfg = new HashMap<>();
+        cfg.put(RemoteFileServiceClient.CONFIG_CLIENT_BLOCK_SIZE, blockSize);
+        cfg.put(RemoteFileServiceClient.CONFIG_CLIENT_MAX_INFLIGHT_WRITE_BYTES, cap);
+        try (RemoteFileServiceClient tuned = new RemoteFileServiceClient(
+                Arrays.asList("localhost:" + server.getPort()), cfg)) {
+            // Reflectively drain the write-byte semaphore so tryAcquire fails
+            // and the chunked slow path is entered.
+            Field semField = RemoteFileServiceClient.class.getDeclaredField("inflightWriteBytes");
+            semField.setAccessible(true);
+            Semaphore writeSem = (Semaphore) semField.get(tuned);
+            int drained = writeSem.drainPermits();
+            assertEquals("drained exactly cap permits", (int) cap, drained);
+
+            // Launch an oversized write (3× cap → toAcquire = cap) on a
+            // background thread. It will park inside acquireUninterruptibly
+            // for each chunk until the main thread restores the permits.
+            byte[] payload = new byte[blockSize * 3];
+            Arrays.fill(payload, (byte) 0xEF);
+            AtomicReference<Throwable> writeError = new AtomicReference<>();
+            CountDownLatch writeDone = new CountDownLatch(1);
+            Thread writer = new Thread(() -> {
+                try {
+                    tuned.writeFile("test/permits/write/chunked-slow-path.bin", payload);
+                } catch (Throwable t) {
+                    writeError.set(t);
+                } finally {
+                    writeDone.countDown();
+                }
+            }, "oversized-slow-path-writer");
+            writer.setDaemon(true);
+            writer.start();
+
+            // Wait for the writer to park on the first chunk.
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+            while (writer.getState() != Thread.State.WAITING
+                    && writer.getState() != Thread.State.TIMED_WAITING) {
+                if (System.nanoTime() > deadline) {
+                    writeSem.release(drained); // unblock writer before failing
+                    fail("writer did not enter WAITING state within 10 s; state="
+                            + writer.getState() + ", error=" + writeError.get());
+                }
+                Thread.sleep(5);
+            }
+
+            // Restore all drained permits — the chunked loop will consume
+            // them (blockSize at a time) and complete.
+            writeSem.release(drained);
+
+            assertTrue("oversized slow-path write completed within timeout",
+                    writeDone.await(20, TimeUnit.SECONDS));
+            assertNull("oversized slow-path write must not throw", writeError.get());
+            assertEquals("budget restored to cap after chunked slow-path write",
+                    cap, tuned.availableInflightWriteBytes());
+        }
+    }
+
+    /**
+     * Exercises the partial-last-chunk case of the slow-path loop: when
+     * {@code toAcquire} is not a multiple of {@code blockSize}, the final
+     * {@code Math.min(toAcquire - acquired, blockSize)} call produces a
+     * chunk smaller than {@code blockSize}. This test verifies that the
+     * arithmetic is correct and that no permits are leaked.
+     *
+     * <p>Config: {@code cap = blockSize + 100} (not a multiple of
+     * {@code blockSize}), payload {@code = 2 × blockSize} ({@code toAcquire
+     * = blockSize + 100}). Loop iteration breakdown:
+     * <ul>
+     *   <li>Chunk 1: {@code blockSize} permits.</li>
+     *   <li>Chunk 2: {@code 100} permits (partial last chunk).</li>
+     * </ul>
+     * The semaphore is drained to force the slow path.
+     */
+    @Test(timeout = 30_000)
+    public void testInflightWriteBytes_oversizedWriteNonDivisibleCapSlowPath() throws Exception {
+        int blockSize = 4096;
+        long cap = blockSize + 100L; // non-divisible: last chunk = 100 bytes
+        Map<String, Object> cfg = new HashMap<>();
+        cfg.put(RemoteFileServiceClient.CONFIG_CLIENT_BLOCK_SIZE, blockSize);
+        cfg.put(RemoteFileServiceClient.CONFIG_CLIENT_MAX_INFLIGHT_WRITE_BYTES, cap);
+        try (RemoteFileServiceClient tuned = new RemoteFileServiceClient(
+                Arrays.asList("localhost:" + server.getPort()), cfg)) {
+            // Drain to force the chunked slow path.
+            Field semField = RemoteFileServiceClient.class.getDeclaredField("inflightWriteBytes");
+            semField.setAccessible(true);
+            Semaphore writeSem = (Semaphore) semField.get(tuned);
+            int drained = writeSem.drainPermits();
+            assertEquals("drained exactly cap permits", (int) cap, drained);
+
+            byte[] payload = new byte[blockSize * 2]; // > cap → toAcquire = cap
+            Arrays.fill(payload, (byte) 0x12);
+            AtomicReference<Throwable> writeError = new AtomicReference<>();
+            CountDownLatch writeDone = new CountDownLatch(1);
+            Thread writer = new Thread(() -> {
+                try {
+                    tuned.writeFile("test/permits/write/nondivisible-slow-path.bin", payload);
+                } catch (Throwable t) {
+                    writeError.set(t);
+                } finally {
+                    writeDone.countDown();
+                }
+            }, "nondivisible-slow-path-writer");
+            writer.setDaemon(true);
+            writer.start();
+
+            // Wait for the writer to park, then restore all permits.
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+            while (writer.getState() != Thread.State.WAITING
+                    && writer.getState() != Thread.State.TIMED_WAITING) {
+                if (System.nanoTime() > deadline) {
+                    writeSem.release(drained);
+                    fail("writer did not enter WAITING state within 10 s; state="
+                            + writer.getState() + ", error=" + writeError.get());
+                }
+                Thread.sleep(5);
+            }
+            writeSem.release(drained);
+
+            assertTrue("non-divisible slow-path write completed within timeout",
+                    writeDone.await(20, TimeUnit.SECONDS));
+            assertNull("non-divisible slow-path write must not throw", writeError.get());
+            assertEquals("budget restored to exactly cap (partial last chunk must not leak)",
+                    cap, tuned.availableInflightWriteBytes());
+        }
+    }
 }
