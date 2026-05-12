@@ -226,14 +226,24 @@ public class IndexOptimizerKubernetesMultiReplicaIT {
         HerdDBKubernetesIT.execSql(k3s, toolsPod,
                 "CREATE VECTOR INDEX vidx_opt2 ON opt2_test(vec)");
 
-        // Wait until both pods have ticked the engine — confirms the basic
-        // scheduler loop is alive on both replicas.
+        // Leader: confirm the engine-reap path is running by waiting for
+        // herddb_optimizer_runs_total to increment (it only bumps on the
+        // LEADER side because reapDeprecatedSegments is leader-only).
         assertTrue("leader pod must tick within 2 minutes",
                 waitForMetric(leaderPod, "herddb_optimizer_runs_total", 1L,
                         2, TimeUnit.MINUTES));
-        assertTrue("worker pod must tick within 2 minutes",
-                waitForMetric(workerPod, "herddb_optimizer_runs_total", 1L,
-                        2, TimeUnit.MINUTES));
+        // Worker: the worker never reaps so herddb_optimizer_runs_total stays
+        // at 0 by design. Instead confirm the /metrics endpoint is reachable
+        // AND reports the WORKER role label set to 1 — proves the pod is up,
+        // role detection works, and the horizontal-scale wiring landed.
+        assertTrue("worker pod must report role=WORKER within 2 minutes",
+                waitForLabeledMetric(workerPod, "herddb_optimizer_role",
+                        "role", "WORKER", 1L, 2, TimeUnit.MINUTES));
+        // And the LEADER label must be 0 on the worker pod (defence-in-depth
+        // against a config drift that flips the role on the wrong pod).
+        assertTrue("worker pod must report role=LEADER as 0",
+                waitForLabeledMetric(workerPod, "herddb_optimizer_role",
+                        "role", "LEADER", 0L, 30, TimeUnit.SECONDS));
 
         LOG.info("=== Multi-replica acceptance: both pods running, leader=" + leaderPod
                 + " worker=" + workerPod + " ===");
@@ -312,6 +322,41 @@ public class IndexOptimizerKubernetesMultiReplicaIT {
                     if (line.startsWith(metric + " ")) {
                         String[] parts = line.trim().split("\\s+");
                         if (parts.length >= 2 && Long.parseLong(parts[1].trim()) >= target) {
+                            return true;
+                        }
+                    }
+                }
+            } catch (Exception transientErr) {
+                LOG.log(Level.FINE, "metrics fetch from {0} failed: {1}",
+                        new Object[]{podName, transientErr.getMessage()});
+            }
+            Thread.sleep(5_000);
+        }
+        return false;
+    }
+
+    private boolean waitForLabeledMetric(String podName, String metric,
+                                         String labelKey, String labelValue,
+                                         long targetExact, long timeout, TimeUnit unit)
+            throws Exception {
+        // Matches lines like: metric{labelKey="labelValue", ...} <value>
+        String labelFragment = labelKey + "=\"" + labelValue + "\"";
+        long deadline = System.currentTimeMillis() + unit.toMillis(timeout);
+        while (System.currentTimeMillis() < deadline) {
+            try {
+                org.testcontainers.containers.Container.ExecResult result =
+                        k3s.execInContainer("kubectl", "exec", podName, "--",
+                                "curl", "-fsS", "http://localhost:9853/metrics");
+                String body = result.getStdout();
+                for (String line : body.split("\n")) {
+                    if (line.startsWith(metric + "{") && line.contains(labelFragment)) {
+                        int closeBrace = line.indexOf('}');
+                        if (closeBrace < 0) {
+                            continue;
+                        }
+                        String[] parts = line.substring(closeBrace + 1).trim().split("\\s+");
+                        if (parts.length >= 1 && !parts[0].isEmpty()
+                                && Long.parseLong(parts[0]) == targetExact) {
                             return true;
                         }
                     }
