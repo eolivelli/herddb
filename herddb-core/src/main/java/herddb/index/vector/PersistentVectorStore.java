@@ -2849,33 +2849,16 @@ public class PersistentVectorStore extends AbstractVectorStore {
             long stage3Start = System.nanoTime();
             stateLock.writeLock().lock();
             try {
-                // Re-apply pendingCompactionDeletes to merged under
-                // writeLock, catching any PKs that arrived after the
-                // lock-free lateDeletes.forEach in runCompactionCycle and
-                // during Stages 1+2 of this method (issue #462, pr-reviewer
-                // pass-1 BLOCK fix). Without this re-apply: a removeVector(X)
-                // arriving during Stages 1+2 finds X in an input segment
-                // (still in this.segments until Stage 3), seg.deletePk
-                // succeeds on the input — but the input is about to be
-                // discarded, lateDeletes.forEach already ran on merged, and
-                // X stays in merged. The set is closed in
-                // runCompactionCycle's finally block right after this method
-                // returns, so this is the last opportunity to apply.
+                // Re-apply pendingCompactionDeletes (issue #462 + #538):
+                // the late-deletes reapply happens BELOW, AFTER
+                // finalNewSegments is built, so the apply covers the full
+                // set of segments being published — mergedOutput AND any
+                // segments preserved from `this.segments` (including
+                // adoptions that landed in the Stage 1 → Stage 3 window).
+                // The reapply must run BEFORE the publish so a throw
+                // unwinds with both the counter and `this.segments`
+                // unchanged. See the corresponding block below.
                 //
-                // Cost: O(|pendingCompactionDeletes|) BLink scans on
-                // mergedOutput. Bounded by application's delete rate ×
-                // (lock-free Stage 1+2 duration). Each seg.deletePk on a
-                // missing PK is a single BLink search returning null, so
-                // entries already absorbed by lateDeletes.forEach return
-                // quickly and only the late-arrivers do meaningful work.
-                if (mergedOutput != null) {
-                    PagedPkSet lateDeletesReapply = this.pendingCompactionDeletes;
-                    if (lateDeletesReapply != null) {
-                        VectorSegment merged = mergedOutput;
-                        lateDeletesReapply.forEach(merged::deletePk);
-                    }
-                    registerSegmentMemoryEstimate(mergedOutput);
-                }
                 // Issue #538 (root cause of the residual race tracked in
                 // issue #537): REBUILD `finalNewSegments` from the CURRENT
                 // `this.segments` rather than publishing the stale Stage-1
@@ -2939,6 +2922,63 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 }
                 if (mergedOutput != null) {
                     finalNewSegments.add(mergedOutput);
+                }
+
+                // Issue #538 (pr-reviewer pass-5 follow-up): reapply
+                // `pendingCompactionDeletes` to ALL segments being
+                // published, not just {@code mergedOutput}.
+                //
+                // The PRE-fix-5 reapply applied only to {@code mergedOutput}:
+                // a remove that lands DURING the compaction cycle would
+                // have been:
+                //   (a) applied to existing on-disk segments by
+                //       removeVector's direct iteration of
+                //       {@code this.segments} at the time of the call;
+                //   (b) added to {@code pendingCompactionDeletes} for
+                //       the lock-free re-apply at the end of Stage 1
+                //       (which targeted mergedOutput, the only segment
+                //       removeVector couldn't iterate); AND
+                //   (c) re-applied to mergedOutput here under writeLock
+                //       to catch arrivals after Stage 1's lock-free
+                //       forEach.
+                //
+                // With round-1 preserving adoptions in finalNewSegments,
+                // an adoption landing AFTER a removeVector(P) but BEFORE
+                // Stage 3 was MISSED by step (a) (the adopted segment
+                // was not yet in {@code this.segments} when removeVector
+                // ran) and by step (c) (the reapply targeted only
+                // mergedOutput). Result: P stayed live in the adopted
+                // segment after Stage 3 — a silent removeVector loss.
+                //
+                // The structural twin of the Phase C Stage 2 fix at
+                // line 5119-5128 (issue #538 pr-reviewer pass-3): iterate
+                // {@code finalNewSegments} so the reapply covers
+                // adoptions. `seg.deletePk` is idempotent; for pks
+                // already deleted by Stage 1's lock-free forEach,
+                // the iteration silently returns false on each segment.
+                //
+                // ORDERING (matching round-4 Phase C Stage 2): the
+                // reapply runs BEFORE
+                // {@code registerSegmentMemoryEstimate(mergedOutput)}
+                // AND BEFORE the {@code this.segments = ...} publish
+                // AND BEFORE the {@code unregisterSegmentMemoryEstimate}
+                // loop over inputs. A throw from `seg.deletePk` leaves
+                // both the counter and `this.segments` unchanged.
+                if (!finalNewSegments.isEmpty()) {
+                    PagedPkSet lateDeletesReapply = this.pendingCompactionDeletes;
+                    if (lateDeletesReapply != null) {
+                        lateDeletesReapply.forEach(pk -> {
+                            for (VectorSegment seg : finalNewSegments) {
+                                if (seg.deletePk(pk)) {
+                                    return;
+                                }
+                            }
+                        });
+                    }
+                }
+
+                if (mergedOutput != null) {
+                    registerSegmentMemoryEstimate(mergedOutput);
                 }
                 this.segments = new java.util.concurrent.CopyOnWriteArrayList<>(
                         finalNewSegments);

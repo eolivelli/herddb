@@ -897,6 +897,95 @@ public class Issue538Stage3RepublishRaceTest {
     }
 
     /**
+     * Pr-reviewer pass-5 follow-up: symmetric compaction-side test for
+     * the reapply-covers-adopted-segments invariant. Mirrors
+     * {@link #stage2ReapplyMustCoverAdoptedSegmentsForPendingCheckpointDeletes}
+     * but exercises {@code atomicSwapCompactionResult} Stage 3 with
+     * {@code pendingCompactionDeletes} (the compaction-cycle counterpart
+     * to {@code pendingCheckpointDeletes}).
+     *
+     * <p>Pre-fix-5 the Stage 3 reapply targeted ONLY {@code mergedOutput}
+     * — a {@code removeVector(P)} that ran during the cycle, followed
+     * by an {@code adoptExternalSegment} landing in the Stage 1 →
+     * Stage 3 window, would leave {@code P} live in the adopted
+     * segment after the cycle. Post-fix-5 the reapply iterates the
+     * entire {@code finalNewSegments} (currentAtStage3 - inputs +
+     * mergedOutput), so the adopted segment receives the pending
+     * delete and the {@code TrackingVectorSegment} observes the
+     * invocation.
+     */
+    @Test(timeout = 30_000)
+    public void stage3CompactionReapplyMustCoverAdoptedSegmentsForPendingCompactionDeletes()
+            throws Exception {
+        Path tmpDir = tmpFolder.newFolder("issue538-compaction-reapply").toPath();
+        MemoryDataStorageManager dsm = new MemoryDataStorageManager();
+
+        try (PersistentVectorStore store = newStore(tmpDir, dsm)) {
+            store.start();
+            seedSegments(store, 5);
+
+            List<VectorSegment> initial = store.getOnDiskSegmentsSnapshotForTest();
+            stampMissingUuids(initial);
+
+            final Bytes pkToRemove = Bytes.from_int(999_999_003);
+            final TrackingVectorSegment tracker = new TrackingVectorSegment(1_000_000_005);
+            tracker.segmentUuid = UUID.randomUUID().toString();
+            tracker.generation = 9999L;
+
+            // Use atomicSwapPostBuildHook (fires AFTER Stage 1 build,
+            // BEFORE Stage 2 persist). Order matters: removeVector FIRST
+            // so the pk lands in pendingCompactionDeletes without
+            // touching the tracker (tracker not yet injected); then
+            // inject the tracker so Stage 3's reapply iterates it.
+            store.setAtomicSwapPostBuildHookForTest(() -> {
+                try {
+                    store.removeVector(pkToRemove);
+                    addSegmentViaReflection(store, tracker);
+                } catch (ReflectiveOperationException e) {
+                    throw new RuntimeException(e);
+                }
+            });
+
+            store.runCompactionCycle();
+
+            // Precondition: the tracker is in the published segments
+            // (the round-1 fix preserves adoptions through Stage 3).
+            boolean trackerInSegments = false;
+            for (VectorSegment s : store.getOnDiskSegmentsSnapshotForTest()) {
+                if (s.segmentId == tracker.segmentId) {
+                    trackerInSegments = true;
+                    break;
+                }
+            }
+            assertTrue("tracker must be in this.segments post-publish "
+                    + "(round-1 fix preserves adoptions)", trackerInSegments);
+
+            // CORE assertion: the tracker's deletePk(pkToRemove) MUST
+            // have been called at least once by the Stage-3 reapply.
+            // (We never invoked it via removeVector — the tracker was
+            // injected AFTER removeVector.) Pre-fix-5 the reapply
+            // targeted only mergedOutput, so the tracker would NOT see
+            // pkToRemove. Post-fix-5 the reapply iterates
+            // finalNewSegments which includes the tracker.
+            int hits = 0;
+            for (Bytes b : tracker.deletePkInvocations) {
+                if (pkToRemove.equals(b)) {
+                    hits++;
+                }
+            }
+            assertTrue("Stage-3 compaction reapply must iterate adopted "
+                    + "segments — tracker.deletePk(pkToRemove) must be "
+                    + "invoked at least once by the reapply over "
+                    + "finalNewSegments. Got " + hits + " invocations; "
+                    + "expected >= 1. Pre-fix-5 the reapply targeted "
+                    + "only mergedOutput, leaving pendingCompactionDeletes "
+                    + "unapplied to adopted segments (issue #538 pr-reviewer "
+                    + "pass-5).",
+                    hits >= 1);
+        }
+    }
+
+    /**
      * Pr-reviewer pass-4 follow-up: locks in the "reapply → register →
      * publish" ordering invariant in Phase C Stage 2. If
      * {@code seg.deletePk} throws during the reapply, the failure must
