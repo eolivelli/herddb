@@ -2753,22 +2753,15 @@ public class PersistentVectorStore extends AbstractVectorStore {
         checkpointLock.lock();
         try {
             // ---------- STAGE 1 — validate + build (no writeLock). ----------
-            // checkpointLock is the outermost serialiser of segments mutations,
-            // so the volatile read of `this.segments` is stable for the
-            // duration of this method.
-            //
-            // KNOWN RACE (issue #537): dropSegmentByUuid does NOT take
-            // checkpointLock; it only takes stateLock.writeLock(). So a
-            // drop landing between this read of `current` and Stage 3's
-            // writeLock-protected publish can:
-            //   - remove a NON-INPUT segment from `this.segments`, and
-            //   - leave it queued in pendingSegmentCloses;
-            // then Stage 3 publishes `newSegments` built from `current`
-            // (which still has the dropped segment) and re-inserts it
-            // into `this.segments`. The cycle's finally then closes the
-            // re-published segment, leaving it visible to subsequent
-            // searches / compactions with onDiskGraph == null. Tracked
-            // separately; outside the scope of issue #535.
+            // checkpointLock serialises compactions and checkpoints, but
+            // does NOT exclude {@link #dropSegmentByUuid} (which takes only
+            // {@code stateLock.writeLock()}). A drop landing in the Stage 1
+            // → Stage 3 window can therefore mutate {@code this.segments}
+            // under our feet. Stage 3 below handles this by REBUILDING the
+            // published list from {@code this.segments} read freshly under
+            // writeLock (issue #538), so the Stage-1 `newSegments` is now a
+            // lower-bound estimate used only for the persist in Stage 2 and
+            // for the pre-lock registry coordination above.
             List<VectorSegment> current = this.segments;
             // Canonical pre-sizing: HashSet rounds up to the next power of two,
             // so we want capacity = ceil(size / loadFactor). 0.75f is the
@@ -2910,18 +2903,30 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 //     {@link #adoptExternalSegment}) ARE preserved;
                 //   - we add `mergedOutput` exactly once.
                 //
-                // The persisted IndexStatus from Stage 2 may diverge slightly
-                // from the published `this.segments` if a non-input drop
-                // landed in the Stage 1→3 window. {@code dirty.set(true)}
-                // below forces the next checkpoint to repersist; in the
-                // restart window between this swap and that checkpoint the
-                // IndexStatus references the dropped segment, but
-                // {@code loadFusedPQSegment} will fail on it cleanly (the
-                // optimizer has deleted the multipart files) and recovery
-                // is bounded by the existing reconcile-on-restart path.
+                // The persisted IndexStatus from Stage 2 may diverge from
+                // the published `this.segments` if a drop or adoption
+                // landed in the Stage 1 → Stage 3 window. The next
+                // checkpoint repersists consistently because the two
+                // mutating callers ({@link #dropSegmentByUuid} and
+                // {@link #adoptExternalSegment}) both call
+                // {@code dirty.set(true)} themselves. In the (short) window
+                // between this swap and the next checkpoint a restart would
+                // load a stale IndexStatus referencing a segment whose
+                // multipart files were already deleted by the optimizer;
+                // {@code start()}'s all-or-nothing load would FAIL on it,
+                // looping the IS until the next checkpoint cadence (~60 s
+                // by default). The pre-fix code had exactly the same
+                // restart-window risk via the orphan-in-segments state
+                // (the loaded segment would have {@code onDiskGraph==null}
+                // and crash on first use); the fix does not enlarge it.
+                // ArrayList + final wrap keeps the writeLock window tight
+                // vs. {@code CopyOnWriteArrayList.add}-in-loop (each add
+                // re-copies the entire backing array — O(N²)).
                 List<VectorSegment> currentAtStage3 = this.segments;
-                List<VectorSegment> finalNewSegments =
-                        new java.util.concurrent.CopyOnWriteArrayList<>();
+                int expectedSize = currentAtStage3.size() - inputs.size()
+                        + (mergedOutput != null ? 1 : 0);
+                ArrayList<VectorSegment> finalNewSegments =
+                        new ArrayList<>(Math.max(0, expectedSize));
                 for (VectorSegment s : currentAtStage3) {
                     if (!inputIds.contains(s.segmentId)) {
                         finalNewSegments.add(s);
@@ -2930,18 +2935,22 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 if (mergedOutput != null) {
                     finalNewSegments.add(mergedOutput);
                 }
-                this.segments = finalNewSegments;
+                this.segments = new java.util.concurrent.CopyOnWriteArrayList<>(
+                        finalNewSegments);
                 for (VectorSegment in : inputs) {
                     unregisterSegmentMemoryEstimate(in);
                 }
-                // Issue #538: force a fresh checkpoint persist whenever the
-                // Stage 1→3 window observed drift (segments dropped or
-                // adopted). Without this, the IndexStatus on disk would
-                // continue to reference the stale Stage-1 snapshot until
-                // some unrelated operation marks the store dirty.
-                boolean stage1Stage3Drift = finalNewSegments.size()
-                        != newSegments.size();
-                dirty.set(dirty.get() || stage1Stage3Drift || totalLiveSize() > 0);
+                // Note: we deliberately do NOT add an explicit drift-detection
+                // dirty bit here. The two mutators that produce drift —
+                // {@link #dropSegmentByUuid} and {@link #adoptExternalSegment}
+                // — both call {@code dirty.set(true)} themselves, so the
+                // next checkpoint already runs to repersist IndexStatus
+                // consistently. A drift bit based on
+                // {@code finalNewSegments.size() != newSegments.size()}
+                // would miss the (rare but possible) "1 drop + 1 adoption"
+                // case anyway; a set-based check would be correct but
+                // redundant.
+                dirty.set(dirty.get() || totalLiveSize() > 0);
             } finally {
                 stateLock.writeLock().unlock();
             }
@@ -5070,10 +5079,62 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 registerSegmentMemoryEstimate(seg);
             }
 
-            this.segments = newSegments;
+            // Issue #538: REBUILD `finalNewSegments` from the CURRENT
+            // `this.segments` rather than publishing the stale Phase-A
+            // snapshot. Between Phase A's writeLock release and this
+            // Stage-2 writeLock acquisition (which spans the slow Phase B
+            // I/O and Phase C-prep loads), a concurrent
+            // {@link #dropSegmentByUuid} (fired by the optimizer-watcher's
+            // {@code onSegmentReleased}) may have removed segments from
+            // {@code this.segments} AND opportunistically closed them via
+            // the deferred-close drain (PR #536) — because the checkpoint
+            // holds only {@code checkpointLock}, NOT {@code compactionLock},
+            // so the drain's {@code compactionLock.tryLock} from
+            // {@code drainPendingSegmentClosesOpportunistically} succeeds.
+            // Publishing the Phase-A snapshot (which still contains those
+            // segments) would silently RE-INSERT closed segments into
+            // {@code this.segments}, leaving orphans with
+            // {@code onDiskGraph == null}. This is the structural twin of
+            // the compaction-side bug fixed in
+            // {@link #atomicSwapCompactionResult} Stage 3; both surfaces
+            // produced the production failure mode reported in issues
+            // #535 / #537 / #538.
+            //
+            // The rebuild filters {@code sealedSegments} and
+            // {@code mergeableSegments} (the Phase-A view of pre-existing
+            // segments) by membership in {@code currentAtStage2}: any
+            // segment dropped during the Phase A → Stage 2 window is
+            // excluded. {@code preloadedSegments} are always included
+            // (they are brand-new and not yet in {@code this.segments}).
+            // ArrayList + final wrap minimises the writeLock window vs.
+            // {@code CopyOnWriteArrayList.add}-in-loop (each {@code add}
+            // would re-copy the entire backing array, O(N²)).
+            List<VectorSegment> currentAtStage2 = this.segments;
+            java.util.HashSet<Integer> currentIdsAtStage2 = new java.util.HashSet<>(
+                    (int) (currentAtStage2.size() / 0.75f) + 1);
+            for (VectorSegment s : currentAtStage2) {
+                currentIdsAtStage2.add(s.segmentId);
+            }
+            int expectedSize = sealedSegments.size() + mergeableSegments.size()
+                    + preloadedSegments.size();
+            ArrayList<VectorSegment> finalNewSegments = new ArrayList<>(expectedSize);
+            for (VectorSegment sealed : sealedSegments) {
+                if (currentIdsAtStage2.contains(sealed.segmentId)) {
+                    finalNewSegments.add(sealed);
+                }
+            }
+            for (VectorSegment mergeable : mergeableSegments) {
+                if (currentIdsAtStage2.contains(mergeable.segmentId)) {
+                    finalNewSegments.add(mergeable);
+                }
+            }
+            // preloadedSegments are brand-new (built in Phase B from live
+            // shards) so they are never in `currentAtStage2`; always include.
+            finalNewSegments.addAll(preloadedSegments);
+            this.segments = new java.util.concurrent.CopyOnWriteArrayList<>(finalNewSegments);
 
             int maxOrd = -1;
-            for (VectorSegment seg : newSegments) {
+            for (VectorSegment seg : finalNewSegments) {
                 if (seg.maxOrdinal > maxOrd) {
                     maxOrd = seg.maxOrdinal;
                 }
@@ -5084,7 +5145,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
             LOGGER.log(Level.INFO,
                     "checkpoint {0} Phase C: {1} nodes across {2} segments (FusedPQ), "
                             + "{3} new live inserts during checkpoint",
-                    new Object[]{indexName, totalNodes, newSegments.size(), totalLiveSize()});
+                    new Object[]{indexName, totalNodes, finalNewSegments.size(), totalLiveSize()});
 
             // No vectorStorage cleanup needed: each shard owns its own per-shard
             // VectorStorage (issue #256). Dropping the reference to the old shards

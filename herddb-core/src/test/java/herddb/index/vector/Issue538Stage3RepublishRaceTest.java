@@ -304,6 +304,11 @@ public class Issue538Stage3RepublishRaceTest {
      * would throw {@code candidate segment N has no on-disk graph
      * (streaming compaction)}. Post-fix the victim is gone and the next
      * cycle proceeds normally on remaining segments.
+     *
+     * <p>This test also asserts the second cycle actually executed work
+     * (compaction success counter advanced), to catch a regression where
+     * the policy silently finds no candidates and the "no corruption"
+     * assertion passes vacuously.
      */
     @Test(timeout = 30_000)
     public void noCorruptionOnNextCycleAfterRacingCompaction() throws Exception {
@@ -331,22 +336,92 @@ public class Issue538Stage3RepublishRaceTest {
 
             // First cycle: the race fires.
             long corruptionBefore = store.getCompactionFailuresCorruptionTotal();
+            long successesBefore = store.getCompactionSuccessesTotal();
             store.runCompactionCycle();
+            long corruptionAfterFirst = store.getCompactionFailuresCorruptionTotal();
+            assertEquals("first cycle must not record CORRUPTION (the race shifts"
+                    + " the symptom to the NEXT cycle, not this one)",
+                    corruptionBefore, corruptionAfterFirst);
 
-            // Disarm the hook so subsequent cycles run normally.
+            // Disarm the hook so the second cycle runs without the race.
             store.setAtomicSwapPostPersistHookForTest(null);
 
-            // Second cycle: must NOT trip the no-on-disk-graph check.
-            // Pre-fix this is where issue #538's persistent failure loop
-            // would start; post-fix the cycle either compacts the remaining
-            // healthy segments or exits with no candidates — either way no
-            // CORRUPTION is recorded.
+            // Loosen the policy so the second cycle compacts everything still
+            // present — including the (post-fix) merged output from cycle 1
+            // and the remaining non-input segments. Pre-fix the orphaned
+            // victim would be republished and selected here, tripping the
+            // no-on-disk-graph check. Post-fix the orphan is gone and the
+            // cycle merges the remaining healthy segments cleanly.
+            store.configureCompaction(Long.MAX_VALUE, 1L, Long.MAX_VALUE, 2,
+                    Integer.MAX_VALUE, 0);
+
             store.runCompactionCycle();
 
             assertEquals(
                 "no CORRUPTION on the cycle following the race — that was"
                 + " the persistent-failure loop reported in issue #538",
                 corruptionBefore, store.getCompactionFailuresCorruptionTotal());
+
+            // Catch the silent "no candidates" trap: the second cycle MUST
+            // have done useful work (i.e. a compaction succeeded), otherwise
+            // the no-corruption assertion above is vacuous.
+            assertTrue("the second cycle must have produced at least one"
+                    + " successful compaction (regression guard against"
+                    + " 'no candidates' masking a real failure)",
+                    store.getCompactionSuccessesTotal() > successesBefore);
+        }
+    }
+
+    /**
+     * Coverage gap (pr-reviewer follow-up): exercises a drop landing during
+     * Stage 2's slow {@code persistIndexStatusMultiSegment} I/O (using
+     * {@code atomicSwapPostBuildHook}, which fires AFTER Stage 1 build but
+     * BEFORE Stage 2 persist — i.e. the long lock-free window). The fix
+     * must protect this window too, not just the immediate pre-Stage-3
+     * window. Post-fix the dropped segment is NOT republished regardless
+     * of which sub-window the drop landed in.
+     */
+    @Test(timeout = 30_000)
+    public void dropDuringStage2PersistIsNotRepublishedByStage3() throws Exception {
+        Path tmpDir = tmpFolder.newFolder("issue538-stage2-race").toPath();
+        MemoryDataStorageManager dsm = new MemoryDataStorageManager();
+
+        try (PersistentVectorStore store = newStore(tmpDir, dsm)) {
+            store.start();
+            seedSegments(store, 5);
+
+            List<VectorSegment> initial = store.getOnDiskSegmentsSnapshotForTest();
+            stampMissingUuids(initial);
+
+            VectorSegment largest = initial.get(0);
+            for (VectorSegment s : initial) {
+                if (s.estimatedSizeBytes > largest.estimatedSizeBytes) {
+                    largest = s;
+                }
+            }
+            final int victimId = largest.segmentId;
+            final String victimUuid = largest.segmentUuid;
+
+            // PostBuildHook fires AFTER Stage 1 builds newSegments and BEFORE
+            // Stage 2 starts the slow persist. Drop the victim here. With the
+            // fix, Stage 3 re-reads this.segments and excludes the dropped
+            // segment.
+            store.setAtomicSwapPostBuildHookForTest(() -> {
+                store.dropSegmentByUuid(victimUuid);
+            });
+
+            long corruptionBefore = store.getCompactionFailuresCorruptionTotal();
+            store.runCompactionCycle();
+
+            for (VectorSegment s : store.getOnDiskSegmentsSnapshotForTest()) {
+                assertFalse("victim dropped during Stage 1 → Stage 2 must NOT"
+                        + " be republished by Stage 3 (issue #538: the fix"
+                        + " must protect the full Stage 1 → Stage 3 window,"
+                        + " not just the immediate pre-Stage-3 sub-window)",
+                        s.segmentId == victimId);
+            }
+            assertEquals("no CORRUPTION recorded",
+                    corruptionBefore, store.getCompactionFailuresCorruptionTotal());
         }
     }
 
@@ -367,6 +442,102 @@ public class Issue538Stage3RepublishRaceTest {
             assertEquals("baseline compaction must succeed", before + 1L, after);
             assertEquals("no CORRUPTION on the baseline", 0L,
                     store.getCompactionFailuresCorruptionTotal());
+        }
+    }
+
+    /**
+     * Coverage gap (pr-reviewer follow-up): the symmetric race in
+     * {@link PersistentVectorStore#doCheckpointFusedPQThreePhase Phase C
+     * Stage 2}. Structurally identical to the compaction Stage-3 race:
+     * Phase A snapshots {@code segments} into
+     * {@code sealedSegments + mergeableSegments} under writeLock, then
+     * releases writeLock for the slow Phase B I/O and Phase C-prep loads.
+     * Phase C Stage 2 re-acquires writeLock and publishes
+     * {@code this.segments = newSegments} (the Phase-A snapshot +
+     * preloadedSegments).
+     *
+     * <p>Between Phase A and Phase C Stage 2, a concurrent
+     * {@code dropSegmentByUuid} can:
+     *
+     * <ol>
+     *   <li>remove a segment from {@code this.segments} under writeLock,</li>
+     *   <li>opportunistically drain {@code pendingSegmentCloses} (the
+     *       checkpoint does NOT hold {@code compactionLock}, only
+     *       {@code checkpointLock}, so the drain's tryLock succeeds),</li>
+     *   <li>close the dropped segment ({@code onDiskGraph = null}).</li>
+     * </ol>
+     *
+     * Phase C Stage 2 then republishes the dropped (now-closed) segment
+     * into {@code this.segments} — same observable failure mode as #538.
+     *
+     * <p>This test fires the drop from {@code phaseCPostDeletesApplyHook}
+     * (already exists at {@code PersistentVectorStore.java:1315}). The
+     * hook runs inside Phase C, AFTER Stage 1's pending-deletes apply and
+     * BEFORE Stage 2's writeLock acquisition.
+     */
+    @Test(timeout = 60_000)
+    public void dropSegmentByUuidDuringCheckpointMustNotBeRepublishedByPhaseCStage2()
+            throws Exception {
+        Path tmpDir = tmpFolder.newFolder("issue538-checkpoint-race").toPath();
+        MemoryDataStorageManager dsm = new MemoryDataStorageManager();
+
+        try (PersistentVectorStore store = newStore(tmpDir, dsm)) {
+            store.start();
+            // Seed via direct addVector + checkpoint (the existing
+            // seedSegments uses this pattern); the checkpoint we'll race
+            // is the one triggered by the next addVector+checkpoint pair.
+            seedSegments(store, 4);
+
+            List<VectorSegment> initial = store.getOnDiskSegmentsSnapshotForTest();
+            assertTrue("seedSegments must produce at least 3 segments",
+                    initial.size() >= 3);
+            stampMissingUuids(initial);
+
+            // Pick the smallest segment as the drop victim. Any segment
+            // would do (the bug doesn't care about size for checkpoint),
+            // but the smallest is a stable choice.
+            VectorSegment smallest = initial.get(0);
+            for (VectorSegment s : initial) {
+                if (s.estimatedSizeBytes < smallest.estimatedSizeBytes) {
+                    smallest = s;
+                }
+            }
+            final VectorSegment victim = smallest;
+            final String victimUuid = victim.segmentUuid;
+            final int victimId = victim.segmentId;
+            assertNotNull("victim must have a UUID stamped", victimUuid);
+            assertNotNull("victim must have onDiskGraph populated", victim.onDiskGraph);
+
+            // Install the hook BEFORE triggering the next checkpoint. The
+            // hook fires inside Phase C, in the lock-free window before
+            // Stage 2's writeLock acquisition.
+            store.setPhaseCPostDeletesApplyHookForTest(() -> {
+                store.dropSegmentByUuid(victimUuid);
+            });
+
+            // Add one more vector + checkpoint to trigger a new checkpoint
+            // cycle. The checkpoint's Phase A snapshots the current segment
+            // list (which includes the victim); during Phase C the hook
+            // drops the victim; Phase C Stage 2 must NOT republish it.
+            store.addVector(Bytes.from_int(99999), vec(new Random(99)));
+            store.checkpoint();
+
+            // Post-fix assertions.
+            List<VectorSegment> after = store.getOnDiskSegmentsSnapshotForTest();
+            for (VectorSegment s : after) {
+                assertFalse("victim must NOT be republished by Phase C Stage 2"
+                        + " — this is the symmetric checkpoint twin of"
+                        + " issue #538's compaction Stage-3 republish bug",
+                        s.segmentId == victimId);
+            }
+
+            // The deferred-close drain ran during the dropSegmentByUuid's
+            // opportunistic call (compactionLock was free during checkpoint),
+            // so the victim's onDiskGraph is null.
+            assertNull("victim.onDiskGraph must be null after the deferred-close"
+                    + " drain that the checkpoint-window drop opportunistically"
+                    + " triggered",
+                    victim.onDiskGraph);
         }
     }
 }
