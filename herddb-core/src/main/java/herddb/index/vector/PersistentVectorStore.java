@@ -2883,11 +2883,65 @@ public class PersistentVectorStore extends AbstractVectorStore {
                     }
                     registerSegmentMemoryEstimate(mergedOutput);
                 }
-                this.segments = newSegments;
+                // Issue #538 (root cause of the residual race tracked in
+                // issue #537): REBUILD `finalNewSegments` from the CURRENT
+                // `this.segments` rather than publishing the stale Stage-1
+                // `newSegments`. Between Stage 1's snapshot and this Stage 3
+                // window a concurrent {@link #dropSegmentByUuid} (typically
+                // fired by the optimizer-watcher's {@code onSegmentReleased}
+                // when the optimizer deprecates a NON-input segment in ZK)
+                // may have removed segments from {@code this.segments} and
+                // queued them on {@link #pendingSegmentCloses}. Publishing
+                // the Stage-1 `newSegments` would silently RE-INSERT those
+                // dropped segments — the cycle's finally drain would then
+                // close them, leaving an orphan in {@code this.segments}
+                // with {@code onDiskGraph == null}. That orphan trips the
+                // null-check at {@code VectorIndexCompactor
+                // .rebuildSegmentStreaming:780} on every subsequent cycle,
+                // producing the persistent failure loop reported in issues
+                // #535 and #538.
+                //
+                // The rebuild here is correct because:
+                //   - we EXCLUDE all `inputs` by segmentId (the swap's intent);
+                //   - we INCLUDE everything else from the CURRENT
+                //     `this.segments`, so segments dropped between Stage 1
+                //     and now are NOT republished AND segments adopted
+                //     between Stage 1 and now (via
+                //     {@link #adoptExternalSegment}) ARE preserved;
+                //   - we add `mergedOutput` exactly once.
+                //
+                // The persisted IndexStatus from Stage 2 may diverge slightly
+                // from the published `this.segments` if a non-input drop
+                // landed in the Stage 1→3 window. {@code dirty.set(true)}
+                // below forces the next checkpoint to repersist; in the
+                // restart window between this swap and that checkpoint the
+                // IndexStatus references the dropped segment, but
+                // {@code loadFusedPQSegment} will fail on it cleanly (the
+                // optimizer has deleted the multipart files) and recovery
+                // is bounded by the existing reconcile-on-restart path.
+                List<VectorSegment> currentAtStage3 = this.segments;
+                List<VectorSegment> finalNewSegments =
+                        new java.util.concurrent.CopyOnWriteArrayList<>();
+                for (VectorSegment s : currentAtStage3) {
+                    if (!inputIds.contains(s.segmentId)) {
+                        finalNewSegments.add(s);
+                    }
+                }
+                if (mergedOutput != null) {
+                    finalNewSegments.add(mergedOutput);
+                }
+                this.segments = finalNewSegments;
                 for (VectorSegment in : inputs) {
                     unregisterSegmentMemoryEstimate(in);
                 }
-                dirty.set(dirty.get() || totalLiveSize() > 0);
+                // Issue #538: force a fresh checkpoint persist whenever the
+                // Stage 1→3 window observed drift (segments dropped or
+                // adopted). Without this, the IndexStatus on disk would
+                // continue to reference the stale Stage-1 snapshot until
+                // some unrelated operation marks the store dirty.
+                boolean stage1Stage3Drift = finalNewSegments.size()
+                        != newSegments.size();
+                dirty.set(dirty.get() || stage1Stage3Drift || totalLiveSize() > 0);
             } finally {
                 stateLock.writeLock().unlock();
             }
