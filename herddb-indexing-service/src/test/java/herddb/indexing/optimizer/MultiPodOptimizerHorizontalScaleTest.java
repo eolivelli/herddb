@@ -148,11 +148,21 @@ public class MultiPodOptimizerHorizontalScaleTest {
     }
 
     private IndexOptimizerMain startPod(int podOrdinal, boolean leaderExecutesTasks) throws Exception {
+        return startPod(podOrdinal, leaderExecutesTasks, new InMemorySegmentMerger(), null);
+    }
+
+    private IndexOptimizerMain startPod(int podOrdinal, boolean leaderExecutesTasks,
+                                        InMemorySegmentMerger merger, Properties overrides)
+            throws Exception {
         Properties props = basicProps(leaderExecutesTasks);
         // Inject role via explicit config — HOSTNAME-based detection wouldn't work in-process.
         props.setProperty(OptimizerConfiguration.PROPERTY_ROLE_IS_LEADER,
                 podOrdinal == 0 ? "true" : "false");
-        InMemorySegmentMerger merger = new InMemorySegmentMerger();
+        if (overrides != null) {
+            for (String key : overrides.stringPropertyNames()) {
+                props.setProperty(key, overrides.getProperty(key));
+            }
+        }
         IndexOptimizerMain pod = new IndexOptimizerMain(new OptimizerConfiguration(props), merger);
         pod.start();
         return pod;
@@ -261,6 +271,130 @@ public class MultiPodOptimizerHorizontalScaleTest {
         } finally {
             worker.shutdown();
             leader.shutdown();
+        }
+    }
+
+    @Test
+    public void workerCrashMidClaimIsRecoveredByAnotherPod() throws Exception {
+        // Acceptance test for the failure-recovery contract: a worker pod
+        // claims a task, starts merging, then dies. Another pod (the leader,
+        // configured with leaderExecuteTasks=true) must observe the orphaned
+        // CLAIMED task once the lease ephemeral is gone, reset it to PENDING
+        // via the orphan scanner, and then drain it to completion.
+        //
+        // To keep the wall-clock short we cap session.timeout at the curator-
+        // test minimum (4 s) and orphan.reset.ms at 2× session.timeout (8 s).
+        // The test deletes the worker's lease znode directly to simulate the
+        // ZK session expiry without actually waiting for it.
+        for (int i = 0; i < 4; i++) {
+            seedActive("seg-pre-" + i, 1_000_000L);
+        }
+
+        // Worker pod (will be crashed): override session timeout + orphan reset
+        // so the test runs in <30 s. Inject a merger hook that latches forever
+        // — once the worker claims a task it will sleep inside merge().
+        java.util.concurrent.CountDownLatch hookEntered = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch hookRelease = new java.util.concurrent.CountDownLatch(1);
+        InMemorySegmentMerger workerMerger = new InMemorySegmentMerger();
+        workerMerger.setHook(() -> {
+            hookEntered.countDown();
+            try {
+                hookRelease.await(60, java.util.concurrent.TimeUnit.SECONDS);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        Properties fastZk = new Properties();
+        fastZk.setProperty(OptimizerConfiguration.PROPERTY_ZOOKEEPER_SESSION_TIMEOUT, "4000");
+        fastZk.setProperty(OptimizerConfiguration.PROPERTY_TASKS_ORPHAN_RESET_MS, "8000");
+
+        // Leader-only (leaderExecuteTasks=false) so the leader does not race
+        // the worker for the first claim — the worker must win deterministically.
+        IndexOptimizerMain leader = startPod(0, /* leaderExecutesTasks */ false,
+                new InMemorySegmentMerger(), fastZk);
+        IndexOptimizerMain worker = startPod(1, /* leaderExecutesTasks */ false,
+                workerMerger, fastZk);
+
+        try {
+            // Wait until the worker enters the merger hook — confirms a task is
+            // CLAIMED on the worker.
+            assertTrue("worker must claim a task and enter merge() within 30 s",
+                    hookEntered.await(30, java.util.concurrent.TimeUnit.SECONDS));
+
+            // Locate the CLAIMED task and verify it's owned by the worker's UUID.
+            OptimizerTaskRegistry taskRegistry = new OptimizerTaskRegistry(() -> rawZk, BASE_PATH);
+            VersionedOptimizerTask claimedTask = null;
+            for (VersionedOptimizerTask vt : taskRegistry.listTasks(TS_UUID)) {
+                if (vt.task().getState() == OptimizerTaskState.CLAIMED) {
+                    claimedTask = vt;
+                    break;
+                }
+            }
+            assertNotNull("expected at least one CLAIMED task before the simulated crash", claimedTask);
+
+            // Simulate worker crash: delete the lease ephemeral directly (any ZK
+            // client with write access can — the orphan scanner's contract is
+            // "missing lease + age >= orphan.reset.ms ⇒ reset"), then shut down
+            // the worker pod. Real-world equivalents: ZK session expiry, pod
+            // SIGKILL, network partition.
+            rawZk.delete(taskRegistry.leasePath(TS_UUID, claimedTask.task().getTaskId()), -1);
+            // Release the hook so the worker's blocked merge thread can exit
+            // before we shut down the pod (avoids a noisy ERROR from the
+            // interrupted hook).
+            hookRelease.countDown();
+            worker.shutdown();
+
+            // Bring up a fresh worker pod (ordinal 2 — we re-use ordinal 1's
+            // worker role via explicit config). Start it AFTER the worker we
+            // crashed so the claim race is forced onto this fresh pod.
+            InMemorySegmentMerger recoveryMerger = new InMemorySegmentMerger();
+            // Switch the leader to leaderExecuteTasks=true so it ALSO drains;
+            // this is the steady-state production deployment. The leader pod's
+            // tick already runs the orphan scanner; with the lease gone and
+            // age >= 8 s, the scanner resets the task and the leader's drain
+            // path consumes it.
+            leader.shutdown();
+            leader = startPod(0, /* leaderExecutesTasks */ true,
+                    recoveryMerger, fastZk);
+
+            // Wait for the orphan scanner to reset the task AND a worker to
+            // drain it. The leader pod (now with leaderExecuteTasks=true)
+            // does both. Allow up to 30 s: orphan.reset.ms = 8 s + a few
+            // scheduler ticks.
+            final OptimizerTaskRegistry taskRegistryFinal = taskRegistry;
+            final String claimedTaskId = claimedTask.task().getTaskId();
+            waitUntil(() -> {
+                try {
+                    java.util.Optional<VersionedOptimizerTask> vt =
+                            taskRegistryFinal.getTask(TS_UUID, claimedTaskId);
+                    return vt.isPresent()
+                            && vt.get().task().getState() == OptimizerTaskState.DONE;
+                } catch (Exception e) {
+                    return false;
+                }
+            }, 30_000L);
+
+            // The recovery merger ran the work — invocation count must be >= 1.
+            assertTrue("recovery worker must have invoked the merger",
+                    recoveryMerger.getInvocationCount() >= 1);
+
+            // No PENDING/CLAIMED tasks remain.
+            for (VersionedOptimizerTask vt : taskRegistryFinal.listTasks(TS_UUID)) {
+                assertEquals("no PENDING/CLAIMED tasks may remain after recovery: " + vt.task(),
+                        false, vt.task().getState().blocksInputs());
+            }
+        } finally {
+            hookRelease.countDown(); // belt-and-suspenders
+            try {
+                worker.shutdown();
+            } catch (RuntimeException ignored) {
+                // already shut down
+            }
+            try {
+                leader.shutdown();
+            } catch (RuntimeException ignored) {
+                // already shut down
+            }
         }
     }
 
