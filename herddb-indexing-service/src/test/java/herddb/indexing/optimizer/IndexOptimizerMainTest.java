@@ -154,6 +154,16 @@ public class IndexOptimizerMainTest {
         // assertion (1 merge invocation) doesn't race with watcher-driven
         // wakeups from the createSegment / deprecate side-effects.
         props.setProperty(OptimizerConfiguration.PROPERTY_EVENT_DEBOUNCE_MS, "60000");
+        // Step 2 default is LEAST_LOADED which requires live IS instance ephemerals
+        // in ZK — this single-pod test doesn't register any, so pin to FIXED_ZERO
+        // to preserve the pre-step-2 "owner = 0" semantics for the merge output.
+        props.setProperty(OptimizerConfiguration.PROPERTY_OWNER_SELECTOR_POLICY, "FIXED_ZERO");
+        // Step 7: pin role to LEADER so the single-pod test reliably drives
+        // the producer + consumer through tickSafe (the default "auto" detection
+        // falls back to WORKER when HOSTNAME doesn't match the StatefulSet regex).
+        props.setProperty(OptimizerConfiguration.PROPERTY_ROLE_IS_LEADER, "true");
+        // orphan.reset.ms must be >= 2 × session timeout (startup validation).
+        props.setProperty(OptimizerConfiguration.PROPERTY_TASKS_ORPHAN_RESET_MS, "120000");
 
         InMemorySegmentMerger merger = new InMemorySegmentMerger();
         IndexOptimizerMain main = new IndexOptimizerMain(new OptimizerConfiguration(props), merger);
@@ -262,6 +272,88 @@ public class IndexOptimizerMainTest {
             fail("expected IllegalStateException but got " + other);
         } finally {
             main.shutdown();
+        }
+    }
+
+    @Test
+    public void httpEndpointReportsRoleAndTaskQueueMetrics() throws Exception {
+        registerTablespace(TS_NAME, TS_UUID);
+        Properties props = new Properties();
+        props.setProperty(OptimizerConfiguration.PROPERTY_ZOOKEEPER_ADDRESS, zkServer.getConnectString());
+        props.setProperty(OptimizerConfiguration.PROPERTY_ZOOKEEPER_SESSION_TIMEOUT, "30000");
+        props.setProperty(OptimizerConfiguration.PROPERTY_ZOOKEEPER_PATH, BASE_PATH);
+        props.setProperty(OptimizerConfiguration.PROPERTY_TABLESPACE_NAME, TS_NAME);
+        props.setProperty(OptimizerConfiguration.PROPERTY_INTERVAL_MS, "100");
+        props.setProperty(OptimizerConfiguration.PROPERTY_RETENTION_MS, "60000");
+        props.setProperty(OptimizerConfiguration.PROPERTY_OWNER_SELECTOR_POLICY, "FIXED_ZERO");
+        props.setProperty(OptimizerConfiguration.PROPERTY_ROLE_IS_LEADER, "true");
+        props.setProperty(OptimizerConfiguration.PROPERTY_TASKS_ORPHAN_RESET_MS, "120000");
+        // Pick a non-default high port to avoid collisions with the chart's default 9853
+        // if another test (or the dev's actual optimizer) is bound there.
+        props.setProperty(OptimizerConfiguration.PROPERTY_HTTP_PORT, "19854");
+
+        InMemorySegmentMerger merger = new InMemorySegmentMerger();
+        IndexOptimizerMain main = new IndexOptimizerMain(new OptimizerConfiguration(props), merger);
+        try {
+            main.start();
+            // Engine must have ticked at least once so producer ran on the
+            // leader path (otherwise the role metric is the only horizontal-
+            // scale gauge that is non-trivial).
+            long deadline = System.currentTimeMillis() + 5_000L;
+            while (System.currentTimeMillis() < deadline
+                    && main.getEngine().getRuns() == 0L) {
+                Thread.sleep(50);
+            }
+            int port = 19854;
+            String metrics = curl("http://127.0.0.1:" + port + "/metrics");
+            assertTrue("metrics must label the leader role: " + metrics,
+                    metrics.contains("herddb_optimizer_role{role=\"LEADER\"} 1"));
+            assertTrue("metrics must label the worker role as 0: " + metrics,
+                    metrics.contains("herddb_optimizer_role{role=\"WORKER\"} 0"));
+            assertTrue("metrics must include leader_executes_tasks gauge: " + metrics,
+                    metrics.contains("herddb_optimizer_leader_executes_tasks 1"));
+            assertTrue("metrics must include tasks_created_total counter: " + metrics,
+                    metrics.contains("herddb_optimizer_tasks_created_total"));
+            assertTrue("metrics must include tasks_claimed_total counter: " + metrics,
+                    metrics.contains("herddb_optimizer_tasks_claimed_total"));
+            assertTrue("metrics must include labeled tasks_completed_total: " + metrics,
+                    metrics.contains("herddb_optimizer_tasks_completed_total{outcome=\"success\"}"));
+            assertTrue("metrics must include orphans_reset_total: " + metrics,
+                    metrics.contains("herddb_optimizer_orphans_reset_total"));
+            assertTrue("metrics must include current_leader_epoch gauge: " + metrics,
+                    metrics.contains("herddb_optimizer_current_leader_epoch"));
+
+            String status = curl("http://127.0.0.1:" + port + "/status");
+            assertTrue("/status must include role: " + status,
+                    status.contains("\"role\": \"LEADER\""));
+            assertTrue("/status must include is_leader: " + status,
+                    status.contains("\"is_leader\": true"));
+            assertTrue("/status must include leader_executes_tasks: " + status,
+                    status.contains("\"leader_executes_tasks\": true"));
+            assertTrue("/status must include tasks_created_total: " + status,
+                    status.contains("\"tasks_created_total\":"));
+            assertTrue("/status must include current_leader_epoch: " + status,
+                    status.contains("\"current_leader_epoch\":"));
+        } finally {
+            main.shutdown();
+        }
+    }
+
+    private static String curl(String url) throws Exception {
+        java.net.HttpURLConnection conn = (java.net.HttpURLConnection)
+                new java.net.URL(url).openConnection();
+        conn.setConnectTimeout(2000);
+        conn.setReadTimeout(2000);
+        assertEquals(200, conn.getResponseCode());
+        try (java.io.BufferedReader r = new java.io.BufferedReader(
+                new java.io.InputStreamReader(conn.getInputStream(),
+                        java.nio.charset.StandardCharsets.UTF_8))) {
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = r.readLine()) != null) {
+                sb.append(line).append('\n');
+            }
+            return sb.toString();
         }
     }
 

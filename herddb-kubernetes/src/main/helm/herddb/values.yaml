@@ -331,6 +331,54 @@ indexingService:
 # segmented-v2 indexes are managed by this service.
 indexOptimizer:
   enabled: false
+  # Number of optimizer pods. Pod ordinal 0 is the leader (selects merge
+  # candidates and enqueues tasks); pods 1..N-1 are workers (consume tasks
+  # only). With replicas=1 the single pod is both leader and worker —
+  # equivalent to the pre-step-7 deployment. Scale up to add merge throughput
+  # when the leader cannot keep the queue drained. K8s >= 1.28 required: the
+  # leader role is detected from the `apps.kubernetes.io/pod-index` downward
+  # API label.
+  replicas: 1
+  # Horizontal scalability — when false, the LEADER pod produces tasks but
+  # never consumes them. Used by the multi-replica K8s acceptance test
+  # (IndexOptimizerKubernetesMultiReplicaIT) to prove the worker pods
+  # actually do the merge work, and also a legitimate "dedicated scheduler"
+  # operator mode for large clusters.
+  leaderExecuteTasks: true
+  # Owner-selection policy for merged-segment ownership. LEAST_LOADED (the
+  # default) picks the IS instance with the lowest current byte footprint;
+  # FIXED_ZERO matches the pre-step-2 behaviour (always owner 0);
+  # ROUND_ROBIN cycles through instance ordinals; STATIC reads a CSV
+  # assignment from indexOptimizer.ownerSelector.staticAssignment.
+  ownerSelector:
+    policy: LEAST_LOADED
+    # staticAssignment: "0,1,0,1"
+  # ZK-backed task queue knobs (step 5).
+  tasks:
+    # Maximum retries for a failed task before it is poisoned (terminal-for-
+    # retry but does not block input re-selection).
+    maxAttempts: 3
+    # Window after which a CLAIMED task with no live lease ephemeral is
+    # reclaimed. MUST be >= 2 × zkSessionTimeout — startup validation
+    # enforces this so a briefly-disconnected worker is not yanked.
+    orphanResetMs: 120000
+    # GC window for terminal DONE/FAILED tasks.
+    terminalRetentionMs: 3600000
+    # GC window for POISON tasks (longer so operators have time to
+    # investigate).
+    poisonRetentionMs: 604800000
+  # Consumer loop knobs.
+  consumer:
+    # Maximum tasks each pod drains per scheduler tick. Bounds the time
+    # spent draining so the leader's producer step still gets cycles.
+    maxTasksPerTick: 4
+  # Indexing-service instance count fallback when the ZK ephemerals are
+  # empty (e.g. during cold-boot ordering). Production deployments should
+  # leave this at 0 and rely on the ZK discovery; setting it forces the
+  # owner selector to assume N live instances even without ephemerals,
+  # which is useful for the K8s multi-replica acceptance test.
+  indexing:
+    numInstances: 0
   # Human-readable tablespace name this optimizer manages — REQUIRED when
   # enabled=true (e.g. "herd", the HerdDB default). The optimizer resolves
   # the UUID from ZooKeeper at startup; no manual UUID lookup is needed.
@@ -419,6 +467,9 @@ indexOptimizer:
   pdb:
     enabled: false
     minAvailable: 0
+    # When set, takes precedence over minAvailable. Use with replicas > 1
+    # so K8s eviction always leaves at least one worker draining tasks.
+    # maxUnavailable: 1
   # Memory sized to hold the optimizer's heap (javaOpts -Xmx) plus JVM
   # non-heap overhead (~1 GiB for code-cache, metaspace, thread stacks)
   # plus direct memory (MaxDirectMemorySize). For the default 6 g heap

@@ -148,6 +148,29 @@ public class IndexOptimizerMainConfigTest {
     }
 
     @Test
+    public void startupRejectsOrphanResetSmallerThanTwiceSessionTimeout() throws Exception {
+        // The plan's recovery contract requires orphan.reset.ms >= 2 ×
+        // session.timeout so a briefly-disconnected worker is not yanked.
+        // IndexOptimizerMain.start enforces this at startup; this test
+        // pins the throw + the diagnostic message.
+        Properties p = baseProps();
+        p.setProperty(OptimizerConfiguration.PROPERTY_ZOOKEEPER_SESSION_TIMEOUT, "40000");
+        p.setProperty(OptimizerConfiguration.PROPERTY_TASKS_ORPHAN_RESET_MS, "70000");
+        IndexOptimizerMain main = new IndexOptimizerMain(new OptimizerConfiguration(p),
+                new InMemorySegmentMerger());
+        try {
+            main.start();
+            org.junit.Assert.fail("expected IllegalStateException on bad orphan.reset.ms");
+        } catch (IllegalStateException ok) {
+            assertTrue("error must name both keys, got: " + ok.getMessage(),
+                    ok.getMessage().contains("orphan.reset.ms")
+                            && ok.getMessage().contains("session.timeout"));
+        } finally {
+            main.shutdown();
+        }
+    }
+
+    @Test
     public void loadMergerSpiReturnsNoopFallback() {
         SegmentMerger m = IndexOptimizerMain.loadMergerSpi();
         assertNotNull(m);

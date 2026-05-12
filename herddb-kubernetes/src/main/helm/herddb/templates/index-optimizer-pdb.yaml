@@ -7,10 +7,17 @@ metadata:
     {{- include "herddb.labels" . | nindent 4 }}
     app.kubernetes.io/component: index-optimizer
 spec:
-  # Default minAvailable: 0 — the optimizer is a singleton; we tolerate
-  # transient eviction during node maintenance because a missed merge cycle
-  # is harmless.
+  {{- if .Values.indexOptimizer.pdb.maxUnavailable }}
+  # Step 9: with replicas > 1 the chart enforces a rolling-upgrade ceiling
+  # (default 1) so the cluster always has at least one worker draining
+  # tasks. Operators can override via indexOptimizer.pdb.maxUnavailable.
+  maxUnavailable: {{ .Values.indexOptimizer.pdb.maxUnavailable }}
+  {{- else }}
+  # Default minAvailable: 0 — when running with replicas=1 the optimizer
+  # tolerates transient eviction during node maintenance because a missed
+  # merge cycle is harmless. Switch to maxUnavailable when replicas > 1.
   minAvailable: {{ .Values.indexOptimizer.pdb.minAvailable | default 0 }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "herddb.selectorLabels" . | nindent 6 }}

@@ -73,7 +73,7 @@ flowchart LR
     ISvcP["Primary<br/>(writes index)"]
     ISvcS1["Shadow 1<br/>(read-only)"]
     ISvcS2["Shadow 2<br/>(read-only)"]
-    IndexOpt["Index Optimizer<br/>(singleton; merges<br/>segments in background)"]
+    IndexOpt["Index Optimizer<br/>(leader + N workers;<br/>merges segments in background)"]
   end
 
   subgraph "Storage tier"
@@ -299,8 +299,9 @@ flowchart LR
     S3["Shadow N"]
   end
 
-  subgraph Optimizer["Index Optimizer (singleton, background)"]
-    O["Watches segment registry → merges<br/>small segments → publishes output,<br/>CAS-deprecates inputs"]
+  subgraph Optimizer["Index Optimizer (leader + N workers, background)"]
+    OLeader["Leader (pod-0)<br/>watches registry → enqueues<br/>merge tasks → load-balances<br/>output ownership across IS pods"]
+    OWorker["Worker pods (1..N-1)<br/>claim tasks → run merge →<br/>publish output, CAS-deprecate inputs"]
   end
 
   JDBC["JDBC client"]
@@ -316,9 +317,11 @@ flowchart LR
   OBJ -. reload IndexStatus .-> S2
   OBJ -. reload IndexStatus .-> S3
 
-  ZK -. watch new sealed segments .-> O
-  O -->|read inputs / write merged output| OBJ
-  O -. CAS register + deprecate segments .-> ZK
+  ZK -. watch new sealed segments .-> OLeader
+  OLeader -. enqueue task .-> ZK
+  ZK -. wake .-> OWorker
+  OWorker -->|read inputs / write merged output| OBJ
+  OWorker -. CAS register + deprecate segments .-> ZK
   ZK -. notify merged segment .-> P
   ZK -. notify merged segment .-> S1
   ZK -. notify merged segment .-> S2
@@ -363,13 +366,34 @@ The primary and shadows watch the same registry via
 `SegmentAssignmentWatcher` and live-reload merged outputs without a
 restart.
 
-**Singleton deployment.** Packaged inside `herddb-services` and shipped
-in the Helm chart as a separate StatefulSet (`replicas: 1`,
-`herddb-kubernetes/.../templates/index-optimizer-statefulset.yaml`)
-with its own ConfigMap, a Pod Disruption Budget, and a small PVC for
-merge scratch files. An `OptimizerLeaderLock` ephemeral znode
-additionally guards against two optimizers racing on the same
-tablespace during a rolling upgrade.
+**Horizontally scalable deployment (leader + workers).** Packaged inside
+`herddb-services` and shipped in the Helm chart as a separate
+StatefulSet (`herddb-kubernetes/.../templates/index-optimizer-statefulset.yaml`)
+with templated `replicas` (default 1), a ConfigMap, a Pod Disruption
+Budget, and a small per-pod PVC for merge scratch files. **Pod ordinal 0
+is the leader**: it scans the segment registry, picks merge candidates,
+chooses the target indexing-service instance for each output via a
+configurable `OwnerSelector` (default `LEAST_LOADED`), and writes a
+task znode under `/{basePath}/index-optimizer/tasks/{tablespaceUuid}/`.
+**Pods 1..N-1 are workers**: they watch the task znode path, claim a
+task by creating an ephemeral lease, run the merge, publish the output
+and CAS-deprecate the inputs, then mark the task DONE. With
+`replicas=1` the single pod plays both roles — behaviour is equivalent
+to the pre-step-7 deployment. Set `indexOptimizer.replicas` higher to
+add merge throughput when the leader cannot keep the queue drained.
+
+The existing `OptimizerLeaderLock` ephemeral znode is retained as a
+liveness fence between successive leader pods during rolling upgrades,
+and a new monotonic `LeaderEpoch` znode (CAS-bumped on every producer
+tick) prevents a stale leader from enqueueing tasks at an old epoch
+after a new leader has taken over. Worker-side fencing piggybacks on
+the task znode version: a CAS-loser worker simply deletes its own
+ephemeral lease and retries. Input segments are NEVER mutated until
+the merge output is published — every failure path preserves the
+"stateless across runs" invariant the engine has always relied on, so
+a crashed worker's task is re-claimed by another (or reset by the
+leader's orphan scanner once the ephemeral lease vanishes) without
+ever stranding the inputs.
 
 **Pressure-driven IS-local fallback.** The indexing service keeps its
 own in-process compaction loop, but with the optimizer enabled that

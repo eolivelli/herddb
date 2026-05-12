@@ -724,6 +724,246 @@
         }
       ],
       "title": "Optimizer Disk & GC"
+    },
+    {
+      "collapse": false,
+      "height": 250,
+      "panels": [
+        {
+          "datasource": "Prometheus",
+          "id": 1180,
+          "title": "Pod Role (LEADER=1)",
+          "description": "Per-replica role gauge. 1 indicates the pod is the LEADER for the current tablespace; pod ordinal 0 should always be 1, others 0. Drops to 0 momentarily across rolling upgrades.",
+          "type": "graph",
+          "fill": 1,
+          "lines": true,
+          "linewidth": 2,
+          "stack": false,
+          "span": 6,
+          "legend": {
+            "alignAsTable": true,
+            "avg": false,
+            "current": true,
+            "max": true,
+            "min": true,
+            "show": true,
+            "values": true
+          },
+          "targets": [
+            {
+              "expr": "herddb_optimizer_role{job=\"index-optimizer\",instance=~\"$instance\",role=\"LEADER\"}",
+              "format": "time_series",
+              "legendFormat": "LEADER — {{instance}}",
+              "refId": "A"
+            }
+          ],
+          "yaxes": [{"format": "short", "max": 1, "min": 0}, {"format": "short"}]
+        },
+        {
+          "datasource": "Prometheus",
+          "id": 1181,
+          "title": "Current Leader Epoch",
+          "description": "Monotonic leader-epoch znode CAS-bumped by the producer on every leader tick. A flat-line means the leader is stable; a jump means a new leader took over. Workers always report -1.",
+          "type": "graph",
+          "fill": 0,
+          "lines": true,
+          "linewidth": 1,
+          "stack": false,
+          "span": 6,
+          "legend": {
+            "alignAsTable": true,
+            "current": true,
+            "max": true,
+            "show": true,
+            "values": true
+          },
+          "targets": [
+            {
+              "expr": "herddb_optimizer_current_leader_epoch{job=\"index-optimizer\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "legendFormat": "epoch — {{instance}}",
+              "refId": "A"
+            }
+          ],
+          "yaxes": [{"format": "short"}, {"format": "short"}]
+        }
+      ],
+      "title": "Pod Role & Leadership"
+    },
+    {
+      "collapse": false,
+      "height": 280,
+      "panels": [
+        {
+          "datasource": "Prometheus",
+          "id": 1182,
+          "title": "Task Throughput (tasks/min)",
+          "description": "Rate of tasks the leader enqueues vs the rate workers claim and complete. A growing gap between created and claimed means the worker pool is undersized.",
+          "type": "graph",
+          "fill": 1,
+          "lines": true,
+          "linewidth": 1,
+          "stack": false,
+          "span": 6,
+          "legend": {
+            "alignAsTable": true,
+            "avg": true,
+            "current": true,
+            "max": true,
+            "show": true,
+            "values": true
+          },
+          "targets": [
+            {
+              "expr": "rate(herddb_optimizer_tasks_created_total{job=\"index-optimizer\",instance=~\"$instance\"}[5m]) * 60",
+              "format": "time_series",
+              "legendFormat": "created/min — {{instance}}",
+              "refId": "A"
+            },
+            {
+              "expr": "rate(herddb_optimizer_tasks_claimed_total{job=\"index-optimizer\",instance=~\"$instance\"}[5m]) * 60",
+              "format": "time_series",
+              "legendFormat": "claimed/min — {{instance}}",
+              "refId": "B"
+            },
+            {
+              "expr": "rate(herddb_optimizer_tasks_completed_total{job=\"index-optimizer\",instance=~\"$instance\",outcome=\"success\"}[5m]) * 60",
+              "format": "time_series",
+              "legendFormat": "success/min — {{instance}}",
+              "refId": "C"
+            }
+          ],
+          "yaxes": [{"format": "short"}, {"format": "short"}]
+        },
+        {
+          "datasource": "Prometheus",
+          "id": 1183,
+          "title": "Task Outcomes (per 5m)",
+          "description": "Stacked breakdown of task outcomes per replica. Any non-zero failed/poisoned/noop indicates either contention (noop) or a real failure that should be triaged.",
+          "type": "graph",
+          "fill": 1,
+          "lines": true,
+          "linewidth": 1,
+          "stack": true,
+          "span": 6,
+          "legend": {
+            "alignAsTable": true,
+            "current": true,
+            "max": true,
+            "show": true,
+            "values": true
+          },
+          "targets": [
+            {
+              "expr": "increase(herddb_optimizer_tasks_completed_total{job=\"index-optimizer\",instance=~\"$instance\",outcome=\"success\"}[5m])",
+              "format": "time_series",
+              "legendFormat": "success — {{instance}}",
+              "refId": "A"
+            },
+            {
+              "expr": "increase(herddb_optimizer_tasks_completed_total{job=\"index-optimizer\",instance=~\"$instance\",outcome=\"noop\"}[5m])",
+              "format": "time_series",
+              "legendFormat": "noop — {{instance}}",
+              "refId": "B"
+            },
+            {
+              "expr": "increase(herddb_optimizer_tasks_completed_total{job=\"index-optimizer\",instance=~\"$instance\",outcome=\"failed\"}[5m])",
+              "format": "time_series",
+              "legendFormat": "failed — {{instance}}",
+              "refId": "C"
+            },
+            {
+              "expr": "increase(herddb_optimizer_tasks_completed_total{job=\"index-optimizer\",instance=~\"$instance\",outcome=\"poisoned\"}[5m])",
+              "format": "time_series",
+              "legendFormat": "poisoned — {{instance}}",
+              "refId": "D"
+            }
+          ],
+          "yaxes": [{"format": "short"}, {"format": "short"}]
+        }
+      ],
+      "title": "Task Queue Throughput"
+    },
+    {
+      "collapse": false,
+      "height": 280,
+      "panels": [
+        {
+          "datasource": "Prometheus",
+          "id": 1184,
+          "title": "Orphan Recovery (per 5m)",
+          "description": "Producer-side housekeeping. orphans_reset = lease expired + worker crashed; orphans_poisoned = same but attempts exceeded; orphans_deleted_after_deprecate = the worker died after partial deprecation and the engine's stateless re-pick takes over. Sustained non-zero values point to an unstable worker pool.",
+          "type": "graph",
+          "fill": 1,
+          "lines": true,
+          "linewidth": 1,
+          "stack": false,
+          "span": 6,
+          "legend": {
+            "alignAsTable": true,
+            "current": true,
+            "max": true,
+            "show": true,
+            "values": true
+          },
+          "targets": [
+            {
+              "expr": "increase(herddb_optimizer_orphans_reset_total{job=\"index-optimizer\",instance=~\"$instance\"}[5m])",
+              "format": "time_series",
+              "legendFormat": "reset — {{instance}}",
+              "refId": "A"
+            },
+            {
+              "expr": "increase(herddb_optimizer_orphans_poisoned_total{job=\"index-optimizer\",instance=~\"$instance\"}[5m])",
+              "format": "time_series",
+              "legendFormat": "poisoned — {{instance}}",
+              "refId": "B"
+            },
+            {
+              "expr": "increase(herddb_optimizer_orphans_deleted_after_deprecate_total{job=\"index-optimizer\",instance=~\"$instance\"}[5m])",
+              "format": "time_series",
+              "legendFormat": "deleted-after-deprecate — {{instance}}",
+              "refId": "C"
+            }
+          ],
+          "yaxes": [{"format": "short"}, {"format": "short"}]
+        },
+        {
+          "datasource": "Prometheus",
+          "id": 1185,
+          "title": "Task Queue GC & Producer Rejections",
+          "description": "terminal_gc = DONE/FAILED/POISON znodes reaped by retention; producer_ticks_rejected = stale-leader ticks aborted on the LeaderEpoch CAS. Frequent rejections signal split-brain across rolling upgrades.",
+          "type": "graph",
+          "fill": 0,
+          "lines": true,
+          "linewidth": 1,
+          "stack": false,
+          "span": 6,
+          "legend": {
+            "alignAsTable": true,
+            "current": true,
+            "max": true,
+            "show": true,
+            "values": true
+          },
+          "targets": [
+            {
+              "expr": "increase(herddb_optimizer_terminal_gc_total{job=\"index-optimizer\",instance=~\"$instance\"}[5m])",
+              "format": "time_series",
+              "legendFormat": "terminal_gc — {{instance}}",
+              "refId": "A"
+            },
+            {
+              "expr": "increase(herddb_optimizer_producer_ticks_rejected_total{job=\"index-optimizer\",instance=~\"$instance\"}[5m])",
+              "format": "time_series",
+              "legendFormat": "producer_rejected — {{instance}}",
+              "refId": "B"
+            }
+          ],
+          "yaxes": [{"format": "short"}, {"format": "short"}]
+        }
+      ],
+      "title": "Task Queue Recovery"
     }
   ],
   "schemaVersion": 14,

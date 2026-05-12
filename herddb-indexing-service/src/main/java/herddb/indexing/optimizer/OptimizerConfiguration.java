@@ -228,6 +228,126 @@ public final class OptimizerConfiguration {
     public static final String PROPERTY_MERGE_KWAY_MAX = "indexoptimizer.merge.kway.max";
     public static final int PROPERTY_MERGE_KWAY_MAX_DEFAULT = 0;
 
+    // -------------------------------------------------------------------------
+    // Horizontal scalability: pod role detection (step 1)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Explicit pod role override. {@code true} / {@code false} forces leader /
+     * worker; {@code auto} (the default) falls back to the environment-variable
+     * and hostname-regex heuristics in {@link OptimizerRole#detect}.
+     */
+    public static final String PROPERTY_ROLE_IS_LEADER = "indexoptimizer.role.is.leader";
+    public static final String PROPERTY_ROLE_IS_LEADER_DEFAULT = "auto";
+
+    /**
+     * Name of the env var that carries this pod's StatefulSet ordinal. Helm
+     * wires this from the K8s downward API field
+     * {@code metadata.labels['apps.kubernetes.io/pod-index']}.
+     */
+    public static final String PROPERTY_ROLE_POD_ORDINAL_ENV = "indexoptimizer.role.pod.ordinal.env";
+    public static final String PROPERTY_ROLE_POD_ORDINAL_ENV_DEFAULT = "POD_ORDINAL";
+
+    /** Regex extracting the ordinal from {@code HOSTNAME} when the env var is absent. */
+    public static final String PROPERTY_ROLE_HOSTNAME_ORDINAL_REGEX =
+            "indexoptimizer.role.hostname.ordinal.regex";
+    public static final String PROPERTY_ROLE_HOSTNAME_ORDINAL_REGEX_DEFAULT = "^.*-(\\d+)$";
+
+    /**
+     * When {@code false}, the leader produces tasks but never consumes them —
+     * pure scheduler mode. Used by the K8s multi-replica acceptance test to
+     * prove that a worker pod actually performs the merge work; also a
+     * legitimate operator knob for "dedicated scheduler" deployments.
+     */
+    public static final String PROPERTY_ROLE_LEADER_EXECUTE_TASKS =
+            "indexoptimizer.role.leader.execute.tasks";
+    public static final boolean PROPERTY_ROLE_LEADER_EXECUTE_TASKS_DEFAULT = true;
+
+    // -------------------------------------------------------------------------
+    // Owner-instance selector (step 1 introduces; step 2 makes LEAST_LOADED default)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Owner-selection policy applied at task creation time. One of
+     * {@code FIXED_ZERO}, {@code ROUND_ROBIN}, {@code STATIC}, {@code LEAST_LOADED}.
+     * Default since step 2 is {@code LEAST_LOADED} (load-aware assignment via
+     * live-instance discovery from ZK ephemerals). Single-IS deployments and
+     * tests with no instance ephemerals keep producing {@code ownerInstanceId=0}
+     * because {@link ZkIndexingServiceInstanceDirectory} falls back to
+     * {@code [0..PROPERTY_INDEXING_NUM_INSTANCES)} (default 0 → empty → selector
+     * throws, engine logs and retries on the next tick).
+     */
+    public static final String PROPERTY_OWNER_SELECTOR_POLICY = "indexoptimizer.owner.selector.policy";
+    public static final String PROPERTY_OWNER_SELECTOR_POLICY_DEFAULT = "LEAST_LOADED";
+
+    /**
+     * Comma-separated list of instance ordinals consumed cyclically by
+     * {@link StaticAssignmentOwnerSelector}. Read only when policy=STATIC.
+     */
+    public static final String PROPERTY_OWNER_SELECTOR_STATIC_ASSIGNMENT =
+            "indexoptimizer.owner.selector.static.assignment";
+
+    /**
+     * Number of indexing-service instances the optimizer will assign segments
+     * across. {@code 0} (default) means "auto-discover from ZK". The
+     * auto-discovery wiring lands in step 2; until then operators that want
+     * non-zero owner ordinals must set this knob explicitly.
+     */
+    public static final String PROPERTY_INDEXING_NUM_INSTANCES = "indexoptimizer.indexing.num.instances";
+    public static final int PROPERTY_INDEXING_NUM_INSTANCES_DEFAULT = 0;
+
+    // -------------------------------------------------------------------------
+    // Task queue lifecycle knobs (step 5)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Maximum retries for a failed task before it is moved to {@code POISON}
+     * (terminal-for-retry but does not block input re-selection).
+     */
+    public static final String PROPERTY_TASKS_MAX_ATTEMPTS = "indexoptimizer.tasks.max.attempts";
+    public static final int PROPERTY_TASKS_MAX_ATTEMPTS_DEFAULT = 3;
+
+    /**
+     * Retention window for terminal {@code DONE} / {@code FAILED} tasks before
+     * the orphan scanner GCs them. {@code POISON} uses
+     * {@link #PROPERTY_TASKS_POISON_RETENTION_MS} so operators have a longer
+     * window to investigate.
+     */
+    public static final String PROPERTY_TASKS_TERMINAL_RETENTION_MS =
+            "indexoptimizer.tasks.terminal.retention.ms";
+    public static final long PROPERTY_TASKS_TERMINAL_RETENTION_MS_DEFAULT = 3_600_000L;
+
+    /**
+     * Retention window for {@code POISON} tasks. Longer than the regular
+     * terminal retention because operators need time to investigate (default
+     * 7 days).
+     */
+    public static final String PROPERTY_TASKS_POISON_RETENTION_MS =
+            "indexoptimizer.tasks.poison.retention.ms";
+    public static final long PROPERTY_TASKS_POISON_RETENTION_MS_DEFAULT = 604_800_000L;
+
+    /**
+     * Minimum age of a {@code CLAIMED} task with no live lease znode before
+     * the orphan scanner considers it orphaned and resets / poisons it.
+     * Operators MUST configure this to be ≥ 2 × {@code zookeeper.session.timeout}
+     * so an actually-alive worker whose session is briefly disconnected does
+     * not get its task yanked from under it.
+     */
+    public static final String PROPERTY_TASKS_ORPHAN_RESET_MS =
+            "indexoptimizer.tasks.orphan.reset.ms";
+    // 120 s default — comfortably above the 2 × 40 s default ZK session timeout
+    // floor enforced at startup (see IndexOptimizerMain.start).
+    public static final long PROPERTY_TASKS_ORPHAN_RESET_MS_DEFAULT = 120_000L;
+
+    /**
+     * Maximum number of consumer iterations per scheduler tick. Bounds the
+     * time spent draining the queue so the leader's producer step still gets
+     * cycles when the pod is busy.
+     */
+    public static final String PROPERTY_CONSUMER_MAX_TASKS_PER_TICK =
+            "indexoptimizer.consumer.max.tasks.per.tick";
+    public static final int PROPERTY_CONSUMER_MAX_TASKS_PER_TICK_DEFAULT = 4;
+
     private final Properties properties;
 
     public OptimizerConfiguration(Properties properties) {

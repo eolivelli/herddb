@@ -69,6 +69,13 @@ public final class OptimizerHttpServer implements AutoCloseable {
     private final ExecutorService executor;
     /** Optional: when non-null, disk-free gauges are computed for this path. */
     private final Path tmpDirectory;
+    /**
+     * Optional: when non-null, /metrics and /status emit task-queue counters,
+     * the pod's role (LEADER / WORKER), and the current leader epoch. Set by
+     * {@link IndexOptimizerMain} at startup. Tests that don't need these
+     * fields construct the server without one — backward compat.
+     */
+    private final IndexOptimizerMain optimizerMain;
 
     /**
      * Backward-compatible constructor that does not emit tmp-disk metrics.
@@ -77,23 +84,39 @@ public final class OptimizerHttpServer implements AutoCloseable {
      */
     public OptimizerHttpServer(String bindHost, int port, IndexOptimizerEngine engine)
             throws IOException {
-        this(bindHost, port, engine, null);
+        this(bindHost, port, engine, null, null);
     }
 
     /**
-     * Full constructor.
-     *
-     * @param tmpDirectory  when non-null, the {@code herddb_optimizer_tmp_disk_*}
-     *                      gauges in {@code /metrics} report the free / total bytes
-     *                      of the file-store backing this directory. Pass
-     *                      {@code null} to omit those metrics (e.g. in unit tests
-     *                      that don't set up a real tmp dir).
+     * Backward-compatible constructor with tmp-dir but without main-pod
+     * metrics. Used by tests that construct the server in isolation.
      */
     public OptimizerHttpServer(String bindHost, int port,
                                IndexOptimizerEngine engine,
                                Path tmpDirectory) throws IOException {
+        this(bindHost, port, engine, tmpDirectory, null);
+    }
+
+    /**
+     * Full constructor — used by {@link IndexOptimizerMain}.
+     *
+     * @param tmpDirectory  when non-null, the {@code herddb_optimizer_tmp_disk_*}
+     *                      gauges in {@code /metrics} report the free / total bytes
+     *                      of the file-store backing this directory.
+     * @param optimizerMain when non-null, {@code /metrics} and {@code /status}
+     *                      emit task-queue counters (created, claimed, completed,
+     *                      failed, poisoned, orphans), the pod's role and
+     *                      {@code leader_executes_tasks} flag, and the current
+     *                      leader epoch. {@code null} keeps the legacy single-pod
+     *                      metric surface for tests and pre-step-7 deployments.
+     */
+    public OptimizerHttpServer(String bindHost, int port,
+                               IndexOptimizerEngine engine,
+                               Path tmpDirectory,
+                               IndexOptimizerMain optimizerMain) throws IOException {
         this.engine = engine;
         this.tmpDirectory = tmpDirectory;
+        this.optimizerMain = optimizerMain;
         this.server = HttpServer.create(new InetSocketAddress(bindHost, port), 0);
         server.createContext("/health", new HealthHandler());
         server.createContext("/metrics", new MetricsHandler());
@@ -307,12 +330,87 @@ public final class OptimizerHttpServer implements AutoCloseable {
             // ----- Gauges: tmp disk (issue #503) -----
             appendTmpDiskMetrics(sb);
 
+            // ----- Task queue & leadership (horizontal-scale rollout) -----
+            appendTaskQueueMetrics(sb);
+
             byte[] body = sb.toString().getBytes(StandardCharsets.UTF_8);
             exchange.getResponseHeaders().set("Content-Type", "text/plain; charset=utf-8");
             exchange.sendResponseHeaders(200, body.length);
             try (OutputStream os = exchange.getResponseBody()) {
                 os.write(body);
             }
+        }
+
+        private void appendTaskQueueMetrics(StringBuilder sb) {
+            if (optimizerMain == null) {
+                return;
+            }
+            OptimizerRole role = optimizerMain.getRole();
+            // Role + leadership flags as labeled gauges so a Grafana dashboard
+            // can pivot panels by role and time-series the leadership state.
+            sb.append("# HELP herddb_optimizer_role"
+                    + " 1 when the pod has the labeled role, 0 otherwise.\n");
+            sb.append("# TYPE herddb_optimizer_role gauge\n");
+            sb.append("herddb_optimizer_role{role=\"LEADER\"} ")
+                    .append(role == OptimizerRole.LEADER ? 1 : 0).append('\n');
+            sb.append("herddb_optimizer_role{role=\"WORKER\"} ")
+                    .append(role == OptimizerRole.WORKER ? 1 : 0).append('\n');
+            appendGauge(sb, "herddb_optimizer_leader_executes_tasks",
+                    "1 when the LEADER pod also drains the task queue, 0 when it"
+                            + " is in dedicated-scheduler mode (leaderExecutesTasks=false).",
+                    optimizerMain.isLeaderExecutingTasks() ? 1L : 0L);
+            appendGauge(sb, "herddb_optimizer_current_leader_epoch",
+                    "Most recent leader epoch this pod observed when it last bumped"
+                            + " (-1 if this pod has never produced as leader).",
+                    optimizerMain.getCurrentLeaderEpoch());
+
+            // Producer-side counters (LEADER-only — workers report 0).
+            appendCounter(sb, "herddb_optimizer_tasks_created_total",
+                    "Tasks the producer wrote into the ZK queue.",
+                    optimizerMain.getTasksCreatedTotal());
+            appendCounter(sb, "herddb_optimizer_orphans_reset_total",
+                    "CLAIMED tasks reset to PENDING by the orphan scanner"
+                            + " (lease missing, age > orphan.reset.ms, attempts < max).",
+                    optimizerMain.getOrphansResetTotal());
+            appendCounter(sb, "herddb_optimizer_orphans_poisoned_total",
+                    "CLAIMED tasks transitioned to POISON by the orphan scanner"
+                            + " (attempts >= max).",
+                    optimizerMain.getOrphansPoisonedTotal());
+            appendCounter(sb, "herddb_optimizer_orphans_deleted_after_deprecate_total",
+                    "CLAIMED tasks deleted outright because at least one input was"
+                            + " already DEPRECATED — the engine's stateless re-pick handles"
+                            + " any orphan ACTIVE inputs on the next tick.",
+                    optimizerMain.getOrphansDeletedAfterDeprecateTotal());
+            appendCounter(sb, "herddb_optimizer_terminal_gc_total",
+                    "DONE/FAILED/POISON tasks reaped by the producer-side"
+                            + " retention GC.",
+                    optimizerMain.getTerminalGcTotal());
+            appendCounter(sb, "herddb_optimizer_producer_ticks_rejected_total",
+                    "Producer ticks that aborted before enqueueing any task (lock"
+                            + " not held OR stale leader-epoch lost the CAS bump).",
+                    optimizerMain.getProducerTicksRejectedTotal());
+
+            // Consumer-side counters (every pod).
+            OptimizerTaskConsumer consumer = optimizerMain.getTaskConsumer();
+            long claimed = consumer == null ? 0L : consumer.getTasksClaimedTotal();
+            long doneSuccess = consumer == null ? 0L : consumer.getTasksCompletedSuccessfullyTotal();
+            long doneNoop = consumer == null ? 0L : consumer.getTasksCompletedNoopTotal();
+            long failed = consumer == null ? 0L : consumer.getTasksFailedTotal();
+            long poisoned = consumer == null ? 0L : consumer.getTasksPoisonedTotal();
+            appendCounter(sb, "herddb_optimizer_tasks_claimed_total",
+                    "Tasks this pod claimed (CAS PENDING -> CLAIMED succeeded).",
+                    claimed);
+            sb.append("# HELP herddb_optimizer_tasks_completed_total"
+                    + " Tasks this pod completed, labeled by outcome.\n");
+            sb.append("# TYPE herddb_optimizer_tasks_completed_total counter\n");
+            sb.append("herddb_optimizer_tasks_completed_total{outcome=\"success\"} ")
+                    .append(doneSuccess).append('\n');
+            sb.append("herddb_optimizer_tasks_completed_total{outcome=\"noop\"} ")
+                    .append(doneNoop).append('\n');
+            sb.append("herddb_optimizer_tasks_completed_total{outcome=\"failed\"} ")
+                    .append(failed).append('\n');
+            sb.append("herddb_optimizer_tasks_completed_total{outcome=\"poisoned\"} ")
+                    .append(poisoned).append('\n');
         }
 
         private void appendTmpDiskMetrics(StringBuilder sb) {
@@ -343,8 +441,46 @@ public final class OptimizerHttpServer implements AutoCloseable {
         @Override
         public void handle(HttpExchange exchange) throws IOException {
             MergeProgress.Snapshot snap = engine.getMergeProgress().snapshot();
-            StringBuilder sb = new StringBuilder(512);
+            StringBuilder sb = new StringBuilder(768);
             sb.append("{\n");
+            // Pod role first so an operator hitting any replica's /status sees
+            // immediately whether they are talking to the leader or a worker.
+            if (optimizerMain != null) {
+                appendJsonStr(sb, "role", optimizerMain.getRole().name(), true);
+                appendJsonBool(sb, "is_leader", optimizerMain.isLeader(), true);
+                appendJsonBool(sb, "leader_executes_tasks",
+                        optimizerMain.isLeaderExecutingTasks(), true);
+                appendJsonNum(sb, "current_leader_epoch",
+                        optimizerMain.getCurrentLeaderEpoch(), true);
+                // Task-queue summary so /status is a one-stop shop for the
+                // horizontal-scale rollout. Producer counters are LEADER-only
+                // (zero on workers); consumer counters are per-pod.
+                appendJsonNum(sb, "tasks_created_total",
+                        optimizerMain.getTasksCreatedTotal(), true);
+                appendJsonNum(sb, "tasks_completed_total",
+                        optimizerMain.getTasksCompletedTotal(), true);
+                appendJsonNum(sb, "orphans_reset_total",
+                        optimizerMain.getOrphansResetTotal(), true);
+                appendJsonNum(sb, "orphans_poisoned_total",
+                        optimizerMain.getOrphansPoisonedTotal(), true);
+                appendJsonNum(sb, "orphans_deleted_after_deprecate_total",
+                        optimizerMain.getOrphansDeletedAfterDeprecateTotal(), true);
+                appendJsonNum(sb, "terminal_gc_total",
+                        optimizerMain.getTerminalGcTotal(), true);
+                OptimizerTaskConsumer consumer = optimizerMain.getTaskConsumer();
+                if (consumer != null) {
+                    appendJsonNum(sb, "tasks_claimed_total",
+                            consumer.getTasksClaimedTotal(), true);
+                    appendJsonNum(sb, "tasks_completed_successfully_total",
+                            consumer.getTasksCompletedSuccessfullyTotal(), true);
+                    appendJsonNum(sb, "tasks_completed_noop_total",
+                            consumer.getTasksCompletedNoopTotal(), true);
+                    appendJsonNum(sb, "tasks_failed_total",
+                            consumer.getTasksFailedTotal(), true);
+                    appendJsonNum(sb, "tasks_poisoned_total",
+                            consumer.getTasksPoisonedTotal(), true);
+                }
+            }
             appendJsonStr(sb, "phase", snap.phase, true);
             appendJsonStr(sb, "merge_id", snap.mergeId, true);
             appendJsonNum(sb, "input_segments", snap.inputSegments, true);
@@ -460,6 +596,15 @@ public final class OptimizerHttpServer implements AutoCloseable {
             }
             sb.append('"');
         }
+        if (trailingComma) {
+            sb.append(',');
+        }
+        sb.append('\n');
+    }
+
+    private static void appendJsonBool(StringBuilder sb, String key, boolean value,
+                                       boolean trailingComma) {
+        sb.append("  \"").append(key).append("\": ").append(value);
         if (trailingComma) {
             sb.append(',');
         }

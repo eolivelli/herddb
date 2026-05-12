@@ -89,7 +89,13 @@ public final class IndexOptimizerEngine {
     private final String tablespaceUuid;
     private final MergePolicy mergePolicy;
     private final long retentionMillis;
-    private final IntSupplier ownerSelector;
+    /**
+     * Owner-instance selector consulted once per merge to decide which IS
+     * instance becomes the owner of the merged output (step 1). The IntSupplier
+     * constructor overloads adapt {@code () -> int} into the new interface for
+     * back-compat with existing tests.
+     */
+    private final OwnerSelector ownerSelector;
     private final LongSupplier clock;
     /**
      * Optional: when non-null, the reaper invokes
@@ -282,6 +288,28 @@ public final class IndexOptimizerEngine {
                                 DataStorageManager dataStorageManager,
                                 OptimizerLeaderLock leaderLock,
                                 boolean safeModeFileDeletion) {
+        this(registry, merger, tablespaceUuid, mergePolicy, retentionMillis,
+                adaptIntSupplier(ownerSelector), clock, dataStorageManager, leaderLock,
+                safeModeFileDeletion);
+    }
+
+    /**
+     * Step 1 — new terminal constructor accepting an {@link OwnerSelector}. The
+     * IntSupplier overloads above adapt their argument into this interface so
+     * existing tests still compile; new callers (notably
+     * {@link IndexOptimizerMain}) wire an {@code OwnerSelector} from
+     * {@link OwnerSelectorFactory} directly.
+     */
+    public IndexOptimizerEngine(SegmentRegistryClient registry,
+                                SegmentMerger merger,
+                                String tablespaceUuid,
+                                MergePolicy mergePolicy,
+                                long retentionMillis,
+                                OwnerSelector ownerSelector,
+                                LongSupplier clock,
+                                DataStorageManager dataStorageManager,
+                                OptimizerLeaderLock leaderLock,
+                                boolean safeModeFileDeletion) {
         this.registry = Objects.requireNonNull(registry, "registry");
         this.merger = Objects.requireNonNull(merger, "merger");
         this.tablespaceUuid = Objects.requireNonNull(tablespaceUuid, "tablespaceUuid");
@@ -305,6 +333,11 @@ public final class IndexOptimizerEngine {
                             + " ownership-change events; otherwise the IS will fail to"
                             + " load on next restart with file-not-found.");
         }
+    }
+
+    private static OwnerSelector adaptIntSupplier(IntSupplier supplier) {
+        Objects.requireNonNull(supplier, "ownerSelector");
+        return (tablespaceUuid, indexUuid) -> supplier.getAsInt();
     }
 
     public long getRuns() {
@@ -459,6 +492,60 @@ public final class IndexOptimizerEngine {
     }
 
     /**
+     * Step-7 production path: lists indexes and reaps every DEPRECATED segment
+     * whose retention has elapsed. Called by {@link IndexOptimizerMain} on the
+     * leader at every scheduler tick. The legacy {@link #runOnce} flow is kept
+     * intact for back-compat tests that exercise the full inline merge cycle
+     * (pick / merge / publish / deprecate) — production no longer calls it.
+     */
+    public void reapDeprecatedSegments(long now) throws SegmentRegistryException {
+        List<String> indexes = registry.listIndexes(tablespaceUuid);
+        long activeTotal = 0;
+        long deprecatedTotal = 0;
+        long transferringTotal = 0;
+        long provisionalTotal = 0;
+        for (String indexUuid : indexes) {
+            List<VersionedSegmentMetadata> all;
+            try {
+                all = registry.listSegments(tablespaceUuid, indexUuid);
+            } catch (SegmentRegistryException e) {
+                LOGGER.log(Level.WARNING,
+                        "reaper failed to list segments for index " + indexUuid, e);
+                continue;
+            }
+            for (VersionedSegmentMetadata v : all) {
+                switch (v.metadata().getState()) {
+                    case ACTIVE:
+                        activeTotal++;
+                        break;
+                    case DEPRECATED:
+                        deprecatedTotal++;
+                        long retentionUntil = v.metadata().getRetentionUntilEpochMillis();
+                        if (retentionUntil != SegmentMetadata.NO_RETENTION && now >= retentionUntil) {
+                            deleteRetainedSegment(v);
+                        }
+                        break;
+                    case TRANSFERRING:
+                        transferringTotal++;
+                        break;
+                    case PROVISIONAL:
+                        provisionalTotal++;
+                        break;
+                    default:
+                        break;
+                }
+            }
+        }
+        observedIndexes.set(indexes.size());
+        observedActiveSegments.set(activeTotal);
+        observedDeprecatedSegments.set(deprecatedTotal);
+        observedTransferringSegments.set(transferringTotal);
+        observedProvisionalSegments.set(provisionalTotal);
+        lastRunAtMillis.set(now);
+        runs.incrementAndGet();
+    }
+
+    /**
      * Runs one optimizer tick. Throws {@link SegmentRegistryException} only on
      * top-level registry failures (e.g. ZK session expiry while listing indexes);
      * per-index failures are caught internally and logged, so a single bad index
@@ -580,7 +667,7 @@ public final class IndexOptimizerEngine {
 
         SegmentMetadata output;
         try {
-            output = merger.merge(inputMetadata, ownerSelector.getAsInt());
+            output = merger.merge(inputMetadata, ownerSelector.selectOwner(tablespaceUuid, indexUuid));
         } catch (Exception e) {
             mergeFailuresTotal.incrementAndGet();
             long mergeEndMs2 = clock.getAsLong();
@@ -762,36 +849,15 @@ public final class IndexOptimizerEngine {
      * <p>Hot-path note: this is one extra ZK read per candidate per merge cycle.
      * Merges run every 5 min by default and process 4–200 candidates each — the
      * extra reads are inconsequential.
+     *
+     * <p>Step 4 — delegates to the standalone {@link SegmentRevalidator} so the
+     * upcoming step-6 task consumer can call the same logic without depending
+     * on the engine.
      */
     private boolean revalidateInputsStillActive(String indexUuid,
                                                 List<VersionedSegmentMetadata> candidates) {
-        for (VersionedSegmentMetadata v : candidates) {
-            try {
-                java.util.Optional<VersionedSegmentMetadata> latest = registry.getSegment(
-                        tablespaceUuid, indexUuid, v.metadata().getSegmentUuid());
-                if (!latest.isPresent()) {
-                    LOGGER.log(Level.INFO,
-                            "input {0} disappeared from registry between pick and revalidate",
-                            v.metadata().getSegmentUuid());
-                    return false;
-                }
-                VersionedSegmentMetadata l = latest.get();
-                if (l.zkVersion() != v.zkVersion() || l.metadata().getState() != SegmentState.ACTIVE) {
-                    LOGGER.log(Level.INFO,
-                            "input {0} drifted between pick (state=ACTIVE, version={1}) and revalidate"
-                                    + " (state={2}, version={3})",
-                            new Object[]{v.metadata().getSegmentUuid(), v.zkVersion(),
-                                    l.metadata().getState(), l.zkVersion()});
-                    return false;
-                }
-            } catch (SegmentRegistryException e) {
-                LOGGER.log(Level.WARNING,
-                        "revalidate failed for input " + v.metadata().getSegmentUuid()
-                                + ": " + e.getMessage());
-                return false;
-            }
-        }
-        return true;
+        return new SegmentRevalidator(registry, tablespaceUuid)
+                .revalidateInputsStillActive(indexUuid, candidates);
     }
 
     private void deprecateInputSegment(VersionedSegmentMetadata v, String replacementUuid,

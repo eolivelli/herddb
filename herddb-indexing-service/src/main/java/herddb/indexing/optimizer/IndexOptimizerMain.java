@@ -163,6 +163,25 @@ public final class IndexOptimizerMain {
     private SegmentRegistryClient registry;
     private OptimizerLeaderLock leaderLock;
     private IndexOptimizerEngine engine;
+    private OptimizerTaskRegistry taskRegistry;
+    private OptimizerTaskProducer taskProducer;
+    private OptimizerTaskConsumer taskConsumer;
+    private volatile OptimizerRole role;
+    private volatile boolean leaderExecutesTasks;
+    private volatile int consumerMaxTasksPerTick;
+    private final String workerUuid = java.util.UUID.randomUUID().toString();
+    /** Tracks total tasks the consumer completed on this pod (production observability). */
+    private final AtomicLong tasksCompletedTotal = new AtomicLong();
+    private final AtomicLong tasksCreatedTotal = new AtomicLong();
+    /** Producer-side housekeeping counters aggregated across leader ticks. */
+    private final AtomicLong orphansResetTotal = new AtomicLong();
+    private final AtomicLong orphansPoisonedTotal = new AtomicLong();
+    private final AtomicLong orphansDeletedAfterDeprecateTotal = new AtomicLong();
+    private final AtomicLong terminalGcTotal = new AtomicLong();
+    /** Number of producer ticks that observed a stale-leader epoch and aborted. */
+    private final AtomicLong producerTicksRejectedTotal = new AtomicLong();
+    /** Current leader epoch bumped by the producer (-1 when never bumped on this pod). */
+    private final AtomicLong currentLeaderEpoch = new AtomicLong(-1L);
     private OptimizerHttpServer httpServer;
     /**
      * Currently active merger. {@code volatile} so that the unsynchronized
@@ -440,15 +459,78 @@ public final class IndexOptimizerMain {
                     + "avoid this fallback.");
             effectiveSafeMode = true;
         }
+        // Horizontal scalability — step 7: detect the pod role (LEADER for ordinal 0,
+        // WORKER otherwise), discover live IS instances from ZK ephemerals, wire a
+        // load-aware OwnerSelector, and construct the producer + consumer that drive
+        // the ZK-backed task queue. With replicas=1 the single pod is both leader and
+        // worker; with replicas>1 the leader produces and the other pods consume.
+        this.role = OptimizerRole.detect(configuration, System.getenv());
+        this.leaderExecutesTasks = configuration.getBoolean(
+                OptimizerConfiguration.PROPERTY_ROLE_LEADER_EXECUTE_TASKS,
+                OptimizerConfiguration.PROPERTY_ROLE_LEADER_EXECUTE_TASKS_DEFAULT);
+        this.consumerMaxTasksPerTick = configuration.getInt(
+                OptimizerConfiguration.PROPERTY_CONSUMER_MAX_TASKS_PER_TICK,
+                OptimizerConfiguration.PROPERTY_CONSUMER_MAX_TASKS_PER_TICK_DEFAULT);
+        IndexingServiceInstanceDirectory instanceDirectory =
+                new ZkIndexingServiceInstanceDirectory(zkMeta,
+                        () -> configuration.getInt(
+                                OptimizerConfiguration.PROPERTY_INDEXING_NUM_INSTANCES,
+                                OptimizerConfiguration.PROPERTY_INDEXING_NUM_INSTANCES_DEFAULT));
+        InstanceLoadProbe loadProbe = new RegistryBackedInstanceLoadProbe(registry, instanceDirectory);
+        OwnerSelector ownerSelector = OwnerSelectorFactory.create(configuration, loadProbe);
+        // Enforce orphan.reset.ms >= 2 * zk.session.timeout — see plan, otherwise a
+        // briefly-disconnected worker could have its task yanked from under it.
+        long orphanResetMs = configuration.getLong(
+                OptimizerConfiguration.PROPERTY_TASKS_ORPHAN_RESET_MS,
+                OptimizerConfiguration.PROPERTY_TASKS_ORPHAN_RESET_MS_DEFAULT);
+        if (orphanResetMs < 2L * sessionTimeout) {
+            throw new IllegalStateException(
+                    OptimizerConfiguration.PROPERTY_TASKS_ORPHAN_RESET_MS
+                            + " (" + orphanResetMs + " ms) must be >= 2 × "
+                            + OptimizerConfiguration.PROPERTY_ZOOKEEPER_SESSION_TIMEOUT
+                            + " (" + sessionTimeout + " ms) — see horizontal-scalability plan");
+        }
+        int maxAttempts = configuration.getInt(
+                OptimizerConfiguration.PROPERTY_TASKS_MAX_ATTEMPTS,
+                OptimizerConfiguration.PROPERTY_TASKS_MAX_ATTEMPTS_DEFAULT);
+        long terminalRetentionMs = configuration.getLong(
+                OptimizerConfiguration.PROPERTY_TASKS_TERMINAL_RETENTION_MS,
+                OptimizerConfiguration.PROPERTY_TASKS_TERMINAL_RETENTION_MS_DEFAULT);
+        long poisonRetentionMs = configuration.getLong(
+                OptimizerConfiguration.PROPERTY_TASKS_POISON_RETENTION_MS,
+                OptimizerConfiguration.PROPERTY_TASKS_POISON_RETENTION_MS_DEFAULT);
+        this.taskRegistry = new OptimizerTaskRegistry(zkRef::get, basePath);
+        taskRegistry.ensureRoot();
+        LeaderEpoch leaderEpochClient = new LeaderEpoch(zkRef::get, basePath, tablespaceUuid);
+        OptimizerOrphanScanner orphanScanner = new OptimizerOrphanScanner(taskRegistry, registry,
+                tablespaceUuid, maxAttempts, orphanResetMs, terminalRetentionMs, poisonRetentionMs,
+                System::currentTimeMillis);
+        LOGGER.log(Level.INFO,
+                "optimizer pod role: {0} (leaderExecutesTasks={1}, ownerSelector={2},"
+                        + " workerUuid={3}, maxTasksPerTick={4})",
+                new Object[]{role, leaderExecutesTasks, ownerSelector.getClass().getSimpleName(),
+                        workerUuid, consumerMaxTasksPerTick});
+
         // The merger constructs its own DSM for the merge path. The reaper
         // can use the same DSM to physically delete files at retention if
         // safeMode is opted out (the operator's responsibility).
         this.engine = new IndexOptimizerEngine(registry, merger, tablespaceUuid, policy, retentionMs,
-                () -> 0 /* MVP: assign new segments to instance 0 — see step 7 for owner-aware routing */,
+                ownerSelector,
                 System::currentTimeMillis,
                 mergerDataStorageManager,
                 leaderLock,
                 effectiveSafeMode);
+
+        // Producer (leader only) + consumer (every pod). Production tick body uses
+        // these instead of engine.runOnce — the engine.runOnce path is kept for
+        // existing single-pod tests but is no longer invoked from production.
+        if (role == OptimizerRole.LEADER) {
+            this.taskProducer = new OptimizerTaskProducer(taskRegistry, registry,
+                    tablespaceUuid, policy, ownerSelector, leaderLock, leaderEpochClient,
+                    orphanScanner, System::currentTimeMillis);
+        }
+        this.taskConsumer = new OptimizerTaskConsumer(taskRegistry, registry, merger,
+                tablespaceUuid, workerUuid, retentionMs, maxAttempts, System::currentTimeMillis);
 
         this.scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
             FastThreadLocalThread t = new FastThreadLocalThread(r, "index-optimizer-engine");
@@ -490,7 +572,7 @@ public final class IndexOptimizerMain {
                                 + " will be omitted: {0}", tmpErr.getMessage());
                 tmpDirForHttp = null;
             }
-            this.httpServer = new OptimizerHttpServer(httpHost, httpPort, engine, tmpDirForHttp);
+            this.httpServer = new OptimizerHttpServer(httpHost, httpPort, engine, tmpDirForHttp, this);
             this.httpServer.start();
         }
 
@@ -508,14 +590,96 @@ public final class IndexOptimizerMain {
             // This is the safety-net path; the primary upgrade path is the ZK watcher
             // in onFileServersChanged() → scheduleEventDrivenTick() registered in start().
             maybeUpgradeMerger();
-            engine.runOnce();
-        } catch (herddb.indexing.segment.SegmentRegistryException | RuntimeException e) {
-            // Narrow catch (review item H1): the engine's runOnce now declares a typed
-            // SegmentRegistryException; merger / scheduler failures still surface as
-            // RuntimeException. Either way we log and let the next tick retry — a
-            // misbehaving merger or transient ZK error must never kill the scheduler.
+            long now = System.currentTimeMillis();
+            // Leader path: reap retention + produce tasks. With leaderExecutesTasks=true
+            // (default) the leader also drains the consumer queue; flip the flag to false
+            // for the k8s multi-replica acceptance test that proves a worker pod did the
+            // work (step 10), or for a "dedicated scheduler" deployment.
+            if (role == OptimizerRole.LEADER && taskProducer != null) {
+                engine.reapDeprecatedSegments(now);
+                OptimizerTaskProducer.ProduceResult pr = taskProducer.produceTasks();
+                tasksCreatedTotal.addAndGet(pr.tasksCreated);
+                orphansResetTotal.addAndGet(pr.orphansReset);
+                orphansPoisonedTotal.addAndGet(pr.orphansPoisoned);
+                orphansDeletedAfterDeprecateTotal.addAndGet(pr.orphansDeletedAfterDeprecate);
+                terminalGcTotal.addAndGet(pr.terminalGcCount);
+                if (pr.leaderEpoch != null) {
+                    currentLeaderEpoch.set(pr.leaderEpoch);
+                } else if (!pr.ranAsLeader) {
+                    producerTicksRejectedTotal.incrementAndGet();
+                }
+            }
+            // Drain path: every pod consumes unless we are LEADER with leaderExecutesTasks=false.
+            boolean drainsTasks = role == OptimizerRole.WORKER
+                    || (role == OptimizerRole.LEADER && leaderExecutesTasks);
+            if (drainsTasks && taskConsumer != null) {
+                int drained = 0;
+                while (drained < consumerMaxTasksPerTick) {
+                    if (!taskConsumer.consumeOneTask()) {
+                        break;
+                    }
+                    drained++;
+                }
+                tasksCompletedTotal.addAndGet(drained);
+            }
+        } catch (herddb.indexing.segment.SegmentRegistryException
+                | OptimizerTaskRegistryException
+                | RuntimeException e) {
+            // Narrow catch: typed registry exceptions surface our own failures; the
+            // merger and scheduler paths still surface as RuntimeException. Either way
+            // we log and let the next tick retry — a misbehaving merger or transient
+            // ZK error must never kill the scheduler.
             LOGGER.log(Level.WARNING, "optimizer tick failed", e);
         }
+    }
+
+    public long getTasksCompletedTotal() {
+        return tasksCompletedTotal.get();
+    }
+
+    public long getTasksCreatedTotal() {
+        return tasksCreatedTotal.get();
+    }
+
+    public OptimizerRole getRole() {
+        return role;
+    }
+
+    public boolean isLeader() {
+        return role == OptimizerRole.LEADER;
+    }
+
+    public boolean isLeaderExecutingTasks() {
+        return leaderExecutesTasks;
+    }
+
+    public long getOrphansResetTotal() {
+        return orphansResetTotal.get();
+    }
+
+    public long getOrphansPoisonedTotal() {
+        return orphansPoisonedTotal.get();
+    }
+
+    public long getOrphansDeletedAfterDeprecateTotal() {
+        return orphansDeletedAfterDeprecateTotal.get();
+    }
+
+    public long getTerminalGcTotal() {
+        return terminalGcTotal.get();
+    }
+
+    public long getProducerTicksRejectedTotal() {
+        return producerTicksRejectedTotal.get();
+    }
+
+    public long getCurrentLeaderEpoch() {
+        return currentLeaderEpoch.get();
+    }
+
+    /** Per-pod consumer counters exposed for /metrics. {@code null} before {@link #start()}. */
+    public OptimizerTaskConsumer getTaskConsumer() {
+        return taskConsumer;
     }
 
     // -------------------------------------------------------------------------
@@ -644,6 +808,11 @@ public final class IndexOptimizerMain {
         if (zooKeeper == null || registry == null || tablespaceUuid == null) {
             return;
         }
+        armSegmentsWatch();
+        armTasksWatch();
+    }
+
+    private void armSegmentsWatch() {
         String path = registry.tablespacePath(tablespaceUuid);
         Watcher eventWatcher = (WatchedEvent event) -> {
             // Only KeeperState.SyncConnected events carry a meaningful path; lifecycle
@@ -688,6 +857,47 @@ public final class IndexOptimizerMain {
         } catch (herddb.indexing.segment.SegmentRegistryException e) {
             LOGGER.log(Level.WARNING,
                     "failed to ensure registry root before arming watch: {0}",
+                    e.getMessage());
+        }
+    }
+
+    private void armTasksWatch() {
+        if (taskRegistry == null) {
+            return;
+        }
+        String path = taskRegistry.tablespacePath(tablespaceUuid);
+        Watcher tasksWatcher = (WatchedEvent event) -> {
+            if (event.getType() == Watcher.Event.EventType.None) {
+                if (event.getState() == Watcher.Event.KeeperState.SyncConnected) {
+                    scheduleEventDrivenTick();
+                }
+                return;
+            }
+            watcherEvents.incrementAndGet();
+            scheduleEventDrivenTick();
+        };
+        try {
+            taskRegistry.ensureRoot();
+            try {
+                zooKeeper.create(path, new byte[0], org.apache.zookeeper.ZooDefs.Ids.OPEN_ACL_UNSAFE,
+                        org.apache.zookeeper.CreateMode.PERSISTENT);
+            } catch (KeeperException.NodeExistsException ok) {
+                // expected after the first start
+            }
+            zooKeeper.addWatch(path, tasksWatcher, AddWatchMode.PERSISTENT_RECURSIVE);
+            LOGGER.log(Level.INFO,
+                    "armed persistent-recursive watch on {0} (task-queue event-driven scheduling)",
+                    path);
+        } catch (KeeperException | InterruptedException e) {
+            if (e instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+            LOGGER.log(Level.WARNING,
+                    "failed to arm task-queue watch on {0}: {1}",
+                    new Object[]{path, e.getMessage()});
+        } catch (OptimizerTaskRegistryException e) {
+            LOGGER.log(Level.WARNING,
+                    "failed to ensure task registry root before arming watch: {0}",
                     e.getMessage());
         }
     }
