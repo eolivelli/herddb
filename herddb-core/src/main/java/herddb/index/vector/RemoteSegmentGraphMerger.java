@@ -19,6 +19,7 @@
  */
 package herddb.index.vector;
 
+import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import herddb.storage.DataStorageManager;
 import herddb.storage.DataStorageManagerException;
 import herddb.utils.Bytes;
@@ -28,6 +29,7 @@ import io.github.jbellis.jvector.disk.ReaderSupplierFactory;
 import io.github.jbellis.jvector.graph.GraphIndexBuilder;
 import io.github.jbellis.jvector.graph.ImmutableGraphIndex;
 import io.github.jbellis.jvector.graph.OnHeapGraphIndex;
+import io.github.jbellis.jvector.graph.disk.CompactionProgressListener;
 import io.github.jbellis.jvector.graph.disk.OnDiskGraphIndex;
 import io.github.jbellis.jvector.graph.disk.OnDiskGraphIndexCompactor;
 import io.github.jbellis.jvector.graph.disk.OnDiskGraphIndexWriter;
@@ -459,6 +461,22 @@ public final class RemoteSegmentGraphMerger {
     }
 
     /**
+     * Bridge between {@link java.util.function.LongBinaryOperator} (the batch-progress
+     * callback type used throughout this class) and {@link CompactionProgressListener}
+     * (which has a {@code void onProgress(long, long)} contract).
+     *
+     * <p>The JDK provides no {@code LongBiConsumer} specialisation, so callers must use
+     * {@code LongBinaryOperator} and return a documented no-op {@code 0L}. SpotBugs would
+     * otherwise flag the ignored return value as
+     * {@code RV_RETURN_VALUE_IGNORED_NO_SIDE_EFFECT}.
+     */
+    @SuppressFBWarnings(value = "RV_RETURN_VALUE_IGNORED_NO_SIDE_EFFECT",
+            justification = "LongBinaryOperator used for side-effect only; 0L return is a documented no-op sentinel")
+    private static void fireBatchProgress(LongBinaryOperator cb, long completed, long total) {
+        cb.applyAsLong(completed, total);
+    }
+
+    /**
      * Legacy in-memory rebuild: reads each input's map file (carrying
      * {@code (ordinal, pk, vector)} tuples), de-duplicates by PK across
      * sources keeping the highest generation, builds a fresh
@@ -829,6 +847,14 @@ public final class RemoteSegmentGraphMerger {
             //    on the second allocation doesn't leak the first; allocations
             //    happen inside the outer try so the existing finally cleans up.
             notifyPhase("compacting");
+            // Notify the initial batch state so the HTTP /status endpoint immediately
+            // shows a non-zero denominator when entering the "compacting" phase. The
+            // batchListener is read once here so the same reference is used for both
+            // the initial call and the CompactionProgressListener lambda below.
+            LongBinaryOperator batchCb = batchListener;
+            if (batchCb != null) {
+                fireBatchProgress(batchCb, 0L, keptCount);
+            }
             Path graphOutTemp = null;
             Path mapOutTemp = null;
             String multipartUuid = outputIndexUuid + "_seg" + outputSegmentId;
@@ -847,8 +873,17 @@ public final class RemoteSegmentGraphMerger {
                 OnDiskGraphIndexCompactor compactor = new OnDiskGraphIndexCompactor(
                         sources, liveBitsets, mappers, similarity,
                         PhysicalCoreExecutor.pool());
+                // Build a typed CompactionProgressListener from the batch callback so
+                // jvector can push (completedBatches, totalBatches) updates back to
+                // MergeProgress without log-message parsing. The listener is null when
+                // no observer is registered (avoids an empty lambda allocation).
+                // fireBatchProgress() is used to avoid a lambda that ignores the
+                // LongBinaryOperator return value (SpotBugs RV_RETURN_VALUE_IGNORED_NO_SIDE_EFFECT).
+                CompactionProgressListener progressListener = batchCb != null
+                        ? (completed, total) -> fireBatchProgress(batchCb, completed, total)
+                        : null;
                 try {
-                    compactor.compact(graphOutTemp);
+                    compactor.compact(graphOutTemp, progressListener);
                 } catch (java.io.FileNotFoundException | RuntimeException e) {
                     throw new IOException("OnDiskGraphIndexCompactor.compact failed"
                             + " (streaming merge)", e);
@@ -1378,13 +1413,13 @@ public final class RemoteSegmentGraphMerger {
             // Fire batch-progress callback every BATCH_PROGRESS_INTERVAL vectors
             // so the HTTP /status endpoint can show fine-grained build progress.
             if (batchCb != null && (ord % BATCH_PROGRESS_INTERVAL == 0)) {
-                batchCb.applyAsLong(ord, keptCount);
+                fireBatchProgress(batchCb, ord, keptCount);
             }
             ord++;
         }
         // Final batch-progress notification at 100%.
         if (batchCb != null) {
-            batchCb.applyAsLong(keptCount, keptCount);
+            fireBatchProgress(batchCb, keptCount, keptCount);
         }
         try {
             builder.cleanup();

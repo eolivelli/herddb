@@ -87,19 +87,6 @@
         <Bug pattern="IS2_INCONSISTENT_SYNC"/>
     </Match>
     <!--
-      RemoteSegmentGraphMerger.buildGraph() (issue #503): batchListener is a
-      LongBinaryOperator used purely for its side effect (updating MergeProgress batch
-      counters via a lambda). The return value is deliberately ignored — the JDK has no
-      void-returning primitive-specialised consumer for two longs (no LongBiConsumer).
-      The lambda always returns 0L as a documented no-op return. Scoped to the exact
-      method that fires the callback to avoid suppressing the rule across the whole class.
-    -->
-    <Match>
-        <Class name="herddb.index.vector.RemoteSegmentGraphMerger"/>
-        <Method name="buildGraph"/>
-        <Bug pattern="RV_RETURN_VALUE_IGNORED_NO_SIDE_EFFECT"/>
-    </Match>
-    <!--
       RemoteSegmentMerger.readCgroupMemoryLimitGib() (issue #503): reads the cgroup v2
       container memory limit from /sys/fs/cgroup/memory.max, which is a well-known Linux
       kernel pseudo-filesystem path, not a user-configurable absolute file path. The
