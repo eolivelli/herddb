@@ -630,8 +630,8 @@ public class Issue538Stage3RepublishRaceTest {
      * Test-only {@link VectorSegment} subclass that records every
      * {@code deletePk} invocation in a thread-safe list and returns
      * {@code false} so the reapply loop continues to subsequent segments.
-     * Used by
-     * {@link #removeBeforeAdoptionDuringCheckpointMustNotResurrectDeletedPk}
+     * Used by {@link
+     * #stage2ReapplyMustCoverAdoptedSegmentsForPendingCheckpointDeletes}
      * to verify that the Stage-2 late-deletes reapply DOES iterate
      * adopted segments (a regression introduced by the round-3 fix
      * that preserves adoptions in the published list).
@@ -650,6 +650,29 @@ public class Issue538Stage3RepublishRaceTest {
             // Return false so the reapply loop continues — we are a
             // pure observer, not an absorber.
             return false;
+        }
+    }
+
+    /**
+     * Test-only {@link VectorSegment} subclass that THROWS on every
+     * {@code deletePk} invocation. Used by
+     * {@link #stage2ReapplyThrowMustNotLeavePartialCounterUpdate} to
+     * verify that a throw from the late-deletes reapply unwinds
+     * cleanly: {@code onDiskSegmentsEstimatedMemoryBytes} stays at its
+     * pre-Stage-2 value (preloadedSegments were not yet registered)
+     * AND {@code this.segments} stays at the OLD list (publish did
+     * not happen). Locks in the "reapply → register → publish"
+     * ordering invariant.
+     */
+    private static final class ThrowingVectorSegment extends VectorSegment {
+        ThrowingVectorSegment(int segmentId) {
+            super(segmentId);
+        }
+
+        @Override
+        boolean deletePk(Bytes key) {
+            throw new RuntimeException(
+                    "synthetic deletePk failure (issue #538 pr-reviewer pass-4 test)");
         }
     }
 
@@ -870,6 +893,93 @@ public class Issue538Stage3RepublishRaceTest {
                     + "iteration, once by the reapply over finalNewSegments). "
                     + "Got " + hits + " invocations; expected >= 2.",
                     hits >= 2);
+        }
+    }
+
+    /**
+     * Pr-reviewer pass-4 follow-up: locks in the "reapply → register →
+     * publish" ordering invariant in Phase C Stage 2. If
+     * {@code seg.deletePk} throws during the reapply, the failure must
+     * unwind cleanly: {@code onDiskSegmentsEstimatedMemoryBytes}
+     * unchanged (preloadedSegments NOT yet registered) and
+     * {@code this.segments} unchanged (publish did not happen).
+     *
+     * <p>Pre-fix-4 the order was "register → reapply → publish", so a
+     * reapply throw left the counter incremented for every preloaded
+     * segment while {@code this.segments} still pointed at the OLD
+     * list — a half-updated state. Post-fix-4 the register runs AFTER
+     * the reapply, so a reapply throw never advances the counter.
+     */
+    @Test(timeout = 60_000)
+    public void stage2ReapplyThrowMustNotLeavePartialCounterUpdate()
+            throws Exception {
+        Path tmpDir = tmpFolder.newFolder("issue538-reapply-throw").toPath();
+        MemoryDataStorageManager dsm = new MemoryDataStorageManager();
+
+        try (PersistentVectorStore store = newStore(tmpDir, dsm)) {
+            store.start();
+            seedSegments(store, 3);
+
+            final Bytes pkToRemove = Bytes.from_int(999_999_002);
+            final ThrowingVectorSegment thrower = new ThrowingVectorSegment(1_000_000_004);
+            thrower.segmentUuid = UUID.randomUUID().toString();
+            thrower.generation = 9999L;
+
+            store.setPhaseCPostDeletesApplyHookForTest(() -> {
+                try {
+                    // Order matters: call removeVector FIRST so the pk is
+                    // added to pendingCheckpointDeletes (removeVector also
+                    // iterates this.segments — at this point thrower is
+                    // NOT yet injected, so removeVector does not hit the
+                    // thrower). Then inject thrower so Stage 2's reapply
+                    // will iterate it and trigger the throw.
+                    store.removeVector(pkToRemove);
+                    addSegmentViaReflection(store, thrower);
+                } catch (ReflectiveOperationException e) {
+                    throw new RuntimeException(e);
+                }
+            });
+
+            long counterBefore = store.getOnDiskSegmentsEstimatedMemoryBytes();
+            List<VectorSegment> segmentsBefore = store.getOnDiskSegmentsSnapshotForTest();
+
+            // Trigger checkpoint. The Phase C Stage 2 reapply will call
+            // thrower.deletePk(pk) and throw. The checkpoint must
+            // propagate the exception, but with the post-fix-4 ordering
+            // the counter and this.segments are unchanged.
+            store.addVector(Bytes.from_int(6666), vec(new Random(6666)));
+            boolean checkpointThrew = false;
+            try {
+                store.checkpoint();
+            } catch (Exception e) {
+                checkpointThrew = true;
+            }
+            assertTrue("checkpoint must propagate the synthetic"
+                    + " thrower's RuntimeException from the reapply path",
+                    checkpointThrew);
+
+            // CORE assertion: the counter did NOT advance during the
+            // failed Stage 2. This proves the register-after-reapply
+            // ordering is in effect.
+            assertEquals("on-disk-segments memory counter must be unchanged"
+                    + " when the Stage-2 reapply throws — preloadedSegments"
+                    + " must NOT have been registered before the reapply"
+                    + " (post-fix-4 ordering: reapply → register → publish)",
+                    counterBefore, store.getOnDiskSegmentsEstimatedMemoryBytes());
+
+            // this.segments did not advance either: the publish was after
+            // the (failed) reapply.
+            List<VectorSegment> segmentsAfter = store.getOnDiskSegmentsSnapshotForTest();
+            // The thrower was injected via reflection, so it IS in the
+            // current segments list (we don't undo that). But the
+            // preloaded segments (from this checkpoint's Phase B) must
+            // NOT have been published — verify by checking the size
+            // didn't grow past `before.size() + 1` (the +1 is the
+            // reflection-injected thrower; the preloaded segment would
+            // be +2).
+            assertEquals("this.segments must not include the preloaded segment"
+                    + " when the Stage-2 reapply threw (publish did not run)",
+                    segmentsBefore.size() + 1, segmentsAfter.size());
         }
     }
 }

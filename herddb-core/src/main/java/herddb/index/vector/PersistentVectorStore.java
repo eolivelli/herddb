@@ -5038,29 +5038,6 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 }
             }
 
-            // Note: late-arriving deletes from {@link #pendingCheckpointDeletes}
-            // are reapplied below, AFTER {@code finalNewSegments} is built —
-            // see the second {@code pendingForReapply.forEach} block. The
-            // reapply was moved out of this position (where it iterated only
-            // {@code preloadedSegments}) to {@code finalNewSegments} to also
-            // cover adopted segments that landed in the Phase A → Stage 2
-            // window (issue #538 pr-reviewer pass-3 follow-up).
-            //
-            // Issue #455: sealedSegments + mergeableSegments together cover
-            // every segment that was previously in this.segments (their union
-            // was built by the Phase A partition loop), so they remain
-            // registered.  Only the freshly-built preloadedSegments need to
-            // join the on-disk memory counter here.
-            //
-            // Capture snapshots BEFORE publishing newSegments: if any
-            // estimatedInMemoryBytes() call were ever to throw (e.g. an
-            // unforeseen failure inside BLink.getUsedMemory()), unwinding
-            // before the publish leaves both this.segments and the counter
-            // consistent — no half-updated-counter window.
-            for (VectorSegment seg : preloadedSegments) {
-                registerSegmentMemoryEstimate(seg);
-            }
-
             // Issue #538: REBUILD `finalNewSegments` from the CURRENT
             // `this.segments` rather than publishing the stale Phase-A
             // snapshot. Between Phase A's writeLock release and this
@@ -5124,6 +5101,16 @@ public class PersistentVectorStore extends AbstractVectorStore {
             // Stage 1 it returns false (BLink miss) and the loop continues
             // to the next segment.
             //
+            // ORDERING (pr-reviewer pass-4 follow-up): the reapply runs
+            // BEFORE {@code registerSegmentMemoryEstimate} so that if
+            // {@code seg.deletePk} throws (e.g. an unchecked
+            // {@code UncheckedIOException} bubbling out of a BLink page
+            // unload), unwinding leaves the counter UNCHANGED and
+            // {@code this.segments} still pointing at the OLD list — no
+            // half-updated state. Matches the {@link
+            // #atomicSwapCompactionResult} Stage-3 ordering of "reapply →
+            // register → publish".
+            //
             // Cost: O(|pending| × |finalNewSegments|). The constant
             // factor is small because each `deletePk` is a single BLink
             // search (~1 μs); typical |pending| at this point is bounded by
@@ -5138,6 +5125,26 @@ public class PersistentVectorStore extends AbstractVectorStore {
                         }
                     }
                 });
+            }
+
+            // Issue #455: sealedSegments + mergeableSegments together cover
+            // every segment that was previously in this.segments (their union
+            // was built by the Phase A partition loop), so they remain
+            // registered.  Only the freshly-built preloadedSegments need to
+            // join the on-disk memory counter here.
+            //
+            // Capture snapshots BEFORE publishing newSegments: if any
+            // estimatedInMemoryBytes() call were ever to throw (e.g. an
+            // unforeseen failure inside BLink.getUsedMemory()), unwinding
+            // before the publish leaves both this.segments and the counter
+            // consistent — no half-updated-counter window.
+            //
+            // Issue #538 pr-reviewer pass-4: ordering is now `reapply →
+            // register → publish`, so a throw in the reapply above also
+            // leaves the counter untouched. Same invariant as the
+            // {@link #atomicSwapCompactionResult} Stage-3 ordering.
+            for (VectorSegment seg : preloadedSegments) {
+                registerSegmentMemoryEstimate(seg);
             }
 
             this.segments = new java.util.concurrent.CopyOnWriteArrayList<>(finalNewSegments);
