@@ -173,6 +173,15 @@ public final class IndexOptimizerMain {
     /** Tracks total tasks the consumer completed on this pod (production observability). */
     private final AtomicLong tasksCompletedTotal = new AtomicLong();
     private final AtomicLong tasksCreatedTotal = new AtomicLong();
+    /** Producer-side housekeeping counters aggregated across leader ticks. */
+    private final AtomicLong orphansResetTotal = new AtomicLong();
+    private final AtomicLong orphansPoisonedTotal = new AtomicLong();
+    private final AtomicLong orphansDeletedAfterDeprecateTotal = new AtomicLong();
+    private final AtomicLong terminalGcTotal = new AtomicLong();
+    /** Number of producer ticks that observed a stale-leader epoch and aborted. */
+    private final AtomicLong producerTicksRejectedTotal = new AtomicLong();
+    /** Current leader epoch bumped by the producer (-1 when never bumped on this pod). */
+    private final AtomicLong currentLeaderEpoch = new AtomicLong(-1L);
     private OptimizerHttpServer httpServer;
     /**
      * Currently active merger. {@code volatile} so that the unsynchronized
@@ -563,7 +572,7 @@ public final class IndexOptimizerMain {
                                 + " will be omitted: {0}", tmpErr.getMessage());
                 tmpDirForHttp = null;
             }
-            this.httpServer = new OptimizerHttpServer(httpHost, httpPort, engine, tmpDirForHttp);
+            this.httpServer = new OptimizerHttpServer(httpHost, httpPort, engine, tmpDirForHttp, this);
             this.httpServer.start();
         }
 
@@ -590,6 +599,15 @@ public final class IndexOptimizerMain {
                 engine.reapDeprecatedSegments(now);
                 OptimizerTaskProducer.ProduceResult pr = taskProducer.produceTasks();
                 tasksCreatedTotal.addAndGet(pr.tasksCreated);
+                orphansResetTotal.addAndGet(pr.orphansReset);
+                orphansPoisonedTotal.addAndGet(pr.orphansPoisoned);
+                orphansDeletedAfterDeprecateTotal.addAndGet(pr.orphansDeletedAfterDeprecate);
+                terminalGcTotal.addAndGet(pr.terminalGcCount);
+                if (pr.leaderEpoch != null) {
+                    currentLeaderEpoch.set(pr.leaderEpoch);
+                } else if (!pr.ranAsLeader) {
+                    producerTicksRejectedTotal.incrementAndGet();
+                }
             }
             // Drain path: every pod consumes unless we are LEADER with leaderExecutesTasks=false.
             boolean drainsTasks = role == OptimizerRole.WORKER
@@ -625,6 +643,43 @@ public final class IndexOptimizerMain {
 
     public OptimizerRole getRole() {
         return role;
+    }
+
+    public boolean isLeader() {
+        return role == OptimizerRole.LEADER;
+    }
+
+    public boolean isLeaderExecutingTasks() {
+        return leaderExecutesTasks;
+    }
+
+    public long getOrphansResetTotal() {
+        return orphansResetTotal.get();
+    }
+
+    public long getOrphansPoisonedTotal() {
+        return orphansPoisonedTotal.get();
+    }
+
+    public long getOrphansDeletedAfterDeprecateTotal() {
+        return orphansDeletedAfterDeprecateTotal.get();
+    }
+
+    public long getTerminalGcTotal() {
+        return terminalGcTotal.get();
+    }
+
+    public long getProducerTicksRejectedTotal() {
+        return producerTicksRejectedTotal.get();
+    }
+
+    public long getCurrentLeaderEpoch() {
+        return currentLeaderEpoch.get();
+    }
+
+    /** Per-pod consumer counters exposed for /metrics. {@code null} before {@link #start()}. */
+    public OptimizerTaskConsumer getTaskConsumer() {
+        return taskConsumer;
     }
 
     // -------------------------------------------------------------------------

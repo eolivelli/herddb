@@ -30,6 +30,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.LongSupplier;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -86,6 +87,13 @@ public final class OptimizerTaskConsumer {
     private final int maxAttempts;
     private final LongSupplier clock;
 
+    // Observability counters wired into /metrics by OptimizerHttpServer.
+    private final AtomicLong tasksClaimedTotal = new AtomicLong();
+    private final AtomicLong tasksCompletedSuccessfullyTotal = new AtomicLong();
+    private final AtomicLong tasksCompletedNoopTotal = new AtomicLong();
+    private final AtomicLong tasksFailedTotal = new AtomicLong();
+    private final AtomicLong tasksPoisonedTotal = new AtomicLong();
+
     public OptimizerTaskConsumer(OptimizerTaskRegistry taskRegistry,
                                  SegmentRegistryClient segmentRegistry,
                                  SegmentMerger merger,
@@ -140,7 +148,28 @@ public final class OptimizerTaskConsumer {
         } catch (OptimizerTaskRegistryException.TaskNotFound gone) {
             return false;
         }
+        tasksClaimedTotal.incrementAndGet();
         return executeClaimedTask(claimed);
+    }
+
+    public long getTasksClaimedTotal() {
+        return tasksClaimedTotal.get();
+    }
+
+    public long getTasksCompletedSuccessfullyTotal() {
+        return tasksCompletedSuccessfullyTotal.get();
+    }
+
+    public long getTasksCompletedNoopTotal() {
+        return tasksCompletedNoopTotal.get();
+    }
+
+    public long getTasksFailedTotal() {
+        return tasksFailedTotal.get();
+    }
+
+    public long getTasksPoisonedTotal() {
+        return tasksPoisonedTotal.get();
     }
 
     private VersionedOptimizerTask pickOldestPending() throws OptimizerTaskRegistryException {
@@ -222,6 +251,7 @@ public final class OptimizerTaskConsumer {
             }
         }
         // Step 7: mark DONE
+        tasksCompletedSuccessfullyTotal.incrementAndGet();
         OptimizerTask done = task.toBuilder()
                 .state(OptimizerTaskState.DONE)
                 .outputSegmentUuid(output.getSegmentUuid())
@@ -277,6 +307,7 @@ public final class OptimizerTaskConsumer {
 
     private boolean finishWithNoopDone(VersionedOptimizerTask claimed, String reason)
             throws OptimizerTaskRegistryException {
+        tasksCompletedNoopTotal.incrementAndGet();
         OptimizerTask done = claimed.task().toBuilder()
                 .state(OptimizerTaskState.DONE)
                 .outputSegmentUuid(null)
@@ -307,6 +338,11 @@ public final class OptimizerTaskConsumer {
         OptimizerTaskState nextState = nextAttempts >= maxAttempts
                 ? OptimizerTaskState.POISON
                 : OptimizerTaskState.FAILED;
+        if (nextState == OptimizerTaskState.POISON) {
+            tasksPoisonedTotal.incrementAndGet();
+        } else {
+            tasksFailedTotal.incrementAndGet();
+        }
         OptimizerTask failed = t.toBuilder()
                 .state(nextState)
                 .attempts(nextAttempts)
