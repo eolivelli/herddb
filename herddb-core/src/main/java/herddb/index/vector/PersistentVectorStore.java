@@ -533,20 +533,18 @@ public class PersistentVectorStore extends AbstractVectorStore {
      *       joined, so a queued segment is never leaked at shutdown.</li>
      * </ul>
      *
-     * <p><b>Known residual race (issue #537):</b> the drain holds
-     * {@code compactionLock} but NOT {@link #stateLock}'s writeLock, so
-     * it does not serialize with concurrent {@code searchInternal}
-     * callers. The drain is safe in the common case because
-     * {@code dropSegmentByUuid} removes the segment from
+     * <p>Search safety: the drain holds {@code compactionLock} but NOT
+     * {@link #stateLock}'s writeLock, so it does not directly serialize
+     * with concurrent {@code searchInternal} callers. Safety nevertheless
+     * holds because {@code dropSegmentByUuid} removes the segment from
      * {@code this.segments} under the writeLock (which waits for all
-     * in-flight {@code searchInternal} readLock holders), so the next
-     * search snapshot won't see the queued segment. However, when
-     * {@code atomicSwapCompactionResult}'s Stage-3 publish races with
-     * {@code dropSegmentByUuid} as described in issue #537, the
-     * just-dropped segment can be re-published into {@code this.segments}
-     * by the Stage-3 writeLock window; the drain then closes a segment
-     * that is observable to new searches. That residual race is tracked
-     * separately and not addressed by this field.
+     * in-flight {@code searchInternal} readLock holders), so any later
+     * search snapshot of {@code this.segments} will not see the queued
+     * segment. The Stage-3 publish in
+     * {@code atomicSwapCompactionResult} (issue #537, now fixed by
+     * issue #538's rebuild-from-current-segments at Stage 3 / Phase C
+     * Stage 2) also reads from {@code this.segments} under the writeLock
+     * and therefore never re-introduces a queued segment.
      */
     private final ConcurrentLinkedDeque<VectorSegment>
             pendingSegmentCloses = new ConcurrentLinkedDeque<>();
@@ -3505,8 +3503,11 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 // either (a) finishes before we publish `newList` (writeLock waits
                 // for outstanding readLock holders) or (b) starts after we publish
                 // `newList` and never sees `found`. Either way, no search will
-                // dereference `found.onDiskGraph` after we drain (modulo issue
-                // #537's Stage-1-snapshot-then-republish residual race).
+                // dereference `found.onDiskGraph` after we drain. The
+                // {@code atomicSwapCompactionResult} Stage-3 rebuild and the
+                // {@code doCheckpointFusedPQThreePhase} Phase C Stage 2 rebuild
+                // (both fixed by issue #538) read `this.segments` under the
+                // writeLock and never re-introduce a removed segment.
                 pendingSegmentCloses.add(found);
             } finally {
                 stateLock.writeLock().unlock();
@@ -4152,12 +4153,12 @@ public class PersistentVectorStore extends AbstractVectorStore {
         //      waited for the readLock to release). Either way the drain's
         //      seg.close() is invisible to in-flight searches.
         //
-        //      RESIDUAL RACE (issue #537): atomicSwapCompactionResult's Stage-3
-        //      writeLock window can re-publish a just-dropped segment into
-        //      this.segments. In that narrow window a new search starting AFTER
-        //      Stage 3 and BEFORE the cycle's finally-drain CAN observe the
-        //      queued segment and then race the drain's close. Tracked
-        //      separately; not addressed by issue #535's fix.
+        //      The Stage-3 republish race tracked separately in issue #537 has
+        //      been FIXED by issue #538: both atomicSwapCompactionResult Stage 3
+        //      and doCheckpointFusedPQThreePhase Phase C Stage 2 now rebuild
+        //      `finalNewSegments` from a fresh read of `this.segments` under
+        //      the writeLock, so a just-dropped segment is never re-introduced
+        //      by either publish path.
         //   2. Live in-memory shards (Phase 2): liveShards is updated under the
         //      write lock during addVectorInternal's shard-rotation path; holding
         //      the read lock keeps the shard list stable across task creation.
