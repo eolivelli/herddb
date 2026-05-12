@@ -222,6 +222,23 @@ public class LeastLoadedOwnerSelectorIntegrationTest {
     }
 
     @Test
+    public void selectorNeverReturnsDeadOrdinalEvenWithZeroBytes() throws Exception {
+        // Live={1}, dead={0}: a naive "min bytes wins" would pick the dead
+        // ordinal because both have zero bytes but the dead one has a lower
+        // ordinal. The probe's MAX_VALUE sentinel makes dead slots
+        // unselectable; this test pins that contract.
+        registerPrimary(1);
+        // No segments anywhere — instance 1 has zero bytes, instance 0 is dead.
+        ZkIndexingServiceInstanceDirectory directory =
+                new ZkIndexingServiceInstanceDirectory(zkMeta, () -> 0);
+        RegistryBackedInstanceLoadProbe probe =
+                new RegistryBackedInstanceLoadProbe(registry, directory);
+        LeastLoadedOwnerSelector sel = new LeastLoadedOwnerSelector(probe);
+        assertEquals("selector must pick the live ordinal even though both have 0 bytes",
+                1, sel.selectOwner(TS_UUID, IDX_UUID));
+    }
+
+    @Test
     public void registryFailureSurfacesAsSelectorThrow() throws Exception {
         registerPrimary(0);
         registerPrimary(1);

@@ -312,6 +312,47 @@ public class OptimizerTaskProducerIntegrationTest {
     }
 
     @Test
+    public void poisonTaskDoesNotBlockReSelectionOfItsInputs() throws Exception {
+        // POISON is terminal-for-retry but does NOT block input re-selection
+        // (so a future producer tick can re-pick the segments with a fresh
+        // task). This test pins the blocksInputs() semantic end-to-end:
+        // pre-seed a POISON task referencing two inputs, seed the same
+        // inputs as ACTIVE, and assert the next produceTasks() creates a
+        // new task referencing them.
+        seedActive(IDX_A, "seg-a-1", 1_000_000L);
+        seedActive(IDX_A, "seg-a-2", 1_000_000L);
+        OptimizerTask poisoned = OptimizerTask.builder()
+                .taskId("t-poison")
+                .tablespaceUuid(TS_UUID).indexUuid(IDX_A)
+                .inputSegmentUuids(List.of("seg-a-1", "seg-a-2"))
+                .state(OptimizerTaskState.POISON)
+                .attempts(3)
+                .createdAtEpochMillis(1_000L)
+                .leaderEpoch(1L)
+                .targetOwnerInstanceId(0)
+                .build();
+        taskRegistry.createTask(poisoned);
+        OptimizerTaskProducer producer = newProducer(
+                new MergePolicy.AggressivePolicy(Long.MAX_VALUE, Long.MAX_VALUE, 100, 8),
+                new Fixed0OwnerSelector());
+        OptimizerTaskProducer.ProduceResult r = producer.produceTasks();
+        assertEquals(1, r.tasksCreated);
+        // Locate the new task (i.e. NOT the poisoned one) and confirm it
+        // covers the same inputs.
+        boolean foundFreshTask = false;
+        for (VersionedOptimizerTask vt : taskRegistry.listTasks(TS_UUID)) {
+            if (vt.task().getState() == OptimizerTaskState.PENDING) {
+                Set<String> uuids = new HashSet<>(vt.task().getInputSegmentUuids());
+                assertTrue(uuids.contains("seg-a-1"));
+                assertTrue(uuids.contains("seg-a-2"));
+                foundFreshTask = true;
+            }
+        }
+        assertTrue("a PENDING follow-up task must reference the previously-POISONed inputs",
+                foundFreshTask);
+    }
+
+    @Test
     public void taskCarriesCurrentLeaderEpochAndInputVersions() throws Exception {
         seedActive(IDX_A, "seg-a-1", 1_000_000L);
         seedActive(IDX_A, "seg-a-2", 1_000_000L);

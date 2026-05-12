@@ -357,6 +357,50 @@ public class OptimizerTaskConsumerIntegrationTest {
     // -------------------------------------------------------------------------
 
     @Test
+    public void taskZnodeDeletedDuringMergeIsHandledGracefully() throws Exception {
+        // Race: the orphan scanner sees an input already DEPRECATED by us
+        // mid-loop and casDeleteTask's it just before we run the final
+        // CAS-to-DONE. The consumer must surface no exception and the
+        // scheduler tick must continue.
+        List<VersionedSegmentMetadata> inputs = activeInputs("seg-race-a", "seg-race-b");
+        String taskId = UUID.randomUUID().toString();
+        OptimizerTask pending = pendingTask(taskId, inputs, 0);
+        taskRegistry.createTask(pending);
+
+        // Wrap the merger so it deletes the task znode out-of-band AFTER the
+        // merge call (mimics the orphan scanner racing us between
+        // createSegment + per-input deprecate and the final DONE CAS).
+        SegmentMerger racingMerger = new SegmentMerger() {
+            @Override
+            public SegmentMetadata merge(List<SegmentMetadata> in, int newOwnerInstance) throws Exception {
+                SegmentMetadata out = merger.merge(in, newOwnerInstance);
+                // Race the orphan scanner: delete the task znode (lease child
+                // first) right when the consumer is about to publish output.
+                String taskPath = taskRegistry.taskPath(TS_UUID, taskId);
+                try {
+                    zk.delete(taskRegistry.leasePath(TS_UUID, taskId), -1);
+                } catch (org.apache.zookeeper.KeeperException.NoNodeException ok) {
+                    // lease not created yet
+                }
+                zk.delete(taskPath, -1);
+                return out;
+            }
+        };
+
+        // Consume must not throw — the work landed (merge output published,
+        // inputs deprecated), only the final DONE CAS finds no znode and
+        // logs an INFO instead of escaping.
+        assertTrue(consumer("w-race", racingMerger).consumeOneTask());
+
+        // Task is gone (deleted by the race), inputs are DEPRECATED, output exists.
+        org.junit.Assert.assertFalse(taskRegistry.getTask(TS_UUID, taskId).isPresent());
+        VersionedSegmentMetadata a = segmentRegistry.getSegment(TS_UUID, IDX, "seg-race-a").orElseThrow();
+        VersionedSegmentMetadata b = segmentRegistry.getSegment(TS_UUID, IDX, "seg-race-b").orElseThrow();
+        assertEquals(SegmentState.DEPRECATED, a.metadata().getState());
+        assertEquals(SegmentState.DEPRECATED, b.metadata().getState());
+    }
+
+    @Test
     public void leaseIsDeletedRegardlessOfOutcome() throws Exception {
         List<VersionedSegmentMetadata> inputs = activeInputs("seg-q", "seg-r");
         String taskId = UUID.randomUUID().toString();

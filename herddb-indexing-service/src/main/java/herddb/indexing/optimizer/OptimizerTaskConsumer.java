@@ -232,8 +232,27 @@ public final class OptimizerTaskConsumer {
             LOGGER.log(Level.WARNING,
                     "could not mark task {0} as DONE (CAS lost); the orphan scanner will reconcile",
                     task.getTaskId());
+        } catch (OptimizerTaskRegistryException.TaskNotFound gone) {
+            // Task znode disappeared between our CAS-claim and now — either
+            // the orphan scanner raced us at the orphan-reset boundary and
+            // deleted the task (because it observed an input already
+            // DEPRECATED by us mid-loop above) or an operator removed it.
+            // The merge output is published and inputs are deprecated; the
+            // work landed. Surface as a no-op + INFO log so the scheduler
+            // tick is not aborted.
+            LOGGER.log(Level.INFO,
+                    "task {0} znode was deleted while we were processing it;"
+                            + " merge output {1} is already published — treating as success",
+                    new Object[]{task.getTaskId(), output.getSegmentUuid()});
         }
-        taskRegistry.deleteLease(tablespaceUuid, task.getTaskId());
+        try {
+            taskRegistry.deleteLease(tablespaceUuid, task.getTaskId());
+        } catch (OptimizerTaskRegistryException leaseRemoval) {
+            // Best-effort: lease may already be gone with the task znode.
+            LOGGER.log(Level.FINE,
+                    "lease removal for task {0} failed (already gone?): {1}",
+                    new Object[]{task.getTaskId(), leaseRemoval.getMessage()});
+        }
         return true;
     }
 
@@ -265,10 +284,19 @@ public final class OptimizerTaskConsumer {
                 .build();
         try {
             taskRegistry.casUpdateTask(claimed, done);
-        } catch (OptimizerTaskRegistryException.VersionMismatch raced) {
-            // The orphan scanner will reconcile.
+        } catch (OptimizerTaskRegistryException.VersionMismatch
+                | OptimizerTaskRegistryException.TaskNotFound recovered) {
+            // VersionMismatch: orphan scanner reconciles on the next tick.
+            // TaskNotFound: scanner already deleted the task — the no-op
+            // outcome is consistent with "task is gone".
         }
-        taskRegistry.deleteLease(tablespaceUuid, claimed.task().getTaskId());
+        try {
+            taskRegistry.deleteLease(tablespaceUuid, claimed.task().getTaskId());
+        } catch (OptimizerTaskRegistryException leaseRemoval) {
+            LOGGER.log(Level.FINE,
+                    "lease removal for task {0} failed (already gone?): {1}",
+                    new Object[]{claimed.task().getTaskId(), leaseRemoval.getMessage()});
+        }
         return true;
     }
 
@@ -286,10 +314,18 @@ public final class OptimizerTaskConsumer {
                 .build();
         try {
             taskRegistry.casUpdateTask(claimed, failed);
-        } catch (OptimizerTaskRegistryException.VersionMismatch raced) {
-            // The orphan scanner will reconcile.
+        } catch (OptimizerTaskRegistryException.VersionMismatch
+                | OptimizerTaskRegistryException.TaskNotFound recovered) {
+            // Same recovery semantics as finishWithNoopDone: orphan scanner
+            // reconciles, or the task was already deleted.
         }
-        taskRegistry.deleteLease(tablespaceUuid, t.getTaskId());
+        try {
+            taskRegistry.deleteLease(tablespaceUuid, t.getTaskId());
+        } catch (OptimizerTaskRegistryException leaseRemoval) {
+            LOGGER.log(Level.FINE,
+                    "lease removal for task {0} failed (already gone?): {1}",
+                    new Object[]{t.getTaskId(), leaseRemoval.getMessage()});
+        }
         return true;
     }
 
