@@ -288,17 +288,19 @@ public class Issue535DropSegmentByUuidRaceTest {
 
     /**
      * Pr-reviewer follow-up: verifies the deferred close fires DURING a
-     * compaction cycle, even for MULTIPLE concurrent drops. The hook drops
-     * two candidates back-to-back, and the test asserts that
+     * compaction cycle, even for MULTIPLE back-to-back drops. The hook
+     * drops two candidates synchronously inside a single cycle and the
+     * test asserts that
      * (a) no CORRUPTION is recorded (the fix held for both drops),
      * (b) both victims are eventually closed (deferred close drained
-     * both queued segments in the cycle's finally block), and
-     * (c) both ABORTED_INPUT_GONE counters increase by exactly the
-     * expected amount — at most one per cycle (the cycle aborts at
-     * the first detected missing input, not per-input).
+     * both queued segments in the cycle's finally block),
+     * (c) neither victim remains in {@code this.segments}, and
+     * (d) the cycle aborts with exactly ONE ABORTED_INPUT_GONE — the
+     * Stage-1 validator short-circuits at the first missing input, so
+     * we get one failure per cycle, not one per dropped segment.
      */
     @Test(timeout = 30_000)
-    public void multipleConcurrentDropsDuringCompactionMustNotCauseCorruption()
+    public void multipleBackToBackDropsDuringCompactionMustNotCauseCorruption()
             throws Exception {
         Path tmpDir = tmpFolder.newFolder("issue535-multi-drop").toPath();
         MemoryDataStorageManager dsm = new MemoryDataStorageManager();
@@ -328,11 +330,12 @@ public class Issue535DropSegmentByUuidRaceTest {
             });
 
             long corruptionBefore = store.getCompactionFailuresCorruptionTotal();
+            long abortedBefore = store.getCompactionFailuresAbortedInputGoneTotal();
             store.runCompactionCycle();
             long corruptionAfter = store.getCompactionFailuresCorruptionTotal();
 
             // (a) No CORRUPTION.
-            assertEquals("no CORRUPTION must be recorded even with TWO concurrent "
+            assertEquals("no CORRUPTION must be recorded even with TWO back-to-back "
                     + "drops during the same cycle (issue #535)",
                     corruptionBefore, corruptionAfter);
 
@@ -347,6 +350,14 @@ public class Issue535DropSegmentByUuidRaceTest {
                 assertFalse(s.segmentId == victim0.segmentId);
                 assertFalse(s.segmentId == victim1.segmentId);
             }
+
+            // (d) Exactly ONE ABORTED_INPUT_GONE — the Stage-1 validator
+            // short-circuits at the first missing input rather than reporting
+            // one failure per dropped segment. This guards against a future
+            // regression where the validator reports per-input failures.
+            assertEquals("exactly one ABORTED_INPUT_GONE per cycle",
+                    abortedBefore + 1L,
+                    store.getCompactionFailuresAbortedInputGoneTotal());
         }
     }
 
