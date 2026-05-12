@@ -258,19 +258,24 @@ public class Issue535DropSegmentByUuidRaceTest {
                     + "issue #535's exact production failure mode",
                     corruptionBefore, store.getCompactionFailuresCorruptionTotal());
 
-            // Drift-aware behaviour: the cycle's atomicSwapCompactionResult
-            // Stage 1 detects that an input segment vanished and aborts
-            // with ABORTED_INPUT_GONE. This is the EXPECTED, documented
-            // outcome of a race between compaction and segment retirement,
-            // not a regression. (If multiple races accumulate, the counter
-            // increases by at least one per drift event.)
-            assertTrue(
-                    "either compaction succeeded (drift detected pre-rebuild) or "
-                    + "aborted with ABORTED_INPUT_GONE (drift detected at swap); "
-                    + "both are documented graceful outcomes, neither is "
-                    + "CORRUPTION (issue #535)",
-                    store.getCompactionFailuresAbortedInputGoneTotal() > abortedBefore
-                    || store.getCompactionSuccessesTotal() > 0);
+            // Drift-aware behaviour (tightened per pr-reviewer follow-up):
+            // because the victim IS an input to this compaction (it's a
+            // candidate selected by chooseSegmentsToMerge before the hook
+            // fires), atomicSwapCompactionResult's Stage-1 drift check
+            // (line ~2779-2785) is DETERMINISTICALLY tripped. A future
+            // regression in the Stage-1 validation would be caught by
+            // this strict ABORTED_INPUT_GONE assertion. (The looser
+            // "either ABORTED_INPUT_GONE or success" wording would have
+            // missed a Stage-1 regression that silently succeeded with a
+            // missing input.)
+            assertEquals(
+                    "compaction MUST abort with ABORTED_INPUT_GONE — the dropped"
+                    + " input is no longer in this.segments at Stage 1's"
+                    + " drift check (regression guard for Stage-1 validation)",
+                    abortedBefore + 1L,
+                    store.getCompactionFailuresAbortedInputGoneTotal());
+            assertEquals("no successful swap must have been recorded",
+                    0L, store.getCompactionSuccessesTotal());
 
             // The deferred close ran in the cycle's finally block: by the
             // time runCompactionCycle returned, the victim's onDiskGraph
@@ -278,6 +283,171 @@ public class Issue535DropSegmentByUuidRaceTest {
             assertNull("deferred close must have run in runCompactionCycle's finally — "
                     + "victim.onDiskGraph should be null after the cycle ends",
                     victim.onDiskGraph);
+        }
+    }
+
+    /**
+     * Pr-reviewer follow-up: verifies the deferred close fires DURING a
+     * compaction cycle, even for MULTIPLE concurrent drops. The hook drops
+     * two candidates back-to-back, and the test asserts that
+     * (a) no CORRUPTION is recorded (the fix held for both drops),
+     * (b) both victims are eventually closed (deferred close drained
+     * both queued segments in the cycle's finally block), and
+     * (c) both ABORTED_INPUT_GONE counters increase by exactly the
+     * expected amount — at most one per cycle (the cycle aborts at
+     * the first detected missing input, not per-input).
+     */
+    @Test(timeout = 30_000)
+    public void multipleConcurrentDropsDuringCompactionMustNotCauseCorruption()
+            throws Exception {
+        Path tmpDir = tmpFolder.newFolder("issue535-multi-drop").toPath();
+        MemoryDataStorageManager dsm = new MemoryDataStorageManager();
+
+        try (PersistentVectorStore store = newStore(tmpDir, dsm)) {
+            store.start();
+            seedSegments(store, 5);
+
+            List<VectorSegment> initial = store.getOnDiskSegmentsSnapshotForTest();
+            assertTrue("setup must produce at least 3 segments", initial.size() >= 3);
+            stampMissingUuids(initial);
+
+            VectorSegment victim0 = initial.get(0);
+            VectorSegment victim1 = initial.get(1);
+            final String uuid0 = victim0.segmentUuid;
+            final String uuid1 = victim1.segmentUuid;
+            assertNotNull(victim0.onDiskGraph);
+            assertNotNull(victim1.onDiskGraph);
+
+            // The hook drops BOTH segments before the rebuild iteration. Pre-fix
+            // each drop would have nulled out onDiskGraph immediately; the
+            // iteration would have thrown CORRUPTION on the FIRST one and
+            // never reached the second.
+            store.setCompactionPostCandidateSelectionHookForTest(() -> {
+                store.dropSegmentByUuid(uuid0);
+                store.dropSegmentByUuid(uuid1);
+            });
+
+            long corruptionBefore = store.getCompactionFailuresCorruptionTotal();
+            store.runCompactionCycle();
+            long corruptionAfter = store.getCompactionFailuresCorruptionTotal();
+
+            // (a) No CORRUPTION.
+            assertEquals("no CORRUPTION must be recorded even with TWO concurrent "
+                    + "drops during the same cycle (issue #535)",
+                    corruptionBefore, corruptionAfter);
+
+            // (b) Both deferred closes ran by the time the cycle returned.
+            assertNull("victim0.onDiskGraph must be null after the cycle "
+                    + "(deferred close drained)", victim0.onDiskGraph);
+            assertNull("victim1.onDiskGraph must be null after the cycle "
+                    + "(deferred close drained)", victim1.onDiskGraph);
+
+            // (c) Neither victim is in this.segments anymore.
+            for (VectorSegment s : store.getOnDiskSegmentsSnapshotForTest()) {
+                assertFalse(s.segmentId == victim0.segmentId);
+                assertFalse(s.segmentId == victim1.segmentId);
+            }
+        }
+    }
+
+    /**
+     * Pr-reviewer follow-up: verifies the {@code close()}-path drain.
+     * Holds {@code compactionLock} from a test-controlled thread so the
+     * opportunistic drain in {@code dropSegmentByUuid} is forced to
+     * skip; then closes the store and asserts the queued segment is
+     * still drained (BLink storage entry dropped, on-disk graph nulled
+     * out). Without the {@code close()}-path drain a deferred segment
+     * would leak its BLink storage at shutdown.
+     */
+    @Test(timeout = 30_000)
+    public void dropQueuedSegmentIsDrainedByCloseEvenWhenNoCycleEverRuns()
+            throws Exception {
+        Path tmpDir = tmpFolder.newFolder("issue535-close-drain").toPath();
+        MemoryDataStorageManager dsm = new MemoryDataStorageManager();
+
+        final PersistentVectorStore store = newStore(tmpDir, dsm);
+        boolean closed = false;
+        try {
+            store.start();
+            seedSegments(store, 3);
+
+            List<VectorSegment> initial = store.getOnDiskSegmentsSnapshotForTest();
+            assertTrue(initial.size() >= 1);
+            stampMissingUuids(initial);
+
+            VectorSegment victim = initial.get(0);
+            final String victimUuid = victim.segmentUuid;
+            assertNotNull(victim.onDiskGraph);
+
+            // Spawn a holder thread that grabs compactionLock and waits for the
+            // test to signal release. While the holder is parked, the opportunistic
+            // drain in dropSegmentByUuid sees `compactionLock` as busy and skips.
+            // This simulates the (rare in practice but possible in principle) case
+            // where dropSegmentByUuid runs while a compaction is mid-cycle and the
+            // cycle's own finally drain never executes (e.g. the JVM is shut down
+            // mid-cycle).
+            final java.util.concurrent.CountDownLatch holderReady =
+                    new java.util.concurrent.CountDownLatch(1);
+            final java.util.concurrent.CountDownLatch releaseHolder =
+                    new java.util.concurrent.CountDownLatch(1);
+            Thread holder = new Thread(() -> {
+                try {
+                    // Reflect into the private compactionLock field. We can't use a
+                    // public accessor — this is intentional internal state. Holding
+                    // the lock from a test thread mirrors what runCompactionCycle
+                    // would do mid-cycle.
+                    java.lang.reflect.Field lockField =
+                            PersistentVectorStore.class.getDeclaredField("compactionLock");
+                    lockField.setAccessible(true);
+                    java.util.concurrent.locks.ReentrantLock lock =
+                            (java.util.concurrent.locks.ReentrantLock) lockField.get(store);
+                    lock.lock();
+                    try {
+                        holderReady.countDown();
+                        releaseHolder.await();
+                    } finally {
+                        lock.unlock();
+                    }
+                } catch (ReflectiveOperationException | InterruptedException e) {
+                    throw new RuntimeException(e);
+                }
+            }, "compaction-lock-holder");
+            holder.setDaemon(true);
+            holder.start();
+
+            assertTrue("holder must grab the lock within 5s",
+                    holderReady.await(5, java.util.concurrent.TimeUnit.SECONDS));
+
+            // While the holder owns compactionLock, drop the victim. The
+            // opportunistic drain will skip because compactionLock.tryLock()
+            // returns false.
+            store.dropSegmentByUuid(victimUuid);
+
+            // The victim is removed from segments but NOT closed yet (close was
+            // deferred to the next drain).
+            for (VectorSegment s : store.getOnDiskSegmentsSnapshotForTest()) {
+                assertFalse(s.segmentId == victim.segmentId);
+            }
+            assertNotNull("victim.onDiskGraph must still be live — close was deferred",
+                    victim.onDiskGraph);
+
+            // Release the holder. compactionLock is now free, but no compaction
+            // cycle will run because compactionIntervalMs == Long.MAX_VALUE.
+            releaseHolder.countDown();
+            holder.join(5_000);
+
+            // close() drains pendingSegmentCloses under compactionLock.
+            store.close();
+            closed = true;
+
+            // The deferred close ran in close()'s drain.
+            assertNull("close() must have drained the queued segment — "
+                    + "victim.onDiskGraph should be null after store.close()",
+                    victim.onDiskGraph);
+        } finally {
+            if (!closed) {
+                store.close();
+            }
         }
     }
 
