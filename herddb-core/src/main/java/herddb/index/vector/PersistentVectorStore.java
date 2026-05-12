@@ -499,6 +499,40 @@ public class PersistentVectorStore extends AbstractVectorStore {
     /** Serialises compaction cycles. One run at a time. */
     private final ReentrantLock compactionLock = new ReentrantLock();
 
+    /**
+     * Segments removed from {@link #segments} by {@link #dropSegmentByUuid}
+     * (typically fired by the optimizer-watcher's
+     * {@code onSegmentReleased} callback) that are awaiting
+     * {@link VectorSegment#close()} + BLink-storage drop (issue #535).
+     *
+     * <p>The close cannot run synchronously inside {@code dropSegmentByUuid}
+     * because a concurrent {@link #runCompactionCycle} may hold live
+     * references to the same {@code VectorSegment} object via its
+     * candidate snapshot (taken at the start of the cycle without a
+     * read-lock). Closing the segment while the cycle's snapshot still
+     * references it nulls out {@code seg.onDiskGraph}, causing
+     * {@link VectorIndexCompactor#rebuildSegmentStreaming} to throw
+     * {@code CompactionException(CORRUPTION, "candidate segment N has no
+     * on-disk graph")} on the next iteration of the candidate list — the
+     * exact production symptom of issue #535.
+     *
+     * <p>The deque is drained at two points (both guarded by
+     * {@link #compactionLock} so the drainer can never run alongside a
+     * cycle that might still be using the queued segments):
+     * <ul>
+     *   <li>Opportunistically at the end of {@code dropSegmentByUuid}
+     *       via {@link #drainPendingSegmentClosesOpportunistically} —
+     *       fast path when no compaction is active.</li>
+     *   <li>In {@link #runCompactionCycle}'s finally block, AFTER the
+     *       cycle's snapshot is no longer being iterated, but BEFORE
+     *       {@code compactionLock} is released — guarantees the
+     *       drop+close pair is observable to the next cycle as a single
+     *       atomic step.</li>
+     * </ul>
+     */
+    private final java.util.concurrent.ConcurrentLinkedDeque<VectorSegment>
+            pendingSegmentCloses = new java.util.concurrent.ConcurrentLinkedDeque<>();
+
     /** Background thread driving {@link #runCompactionCycle(long)}. */
     private volatile Thread vectorIndexCompactionThread;
     private final Object vectorIndexCompactionWakeup = new Object();
@@ -1264,6 +1298,36 @@ public class PersistentVectorStore extends AbstractVectorStore {
      * For testing. */
     public void setPhaseCPostDeletesApplyHookForTest(Runnable hook) {
         this.phaseCPostDeletesApplyHook = hook;
+    }
+
+    /**
+     * Test hook (issue #535) fired inside {@link #runCompactionCycle} AFTER
+     * the {@code candidates} list has been built by
+     * {@link VectorIndexCompactor#chooseSegmentsToMerge} and BEFORE
+     * {@link VectorIndexCompactor#rebuildSegment} is called. Lets a test
+     * deterministically inject a concurrent mutation (e.g. a
+     * {@link #dropSegmentByUuid} that closes one of the candidate
+     * {@code VectorSegment} objects) while the cycle is holding live
+     * references to those candidates — reproducing the race that surfaces
+     * as {@code "candidate segment N has no on-disk graph"} on production
+     * deployments where the optimizer-driven {@link
+     * herddb.indexing.segment.SegmentAssignmentWatcher} fires
+     * {@code onSegmentReleased} concurrently with an IS-local fallback
+     * compaction.
+     *
+     * <p>Hook runs under {@link #compactionLock} but NOT under
+     * {@link #stateLock}, so it can safely call any operation that takes
+     * the state writeLock.
+     */
+    private volatile Runnable compactionPostCandidateSelectionHookForTests;
+
+    /**
+     * Sets the test hook fired between candidate selection and
+     * {@code rebuildSegment} in {@link #runCompactionCycle}.
+     * For testing only (issue #535 reproducer).
+     */
+    public void setCompactionPostCandidateSelectionHookForTest(Runnable hook) {
+        this.compactionPostCandidateSelectionHookForTests = hook;
     }
 
     // -------------------------------------------------------------------------
@@ -2292,6 +2356,15 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 long vectorsWritten = 0;
                 long vectorsFiltered = 0;
                 VectorIndexCompactor.RebuildResult rebuild = null;
+                // Issue #535 — test hook: fires AFTER candidates + authority are
+                // built but BEFORE rebuildSegment iterates the candidates'
+                // onDiskGraph references. Lets a reproducer test simulate the
+                // race where a concurrent dropSegmentByUuid (from the optimizer
+                // watcher) closes a candidate VectorSegment under our feet.
+                Runnable postCandSelHook = compactionPostCandidateSelectionHookForTests;
+                if (postCandSelHook != null) {
+                    postCandSelHook.run();
+                }
                 try {
                     rebuild = VectorIndexCompactor.rebuildSegment(this, candidates, authority);
                     if (rebuild == null) {
@@ -2420,6 +2493,13 @@ public class PersistentVectorStore extends AbstractVectorStore {
             }
         } finally {
             compactionActive.set(0);
+            // Issue #535: drain segments queued for close by any concurrent
+            // dropSegmentByUuid that landed during this cycle. Doing this
+            // BEFORE releasing compactionLock guarantees the close cannot
+            // race with this cycle's iteration of candidates (the snapshot
+            // is fully consumed by now), and that the next cycle to acquire
+            // compactionLock starts from an empty queue.
+            drainPendingSegmentClosesUnderCompactionLock();
             compactionLock.unlock();
             // Belt-and-suspenders notify (issue #370): all normal and checked-exception
             // exit paths call notifySegmentCountMonitor() explicitly above for immediate
@@ -3233,8 +3313,8 @@ public class PersistentVectorStore extends AbstractVectorStore {
      */
     @Override
     public void dropSegmentByUuid(String segmentUuid) {
-        stateLock.writeLock().lock();
         VectorSegment found = null;
+        stateLock.writeLock().lock();
         try {
             List<VectorSegment> newList = new java.util.concurrent.CopyOnWriteArrayList<>();
             for (VectorSegment s : segments) {
@@ -3257,33 +3337,44 @@ public class PersistentVectorStore extends AbstractVectorStore {
                     "dropSegmentByUuid: removed segment {0} from store {1};"
                             + " total on-disk segments now {2}",
                     new Object[]{segmentUuid, indexName, segments.size()});
-            // Close the segment while holding the write lock. searchInternal snapshots
-            // this.segments and executes seg.search() under stateLock.readLock(). By
-            // closing here (under writeLock) we guarantee that no concurrent search can
-            // be using this segment when close() runs: the writeLock cannot be acquired
-            // until all in-flight readLock holders have released (and thus completed
-            // their seg.search() call). Without this, a search that snapshots the
-            // segment reference before the writeLock is acquired could use a closed
-            // segment, causing ReaderSupplier / OnDiskGraphIndex use-after-close errors.
-            try {
-                found.close();
-            } catch (RuntimeException closeEx) {
-                // Narrow catch: VectorSegment.close() throws only RuntimeException
-                // (BLink cleanup). We must not let a stale-handle error mask the
-                // segment removal or propagate past the writeLock.
-                LOGGER.log(Level.WARNING,
-                        "dropSegmentByUuid: error closing segment " + segmentUuid
-                                + " in store " + indexName, closeEx);
-            }
-            // Reclaim the per-segment pk-to-node BLink storage entry. For adopted
-            // (external-storage-key) segments this is the entry created by
-            // loadFusedPQSegment → createSegmentBLinks during adoption. Without
-            // this, each optimizer adopt→deprecate→drop cycle leaks one BLink
-            // storage entry indefinitely.
-            dropSegmentBLinkStorage(found);
+            // Issue #535: do NOT close `found` synchronously here. A concurrent
+            // runCompactionCycle may have snapshotted `segments` (volatile read,
+            // no readLock) at the start of the cycle and may still hold a live
+            // reference to `found` via its `candidates` list. Closing `found`
+            // immediately would null out `found.onDiskGraph` (the only place that
+            // field is ever written to null — see {@link VectorSegment#close})
+            // and the cycle's next iteration of `candidates` in
+            // {@link VectorIndexCompactor#rebuildSegmentStreaming} (line ~780)
+            // would throw {@code CompactionException(CORRUPTION,
+            // "candidate segment N has no on-disk graph (streaming compaction)")},
+            // matching the exact failure observed during the bigann-100M k3s
+            // benchmark (issue #535).
+            //
+            // Instead, queue `found` for deferred close. The drainer is guarded
+            // by {@link #compactionLock} so it cannot run while a cycle is in
+            // progress — i.e. close happens AFTER any in-flight cycle has
+            // released its references. The two drain points are
+            // {@link #drainPendingSegmentClosesOpportunistically} (called below,
+            // OUTSIDE the writeLock, fast path) and
+            // {@link #runCompactionCycle}'s finally block.
+            //
+            // Search safety: searchInternal snapshots `this.segments` under
+            // stateLock.readLock() and uses the VectorSegment objects under the
+            // same readLock. The writeLock above guarantees no readLock holder
+            // overlaps the segment-list mutation, so any concurrent searcher
+            // either (a) finishes before we publish `newList` (writeLock waits
+            // for outstanding readLock holders) or (b) starts after we publish
+            // `newList` and never sees `found`. Either way, no search will
+            // dereference `found.onDiskGraph` after we drain.
+            pendingSegmentCloses.add(found);
         } finally {
             stateLock.writeLock().unlock();
         }
+        // Outside the writeLock: try to drain immediately if no compaction is
+        // running. If a cycle IS running, its finally block will drain when it
+        // releases compactionLock, so the segment resources are released as
+        // soon as it is safe to do so. See {@link #pendingSegmentCloses}.
+        drainPendingSegmentClosesOpportunistically();
     }
 
     /**
@@ -3576,6 +3667,16 @@ public class PersistentVectorStore extends AbstractVectorStore {
         if (latch != null) {
             latch.countDown();
             this.checkpointPhaseComplete = null;
+        }
+        // Issue #535: drain any segments queued for close by a deferred
+        // dropSegmentByUuid that landed after the compaction thread exited.
+        // After the join above, no new cycle can start, so no contention
+        // for compactionLock — but we still take it for invariant clarity.
+        compactionLock.lock();
+        try {
+            drainPendingSegmentClosesUnderCompactionLock();
+        } finally {
+            compactionLock.unlock();
         }
         // Issue #455: drop every segment's contribution from the on-disk
         // memory counter before closing them, so the counter goes back to 0
@@ -6594,6 +6695,85 @@ public class PersistentVectorStore extends AbstractVectorStore {
         } catch (DataStorageManagerException e) {
             LOGGER.log(Level.WARNING, "Failed to drop BLink storage for segment " + seg.segmentId
                     + " of vector store " + indexName, e);
+        }
+    }
+
+    /**
+     * Issue #535: drains every queued {@link VectorSegment} in
+     * {@link #pendingSegmentCloses}, closing each one and dropping its
+     * BLink storage entry. Caller MUST hold {@link #compactionLock} so
+     * the close cannot race with a {@link #runCompactionCycle} that has
+     * already snapshotted {@code this.segments} and would dereference
+     * {@code seg.onDiskGraph} on the (now-closed) segment.
+     *
+     * <p>Idempotent and safe to call repeatedly: drains until the queue
+     * is empty and {@link VectorSegment#close()} is itself idempotent
+     * (its {@code if (odg != null)} guard).
+     */
+    private void drainPendingSegmentClosesUnderCompactionLock() {
+        // Sanity-check the lock invariant (assertions are no-ops in production).
+        assert compactionLock.isHeldByCurrentThread()
+                : "drainPendingSegmentClosesUnderCompactionLock requires compactionLock";
+        VectorSegment seg;
+        while ((seg = pendingSegmentCloses.pollFirst()) != null) {
+            try {
+                seg.close();
+            } catch (RuntimeException closeEx) {
+                // Narrow catch: VectorSegment.close() throws only
+                // RuntimeException (BLink cleanup). Logging-and-continue is
+                // the correct behaviour — the segment's bookkeeping must
+                // not block the drain of subsequent segments.
+                LOGGER.log(Level.WARNING,
+                        "drainPendingSegmentCloses: error closing segment "
+                                + seg.segmentId + " in store " + indexName, closeEx);
+            }
+            dropSegmentBLinkStorage(seg);
+        }
+    }
+
+    /**
+     * Issue #535: opportunistic drain — runs only if {@link #compactionLock}
+     * is currently free AND not already held by the current thread.
+     * Called from {@link #dropSegmentByUuid} immediately after the
+     * writeLock release, so a "drop while no compaction is running" path
+     * closes synchronously (preserving the original behaviour for the
+     * common case where the watcher fires while the IS is idle). When
+     * compaction IS running, this is a no-op and the cycle's own finally
+     * block drains the queue when it completes.
+     *
+     * <p>The {@code isHeldByCurrentThread} guard is critical because
+     * {@link java.util.concurrent.locks.ReentrantLock} returns {@code true}
+     * from {@code tryLock} when the calling thread already holds it
+     * (re-entrance). Without the guard, a {@code dropSegmentByUuid} call
+     * fired from inside a {@link #runCompactionCycle}-driven code path
+     * (e.g., a test hook, or any future caller that runs on the
+     * compaction thread itself) would acquire the lock re-entrantly and
+     * close the segment immediately — reintroducing the very race this
+     * fix is meant to eliminate.
+     */
+    private void drainPendingSegmentClosesOpportunistically() {
+        if (pendingSegmentCloses.isEmpty()) {
+            return;
+        }
+        if (compactionLock.isHeldByCurrentThread()) {
+            // The current thread is already inside a compaction cycle (or
+            // some other code path that took compactionLock). Reentering
+            // the lock here would let the drain run alongside that cycle's
+            // own snapshot iteration. Skip — the cycle's finally block
+            // drains the queue before releasing compactionLock.
+            return;
+        }
+        if (!compactionLock.tryLock()) {
+            // Another thread is running a compaction. Its finally block
+            // drains pendingSegmentCloses before releasing compactionLock,
+            // so the queue is guaranteed to be empty by the time the next
+            // caller observes the lock as free.
+            return;
+        }
+        try {
+            drainPendingSegmentClosesUnderCompactionLock();
+        } finally {
+            compactionLock.unlock();
         }
     }
 
