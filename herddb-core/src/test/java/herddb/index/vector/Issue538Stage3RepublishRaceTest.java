@@ -604,6 +604,14 @@ public class Issue538Stage3RepublishRaceTest {
      * {@code adoptExternalSegment} setup (pre-written multipart files,
      * BLink storage init, jvector graph load) would dominate the test
      * boilerplate without exercising the bug.
+     *
+     * <p>Production-vs-test divergence: real
+     * {@link PersistentVectorStore#adoptExternalSegment} acquires
+     * {@code stateLock.writeLock()} before mutating {@code segments}.
+     * This helper does NOT — it relies on the test running the hook
+     * callback on the same thread as the cycle (which is the case for
+     * every hook in this test file), so there is no concurrent writer
+     * and no visibility concern.
      */
     private static void addSegmentViaReflection(PersistentVectorStore store,
             VectorSegment seg) throws ReflectiveOperationException {
@@ -616,6 +624,33 @@ public class Issue538Stage3RepublishRaceTest {
                 new java.util.concurrent.CopyOnWriteArrayList<>(current);
         newList.add(seg);
         f.set(store, newList);
+    }
+
+    /**
+     * Test-only {@link VectorSegment} subclass that records every
+     * {@code deletePk} invocation in a thread-safe list and returns
+     * {@code false} so the reapply loop continues to subsequent segments.
+     * Used by
+     * {@link #removeBeforeAdoptionDuringCheckpointMustNotResurrectDeletedPk}
+     * to verify that the Stage-2 late-deletes reapply DOES iterate
+     * adopted segments (a regression introduced by the round-3 fix
+     * that preserves adoptions in the published list).
+     */
+    private static final class TrackingVectorSegment extends VectorSegment {
+        final java.util.List<Bytes> deletePkInvocations =
+                java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+
+        TrackingVectorSegment(int segmentId) {
+            super(segmentId);
+        }
+
+        @Override
+        boolean deletePk(Bytes key) {
+            deletePkInvocations.add(key);
+            // Return false so the reapply loop continues — we are a
+            // pure observer, not an absorber.
+            return false;
+        }
     }
 
     /**
@@ -711,6 +746,130 @@ public class Issue538Stage3RepublishRaceTest {
                     + " drain that the checkpoint-window drop opportunistically"
                     + " triggered",
                     victim.onDiskGraph);
+
+            // Pr-reviewer pass-3 follow-up: the dirty bit MUST remain true
+            // after a race-affected checkpoint, even when
+            // `totalLiveSize() == 0`. Pre-fix-3 the Stage-2 OVERWRITE
+            // `dirty.set(totalLiveSize() > 0)` clobbered the `dirty=true`
+            // signal that {@code dropSegmentByUuid} set in the Phase A →
+            // Stage 2 window, leaving the next periodic checkpoint to skip
+            // (it would observe `dirty == false`) and the IndexStatus-vs-
+            // segments drift introduced by the rebuild would persist
+            // indefinitely. Post-fix-3 the Stage-2 OR pattern
+            // `dirty.set(dirty.get() || totalLiveSize() > 0)` preserves
+            // the signal so the next checkpoint repersists IndexStatus
+            // and heals the drift.
+            assertTrue("dirty bit must be preserved past the race-affected"
+                    + " checkpoint so the next periodic checkpoint runs"
+                    + " and repersists IndexStatus (issue #538 pr-reviewer"
+                    + " pass-3: Stage-2 must OR-merge the `dirty=true`"
+                    + " signal from the in-window dropSegmentByUuid /"
+                    + " adoptExternalSegment, not overwrite it with"
+                    + " totalLiveSize()>0)",
+                    store.isDirty());
+        }
+    }
+
+    /**
+     * Pr-reviewer pass-3 follow-up: with the round-3 fix preserving
+     * adopted segments in {@code this.segments} past the checkpoint,
+     * the Stage-2 late-deletes reapply must ALSO iterate those adopted
+     * segments. Otherwise a {@code removeVector(P)} that arrived during
+     * the checkpoint (placing {@code P} in
+     * {@code pendingCheckpointDeletes}) BEFORE the adoption would
+     * leave {@code P} live in the adopted segment after the checkpoint
+     * — a stale-data window.
+     *
+     * <p>This test injects a {@link TrackingVectorSegment} via reflection
+     * inside {@code phaseCPostDeletesApplyHook} (the Phase A → Stage 2
+     * lock-free window), then calls {@code removeVector} from the same
+     * hook so that {@code P} is added to {@code pendingCheckpointDeletes}.
+     * Post-fix the Stage-2 reapply iterates {@code finalNewSegments},
+     * which includes the adopted tracking segment, calling its
+     * {@code deletePk(P)}. The test asserts the tracking segment's
+     * invocation log contains {@code P} at least twice — once from
+     * {@code removeVector}'s direct iteration of {@code this.segments}
+     * and once from the Stage-2 reapply.
+     *
+     * <p>Pre-fix-3 the reapply iterates {@code preloadedSegments} only;
+     * the tracking segment is silently bypassed, so the invocation count
+     * is 1 instead of 2.
+     */
+    @Test(timeout = 60_000)
+    public void stage2ReapplyMustCoverAdoptedSegmentsForPendingCheckpointDeletes()
+            throws Exception {
+        Path tmpDir = tmpFolder.newFolder("issue538-reapply-adopted").toPath();
+        MemoryDataStorageManager dsm = new MemoryDataStorageManager();
+
+        try (PersistentVectorStore store = newStore(tmpDir, dsm)) {
+            store.start();
+            seedSegments(store, 3);
+
+            // The pk we will remove during the checkpoint. Pick a value
+            // that's NOT in the seeded segments (so removeVector does not
+            // find it in any real segment — keeps the test focused on the
+            // reapply path). Any non-empty Bytes works.
+            final Bytes pkToRemove = Bytes.from_int(999_999_001);
+
+            final TrackingVectorSegment tracker = new TrackingVectorSegment(1_000_000_003);
+            tracker.segmentUuid = UUID.randomUUID().toString();
+            tracker.generation = 9999L;
+
+            store.setPhaseCPostDeletesApplyHookForTest(() -> {
+                try {
+                    // 1. Inject the tracking segment into this.segments so
+                    //    Stage 2's rebuild of finalNewSegments will include
+                    //    it (currentAtStage2 + preloadedSegments).
+                    addSegmentViaReflection(store, tracker);
+                    // 2. Call removeVector(pkToRemove). Since a checkpoint
+                    //    is in progress (pendingCheckpointDeletes != null),
+                    //    the pk goes onto pendingCheckpointDeletes. The
+                    //    pk is also tried against every segment via
+                    //    removeVector's iteration of this.segments —
+                    //    this includes the tracking segment, so the
+                    //    tracker sees a removeVector-direct invocation.
+                    store.removeVector(pkToRemove);
+                } catch (ReflectiveOperationException e) {
+                    throw new RuntimeException(e);
+                }
+            });
+
+            // Trigger the checkpoint cycle.
+            store.addVector(Bytes.from_int(7777), vec(new Random(7777)));
+            store.checkpoint();
+
+            // Confirm the tracker is in the published segment list (the
+            // round-3 fix preserves adoptions; precondition for the
+            // reapply to have a chance to iterate it).
+            boolean trackerInSegments = false;
+            for (VectorSegment s : store.getOnDiskSegmentsSnapshotForTest()) {
+                if (s.segmentId == tracker.segmentId) {
+                    trackerInSegments = true;
+                    break;
+                }
+            }
+            assertTrue("tracker must be in this.segments post-publish "
+                    + "(round-3 fix); precondition for the reapply assertion",
+                    trackerInSegments);
+
+            // CORE assertion: the tracker's deletePk was invoked at least
+            // TWICE for pkToRemove — once by removeVector's direct
+            // iteration of this.segments, AND once by Stage 2's late-
+            // deletes reapply over finalNewSegments. Pre-fix-3 the reapply
+            // iterated `preloadedSegments` only (which does not contain
+            // the tracker), so the invocation count would be 1.
+            int hits = 0;
+            for (Bytes b : tracker.deletePkInvocations) {
+                if (pkToRemove.equals(b)) {
+                    hits++;
+                }
+            }
+            assertTrue("Stage-2 late-deletes reapply must iterate adopted "
+                    + "segments — tracker.deletePk(pkToRemove) must be "
+                    + "invoked at least twice (once by removeVector's direct "
+                    + "iteration, once by the reapply over finalNewSegments). "
+                    + "Got " + hits + " invocations; expected >= 2.",
+                    hits >= 2);
         }
     }
 }

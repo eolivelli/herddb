@@ -5038,37 +5038,14 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 }
             }
 
-            // Re-apply pendingCheckpointDeletes to preloadedSegments under
-            // writeLock to catch any PKs that arrived in the BLink-backed
-            // pending set after Stage 1's lock-free forEach (issue #462,
-            // pr-reviewer pass-1 BLOCK fix). BLink.scan is weakly consistent:
-            // late-arriver inserts that land left of the iterator's current
-            // position are missed by Stage 1.
+            // Note: late-arriving deletes from {@link #pendingCheckpointDeletes}
+            // are reapplied below, AFTER {@code finalNewSegments} is built —
+            // see the second {@code pendingForReapply.forEach} block. The
+            // reapply was moved out of this position (where it iterated only
+            // {@code preloadedSegments}) to {@code finalNewSegments} to also
+            // cover adopted segments that landed in the Phase A → Stage 2
+            // window (issue #538 pr-reviewer pass-3 follow-up).
             //
-            // We restrict the re-apply to preloadedSegments (not all
-            // newSegments) because removeVector itself directly applies the
-            // delete to existing on-disk segments via its iteration of
-            // `this.segments` (see PersistentVectorStore.removeVector). The
-            // gap is only the preloaded segments that aren't in
-            // `this.segments` until Stage 2's publish below — removeVector
-            // can't see them, so the late-arriver path through
-            // pendingCheckpointDeletes is the only mechanism.
-            //
-            // Cost: O(|pending| × |preloadedSegments|) with preloadedSegments
-            // typically 1 segment. Each seg.deletePk on a missing PK is a
-            // single BLink search that returns null quickly, so this is fast
-            // even when most pending entries were already applied in Stage 1.
-            PagedPkSet pendingForReapply = this.pendingCheckpointDeletes;
-            if (pendingForReapply != null && !preloadedSegments.isEmpty()) {
-                pendingForReapply.forEach(pk -> {
-                    for (VectorSegment seg : preloadedSegments) {
-                        if (seg.deletePk(pk)) {
-                            return;
-                        }
-                    }
-                });
-            }
-
             // Issue #455: sealedSegments + mergeableSegments together cover
             // every segment that was previously in this.segments (their union
             // was built by the Phase A partition loop), so they remain
@@ -5118,12 +5095,51 @@ public class PersistentVectorStore extends AbstractVectorStore {
             //
             // ArrayList + final wrap minimises the writeLock window vs.
             // {@code CopyOnWriteArrayList.add}-in-loop (each {@code add}
-            // would re-copy the entire backing array, O(N²)).
+            // would re-copy the entire backing array, O(N²)). The
+            // CopyOnWriteArrayList constructor still allocates one backing
+            // array of size N, so the saving is O(N²) → O(N).
             List<VectorSegment> currentAtStage2 = this.segments;
             ArrayList<VectorSegment> finalNewSegments = new ArrayList<>(
                     currentAtStage2.size() + preloadedSegments.size());
             finalNewSegments.addAll(currentAtStage2);
             finalNewSegments.addAll(preloadedSegments);
+
+            // Issue #538 (pr-reviewer pass-3 follow-up): reapply
+            // late-arriving deletes in `pendingCheckpointDeletes` to ALL
+            // segments being published, not just `preloadedSegments`.
+            //
+            // Stage 1's lock-free apply at line ~4998 iterates the Phase-A
+            // snapshot of `this.segments` plus `preloadedSegments`. With
+            // the round-3 fix, `finalNewSegments` may ALSO contain segments
+            // that landed via `adoptExternalSegment` during the Phase A →
+            // Stage 2 window. Those adopted segments did not see the
+            // Stage-1 apply, and `removeVector`'s direct iteration over
+            // `this.segments` only sees segments present at the moment of
+            // the removeVector call — if the removeVector arrived BEFORE
+            // the adoption, the adopted segment did not receive the delete.
+            //
+            // Re-applying to the full {@code finalNewSegments} here ensures
+            // any late delete is honoured by the adopted segment too.
+            // `seg.deletePk` is idempotent: for pks already removed in
+            // Stage 1 it returns false (BLink miss) and the loop continues
+            // to the next segment.
+            //
+            // Cost: O(|pending| × |finalNewSegments|). The constant
+            // factor is small because each `deletePk` is a single BLink
+            // search (~1 μs); typical |pending| at this point is bounded by
+            // the application's remove-rate × Phase B duration (seconds),
+            // typically a few hundred entries.
+            PagedPkSet pendingForReapply = this.pendingCheckpointDeletes;
+            if (pendingForReapply != null && !finalNewSegments.isEmpty()) {
+                pendingForReapply.forEach(pk -> {
+                    for (VectorSegment seg : finalNewSegments) {
+                        if (seg.deletePk(pk)) {
+                            return;
+                        }
+                    }
+                });
+            }
+
             this.segments = new java.util.concurrent.CopyOnWriteArrayList<>(finalNewSegments);
 
             int maxOrd = -1;
@@ -5158,7 +5174,18 @@ public class PersistentVectorStore extends AbstractVectorStore {
             currentDeferredVectors.set(0);  // Deferred shards have been restored to live set
             closePendingCheckpointDeletesQuietly();
             this.liveVectorCapDuringCheckpoint = Integer.MAX_VALUE;
-            dirty.set(totalLiveSize() > 0);
+            // Issue #538 (pr-reviewer pass-3 follow-up): OR-pattern so a
+            // concurrent {@link #dropSegmentByUuid} or
+            // {@link #adoptExternalSegment} that landed in the Phase A →
+            // Stage 2 window and set {@code dirty=true} is preserved. With
+            // the OLD overwrite ({@code dirty.set(totalLiveSize() > 0)})
+            // the dirty signal was clobbered on a quiet index — the
+            // IndexStatus-vs-segments drift this fix introduces would
+            // then persist indefinitely because the next periodic
+            // checkpoint would see {@code dirty == false} and skip.
+            // Matches the OR pattern in {@link #atomicSwapCompactionResult}
+            // Stage 3 (used to signal a similar drift case).
+            dirty.set(dirty.get() || totalLiveSize() > 0);
 
             recordSegmentSizeDistribution();
         } finally {
