@@ -2912,13 +2912,18 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 // {@code dirty.set(true)} themselves. In the (short) window
                 // between this swap and the next checkpoint a restart would
                 // load a stale IndexStatus referencing a segment whose
-                // multipart files were already deleted by the optimizer;
-                // {@code start()}'s all-or-nothing load would FAIL on it,
-                // looping the IS until the next checkpoint cadence (~60 s
-                // by default). The pre-fix code had exactly the same
-                // restart-window risk via the orphan-in-segments state
-                // (the loaded segment would have {@code onDiskGraph==null}
-                // and crash on first use); the fix does not enlarge it.
+                // multipart files were already deleted by the optimizer.
+                // {@code start()}'s {@code loadFromStatus} is all-or-nothing
+                // (it runs BEFORE {@link #reconcileWithIndexStatus}), so
+                // it would FAIL on the deleted segment and the IS process
+                // would crash-loop until manual operator intervention OR
+                // until the optimizer's retention has not yet expired
+                // (typical retention >> checkpoint cadence, so this is
+                // unlikely in practice). The pre-fix code had exactly the
+                // same restart-window risk via the orphan-in-segments
+                // state (the loaded segment would have
+                // {@code onDiskGraph==null} and crash on first use); the
+                // fix does not enlarge it.
                 // ArrayList + final wrap keeps the writeLock window tight
                 // vs. {@code CopyOnWriteArrayList.add}-in-loop (each add
                 // re-copies the entire backing array — O(N²)).
@@ -5100,36 +5105,24 @@ public class PersistentVectorStore extends AbstractVectorStore {
             // produced the production failure mode reported in issues
             // #535 / #537 / #538.
             //
-            // The rebuild filters {@code sealedSegments} and
-            // {@code mergeableSegments} (the Phase-A view of pre-existing
-            // segments) by membership in {@code currentAtStage2}: any
-            // segment dropped during the Phase A → Stage 2 window is
-            // excluded. {@code preloadedSegments} are always included
-            // (they are brand-new and not yet in {@code this.segments}).
+            // Concurrent {@link #adoptExternalSegment} is also handled
+            // correctly: an adoption landed in the Phase A → Stage 2
+            // window is in {@code currentAtStage2} but was NOT in the
+            // Phase-A snapshot. Iterating {@code currentAtStage2}
+            // directly (rather than the snapshot) preserves the adoption.
+            // {@code preloadedSegments} are the NEW segments produced by
+            // this checkpoint's Phase B from live shards; they are
+            // guaranteed to not be in {@code currentAtStage2} (Phase B's
+            // segment IDs are freshly allocated), so concatenating is
+            // collision-free.
+            //
             // ArrayList + final wrap minimises the writeLock window vs.
             // {@code CopyOnWriteArrayList.add}-in-loop (each {@code add}
             // would re-copy the entire backing array, O(N²)).
             List<VectorSegment> currentAtStage2 = this.segments;
-            java.util.HashSet<Integer> currentIdsAtStage2 = new java.util.HashSet<>(
-                    (int) (currentAtStage2.size() / 0.75f) + 1);
-            for (VectorSegment s : currentAtStage2) {
-                currentIdsAtStage2.add(s.segmentId);
-            }
-            int expectedSize = sealedSegments.size() + mergeableSegments.size()
-                    + preloadedSegments.size();
-            ArrayList<VectorSegment> finalNewSegments = new ArrayList<>(expectedSize);
-            for (VectorSegment sealed : sealedSegments) {
-                if (currentIdsAtStage2.contains(sealed.segmentId)) {
-                    finalNewSegments.add(sealed);
-                }
-            }
-            for (VectorSegment mergeable : mergeableSegments) {
-                if (currentIdsAtStage2.contains(mergeable.segmentId)) {
-                    finalNewSegments.add(mergeable);
-                }
-            }
-            // preloadedSegments are brand-new (built in Phase B from live
-            // shards) so they are never in `currentAtStage2`; always include.
+            ArrayList<VectorSegment> finalNewSegments = new ArrayList<>(
+                    currentAtStage2.size() + preloadedSegments.size());
+            finalNewSegments.addAll(currentAtStage2);
             finalNewSegments.addAll(preloadedSegments);
             this.segments = new java.util.concurrent.CopyOnWriteArrayList<>(finalNewSegments);
 

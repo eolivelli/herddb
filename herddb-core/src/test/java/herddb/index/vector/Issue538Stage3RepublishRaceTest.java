@@ -373,16 +373,21 @@ public class Issue538Stage3RepublishRaceTest {
     }
 
     /**
-     * Coverage gap (pr-reviewer follow-up): exercises a drop landing during
-     * Stage 2's slow {@code persistIndexStatusMultiSegment} I/O (using
-     * {@code atomicSwapPostBuildHook}, which fires AFTER Stage 1 build but
-     * BEFORE Stage 2 persist — i.e. the long lock-free window). The fix
-     * must protect this window too, not just the immediate pre-Stage-3
-     * window. Post-fix the dropped segment is NOT republished regardless
-     * of which sub-window the drop landed in.
+     * Coverage gap (pr-reviewer follow-up): exercises a drop landing in
+     * the Stage 1 → Stage 2 sub-window (via {@code atomicSwapPostBuildHook},
+     * which fires AFTER Stage 1 build and BEFORE Stage 2 persist). The fix
+     * must protect the FULL Stage 1 → Stage 3 window, not just the
+     * immediate pre-Stage-3 sub-window. Post-fix the dropped segment is
+     * NOT republished regardless of which sub-window the drop landed in.
+     *
+     * <p>The three sub-windows (Stage 1 → Stage 2, during Stage 2 persist,
+     * Stage 2 → Stage 3) are equivalent under the fix because Stage 3
+     * rebuilds {@code finalNewSegments} from a fresh read of
+     * {@code this.segments} under the writeLock — so the test only needs
+     * to cover one of them; the other two share the same code path.
      */
     @Test(timeout = 30_000)
-    public void dropDuringStage2PersistIsNotRepublishedByStage3() throws Exception {
+    public void dropBeforeStage2PersistIsNotRepublishedByStage3() throws Exception {
         Path tmpDir = tmpFolder.newFolder("issue538-stage2-race").toPath();
         MemoryDataStorageManager dsm = new MemoryDataStorageManager();
 
@@ -443,6 +448,174 @@ public class Issue538Stage3RepublishRaceTest {
             assertEquals("no CORRUPTION on the baseline", 0L,
                     store.getCompactionFailuresCorruptionTotal());
         }
+    }
+
+    /**
+     * Pr-reviewer follow-up: locks down the compaction Stage 3 comment's
+     * claim that adoptions landing in the Stage 1 → Stage 3 window are
+     * preserved by the rebuild. The hook fires between Stage 2 persist
+     * and Stage 3, simulating a concurrent {@code adoptExternalSegment}
+     * by directly mutating {@code this.segments} (via reflection — full
+     * {@code adoptExternalSegment} requires preexisting multipart files
+     * keyed by externalStorageKey, which would dominate the test
+     * setup). Asserts the synthetic adopted segment is present in
+     * {@code this.segments} after the cycle returns.
+     *
+     * <p>Mirrors the {@code currentAtStage3}-driven rebuild semantics:
+     * any segment in {@code this.segments} when Stage 3 acquires the
+     * writeLock survives the publish, regardless of whether it was in
+     * Stage 1's snapshot.
+     */
+    @Test(timeout = 30_000)
+    public void adoptionDuringCompactionStage1To3MustBePreservedByStage3()
+            throws Exception {
+        Path tmpDir = tmpFolder.newFolder("issue538-compaction-adopt").toPath();
+        MemoryDataStorageManager dsm = new MemoryDataStorageManager();
+
+        try (PersistentVectorStore store = newStore(tmpDir, dsm)) {
+            store.start();
+            seedSegments(store, 5);
+
+            List<VectorSegment> initial = store.getOnDiskSegmentsSnapshotForTest();
+            stampMissingUuids(initial);
+
+            // Synthetic adopted segment. The Stage 3 publish only iterates
+            // and filters by segmentId, so a minimal VectorSegment with a
+            // unique high ID is sufficient to verify preservation. Real
+            // adoptions land via {@code adoptExternalSegment} from the
+            // optimizer-watcher's {@code onSegmentAssigned} callback; the
+            // observable effect on `this.segments` is identical to the
+            // reflection-driven mutation below.
+            final int adoptedId = 1_000_000_001;
+            final VectorSegment adopted = new VectorSegment(adoptedId);
+            adopted.segmentUuid = UUID.randomUUID().toString();
+            adopted.generation = 9999L;
+
+            // Hook fires BETWEEN Stage 2 persist and Stage 3 publish — same
+            // window where a concurrent adoption could land in production.
+            store.setAtomicSwapPostPersistHookForTest(() -> {
+                try {
+                    addSegmentViaReflection(store, adopted);
+                } catch (ReflectiveOperationException e) {
+                    throw new RuntimeException(e);
+                }
+            });
+
+            long successesBefore = store.getCompactionSuccessesTotal();
+            store.runCompactionCycle();
+            long successesAfter = store.getCompactionSuccessesTotal();
+
+            assertEquals("compaction must succeed", successesBefore + 1L, successesAfter);
+
+            // The adopted segment is in this.segments after Stage 3 publish.
+            boolean foundAdopted = false;
+            for (VectorSegment s : store.getOnDiskSegmentsSnapshotForTest()) {
+                if (s.segmentId == adoptedId) {
+                    foundAdopted = true;
+                    break;
+                }
+            }
+            assertTrue("adoption landed in the Stage 1 → Stage 3 window must"
+                    + " be PRESERVED by the Stage 3 rebuild (the rebuild"
+                    + " iterates `currentAtStage3` and excludes only inputs;"
+                    + " adoptions are not inputs)", foundAdopted);
+        }
+    }
+
+    /**
+     * Pr-reviewer follow-up: companion test for the checkpoint side. With
+     * the fix the Phase C Stage 2 rebuild uses
+     * {@code currentAtStage2 + preloadedSegments}, so an adoption landing
+     * in the Phase A → Stage 2 window is preserved. Pre-fix the rebuild
+     * filtered by membership in {@code sealedSegments + mergeableSegments
+     * + preloadedSegments} — a Phase-A-time snapshot — and silently
+     * dropped any adoption that arrived in the window. This test fails
+     * pre-fix and passes post-fix.
+     */
+    @Test(timeout = 60_000)
+    public void adoptionDuringCheckpointPhaseAToStage2MustNotBeDroppedByStage2()
+            throws Exception {
+        Path tmpDir = tmpFolder.newFolder("issue538-checkpoint-adopt").toPath();
+        MemoryDataStorageManager dsm = new MemoryDataStorageManager();
+
+        try (PersistentVectorStore store = newStore(tmpDir, dsm)) {
+            store.start();
+            // Seed a few on-disk segments so Phase A captures a non-empty
+            // sealed/mergeable list (the bug only fires when the
+            // Phase-A snapshot is non-empty so the rebuild has somewhere
+            // to filter against).
+            seedSegments(store, 3);
+
+            List<VectorSegment> initial = store.getOnDiskSegmentsSnapshotForTest();
+            assertTrue("seedSegments must produce at least 2 segments",
+                    initial.size() >= 2);
+            stampMissingUuids(initial);
+
+            final int adoptedId = 1_000_000_002;
+            final VectorSegment adopted = new VectorSegment(adoptedId);
+            adopted.segmentUuid = UUID.randomUUID().toString();
+            adopted.generation = 9999L;
+
+            // Hook fires after Stage 1's pending-deletes apply and BEFORE
+            // Stage 2's writeLock. This is the Phase A → Stage 2 lock-free
+            // window where real adoptions can land in production (the
+            // optimizer-watcher's onSegmentAssigned does not hold
+            // checkpointLock).
+            store.setPhaseCPostDeletesApplyHookForTest(() -> {
+                try {
+                    addSegmentViaReflection(store, adopted);
+                } catch (ReflectiveOperationException e) {
+                    throw new RuntimeException(e);
+                }
+            });
+
+            // Trigger a checkpoint. The hook will fire inside Phase C,
+            // adding the synthetic adopted segment to this.segments. With
+            // the fix, Stage 2's rebuild reads `currentAtStage2` and
+            // preserves the adoption. Pre-fix the rebuild iterates only
+            // Phase-A's snapshot and silently drops the adoption.
+            store.addVector(Bytes.from_int(8888), vec(new Random(8888)));
+            store.checkpoint();
+
+            // The adopted segment MUST be in this.segments after the
+            // checkpoint publishes.
+            boolean foundAdopted = false;
+            for (VectorSegment s : store.getOnDiskSegmentsSnapshotForTest()) {
+                if (s.segmentId == adoptedId) {
+                    foundAdopted = true;
+                    break;
+                }
+            }
+            assertTrue("adoption landed in the Phase A → Stage 2 window must"
+                    + " be PRESERVED by the Stage 2 rebuild (issue #538"
+                    + " follow-up: the checkpoint-side rebuild must"
+                    + " iterate `currentAtStage2` directly, not"
+                    + " sealed+mergeable+preloaded with currentIds filter)",
+                    foundAdopted);
+        }
+    }
+
+    /**
+     * Reflection-driven equivalent of {@code adoptExternalSegment}'s
+     * end-effect on {@code this.segments}: writes a fresh
+     * {@code CopyOnWriteArrayList} containing the current entries plus
+     * the supplied segment back to the private {@code segments} field.
+     * Used by adoption-window tests where a full
+     * {@code adoptExternalSegment} setup (pre-written multipart files,
+     * BLink storage init, jvector graph load) would dominate the test
+     * boilerplate without exercising the bug.
+     */
+    private static void addSegmentViaReflection(PersistentVectorStore store,
+            VectorSegment seg) throws ReflectiveOperationException {
+        java.lang.reflect.Field f =
+                PersistentVectorStore.class.getDeclaredField("segments");
+        f.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        List<VectorSegment> current = (List<VectorSegment>) f.get(store);
+        java.util.concurrent.CopyOnWriteArrayList<VectorSegment> newList =
+                new java.util.concurrent.CopyOnWriteArrayList<>(current);
+        newList.add(seg);
+        f.set(store, newList);
     }
 
     /**
