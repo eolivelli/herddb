@@ -349,7 +349,20 @@ public final class SegmentBlockCache {
         // We are the in-flight owner.
         misses.incrementAndGet();
         long startNanos = System.nanoTime();
-        loader.loadAsync(path, offset, length).whenComplete((loaded, err) -> {
+        // Guard against a loader whose synchronous portion throws before returning
+        // a future. Without this, ourFuture would linger in inFlightAsync forever
+        // and any piggybackers would deadlock waiting on it.
+        CompletableFuture<ByteBuf> loadFuture;
+        try {
+            loadFuture = loader.loadAsync(path, offset, length);
+        } catch (RuntimeException t) {
+            loadTimeNanos.addAndGet(System.nanoTime() - startNanos);
+            loadFailure.incrementAndGet();
+            inFlightAsync.remove(key, ourFuture);
+            ourFuture.completeExceptionally(t);
+            return ourFuture;
+        }
+        loadFuture.whenComplete((loaded, err) -> {
             loadTimeNanos.addAndGet(System.nanoTime() - startNanos);
             inFlightAsync.remove(key, ourFuture);
 

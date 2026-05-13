@@ -22,12 +22,15 @@ package herddb.remote;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.fail;
+import herddb.utils.VectorSearchRequestContext;
 import io.netty.util.ResourceLeakDetector;
 import java.io.ByteArrayInputStream;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
@@ -63,6 +66,7 @@ public class RemoteRandomAccessReaderAsyncTest {
     @Rule
     public TemporaryFolder folder = new TemporaryFolder();
 
+    // May be set to null in tests that shut down the server mid-test.
     private RemoteFileServer server;
     private RemoteFileServiceClient client;
 
@@ -79,7 +83,9 @@ public class RemoteRandomAccessReaderAsyncTest {
     @After
     public void tearDown() throws Exception {
         client.close();
-        server.stop();
+        if (server != null) {
+            server.stop();
+        }
     }
 
     /** Build a sequential byte array: byte[i] = (byte)(i & 0xFF). */
@@ -389,11 +395,112 @@ public class RemoteRandomAccessReaderAsyncTest {
             CompletableFuture<ByteBuffer> future = reader.readRangeAsync(BLOCK_SIZE - 5, 20);
             try {
                 future.get(5, TimeUnit.SECONDS);
-                assertFalse("should have thrown ExecutionException", true);
+                fail("should have thrown ExecutionException for read past end of file");
             } catch (ExecutionException e) {
                 // expected: read past end of file
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Multi-block error path — all successfully-fetched buffers must be released
+    // -----------------------------------------------------------------------
+
+    /**
+     * When a multi-block {@code readRangeAsync} call partially fails — block 0
+     * is served from cache but block 1 cannot be fetched (server is down) —
+     * the returned future must fail AND the ByteBuf obtained for block 0 must be
+     * released (verified by the PARANOID leak detector that fires at GC time).
+     */
+    @Test
+    public void testMultiBlockPartialFailureReleasesAllBuffers() throws Exception {
+        byte[] data = seqBytes(BLOCK_SIZE * 2);
+        client.writeMultipartFile("ts/idx/partial", new ByteArrayInputStream(data), BLOCK_SIZE);
+
+        // Warm block 0 into the cache using the working server
+        SegmentBlockCache cache = new SegmentBlockCache(BLOCK_SIZE * 4L);
+        try (RemoteRandomAccessReader warmup = new RemoteRandomAccessReader(
+                client, "ts/idx/partial", data.length, BLOCK_SIZE, BLOCK_SIZE,
+                NullStatsLogger.INSTANCE, cache)) {
+            warmup.seek(0);
+            byte[] buf = new byte[BLOCK_SIZE];
+            warmup.readFully(buf); // block 0 now in cache
+        }
+
+        // Build a fast-fail client with 0 retries pointing at a port that is closed.
+        // The default client has 10 retries with exponential backoff (~17 min) which
+        // would hang the test; we want the network read to fail immediately so the
+        // multi-block error path is exercised quickly.
+        Map<String, Object> conf = new HashMap<>();
+        conf.put(RemoteFileServiceClient.CONFIG_CLIENT_RETRIES, 0);
+        conf.put(RemoteFileServiceClient.CONFIG_CLIENT_TIMEOUT, 2L);
+        RemoteFileServiceClient brokenClient = new RemoteFileServiceClient(
+                List.of("localhost:" + server.getPort()), conf, null);
+        // Stop the server so any reconnect attempt gets ECONNREFUSED.
+        server.stop();
+        server = null; // prevent double-stop in @After
+
+        try (RemoteRandomAccessReader reader = new RemoteRandomAccessReader(
+                brokenClient, "ts/idx/partial", data.length, BLOCK_SIZE, BLOCK_SIZE,
+                NullStatsLogger.INSTANCE, cache)) {
+
+            // Cross-block read: block 0 (cache hit) + block 1 (network miss → fails)
+            int crossOffset = BLOCK_SIZE - 5;
+            int crossLen = 15;
+            CompletableFuture<ByteBuffer> future = reader.readRangeAsync(crossOffset, crossLen);
+            try {
+                future.get(15, TimeUnit.SECONDS);
+                fail("should have thrown ExecutionException because block 1 cannot be fetched");
+            } catch (ExecutionException e) {
+                // expected: block 1 read failed because the server is down
+            }
+        } finally {
+            brokenClient.close();
+        }
+        cache.cleanUp();
+        // PARANOID leak detector will surface any unreleased ByteBuf at GC time
+    }
+
+    // -----------------------------------------------------------------------
+    // Multi-block path — VectorSearchRequestContext stats
+    // -----------------------------------------------------------------------
+
+    /**
+     * A cross-block {@code readRangeAsync} call must record per-block cache
+     * hit/miss/readFileRange events in the active {@link VectorSearchRequestContext},
+     * matching the single-block path behaviour.
+     */
+    @Test
+    public void testMultiBlockUpdatesVectorSearchRequestContextStats() throws Exception {
+        byte[] data = seqBytes(BLOCK_SIZE * 3);
+        client.writeMultipartFile("ts/idx/ctxmulti", new ByteArrayInputStream(data), BLOCK_SIZE);
+
+        SegmentBlockCache cache = new SegmentBlockCache(BLOCK_SIZE * 8L);
+        try (RemoteRandomAccessReader reader = new RemoteRandomAccessReader(
+                client, "ts/idx/ctxmulti", data.length, BLOCK_SIZE, BLOCK_SIZE,
+                NullStatsLogger.INSTANCE, cache)) {
+
+            // Warm block 0 into cache
+            reader.seek(0);
+            reader.readFully(new byte[BLOCK_SIZE]);
+
+            // Now issue a cross-block async read: block 0 is cached, block 1 is not.
+            VectorSearchRequestContext ctx = VectorSearchRequestContext.begin();
+            try {
+                int off = BLOCK_SIZE - 4;
+                int len = 20; // 4 bytes from block 0 (cached) + 16 from block 1 (miss)
+                reader.readRangeAsync(off, len).get(5, TimeUnit.SECONDS);
+            } finally {
+                VectorSearchRequestContext.end();
+            }
+
+            // The multi-block path covers 2 blocks: block 0 (hit) + block 1 (miss).
+            assertEquals("expected 1 cache hit (block 0 was warmed)", 1, ctx.getCacheHits());
+            assertEquals("expected 1 cache miss (block 1 was cold)", 1, ctx.getCacheMisses());
+            assertEquals("expected 2 readFileRange events (one per covering block)",
+                    2, ctx.getReadFileRangeCalls());
+        }
+        cache.cleanUp();
     }
 
     // -----------------------------------------------------------------------

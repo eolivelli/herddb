@@ -37,6 +37,8 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import org.junit.After;
+import org.junit.Assert;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
@@ -53,6 +55,20 @@ public class SegmentBlockCacheAsyncTest {
     }
 
     private static final int BLOCK = 256;
+
+    /** Cache under test; allocated per test and cleared in @After. */
+    private SegmentBlockCache testCache;
+
+    @After
+    public void clearCache() {
+        if (testCache != null) {
+            // Trigger eviction-listener releases so PARANOID leak detector
+            // deterministically observes any leaked ByteBufs within this JUnit run.
+            testCache.clear();
+            testCache.cleanUp();
+            testCache = null;
+        }
+    }
 
     /** Allocates a pooled direct buffer filled with the given byte value. */
     private static ByteBuf direct(int len, byte value) {
@@ -101,7 +117,8 @@ public class SegmentBlockCacheAsyncTest {
 
     @Test
     public void missPopulatesThenSecondCallIsHit() throws Exception {
-        SegmentBlockCache cache = new SegmentBlockCache(BLOCK * 10L);
+        testCache = new SegmentBlockCache(BLOCK * 10L);
+        SegmentBlockCache cache = testCache;
         AtomicInteger loadCount = new AtomicInteger();
         byte[] expected = new byte[BLOCK];
         for (int i = 0; i < BLOCK; i++) {
@@ -145,7 +162,8 @@ public class SegmentBlockCacheAsyncTest {
 
     @Test
     public void syncMissPopulatesThenAsyncCallIsHit() throws Exception {
-        SegmentBlockCache cache = new SegmentBlockCache(BLOCK * 10L);
+        testCache = new SegmentBlockCache(BLOCK * 10L);
+        SegmentBlockCache cache = testCache;
         AtomicInteger loadCount = new AtomicInteger();
         SegmentBlockCache.BlockLoader syncLoader = (p, off, len) -> {
             loadCount.incrementAndGet();
@@ -179,7 +197,8 @@ public class SegmentBlockCacheAsyncTest {
 
     @Test
     public void concurrentMissesShareOneLoaderCall() throws Exception {
-        SegmentBlockCache cache = new SegmentBlockCache(BLOCK * 10L);
+        testCache = new SegmentBlockCache(BLOCK * 10L);
+        SegmentBlockCache cache = testCache;
         AtomicInteger loadCount = new AtomicInteger();
         CountDownLatch loaderStart = new CountDownLatch(1);
 
@@ -228,7 +247,8 @@ public class SegmentBlockCacheAsyncTest {
 
     @Test
     public void eachCallerReceivesIndependentSlice() throws Exception {
-        SegmentBlockCache cache = new SegmentBlockCache(BLOCK * 10L);
+        testCache = new SegmentBlockCache(BLOCK * 10L);
+        SegmentBlockCache cache = testCache;
         byte[] pattern = new byte[BLOCK];
         for (int i = 0; i < BLOCK; i++) {
             pattern[i] = (byte) (i * 2);
@@ -269,7 +289,8 @@ public class SegmentBlockCacheAsyncTest {
 
     @Test
     public void loaderFailurePropagatedToAllWaiters() throws Exception {
-        SegmentBlockCache cache = new SegmentBlockCache(BLOCK * 10L);
+        testCache = new SegmentBlockCache(BLOCK * 10L);
+        SegmentBlockCache cache = testCache;
         CountDownLatch loaderStart = new CountDownLatch(1);
         IOException cause = new IOException("simulated read failure");
 
@@ -311,7 +332,8 @@ public class SegmentBlockCacheAsyncTest {
 
     @Test
     public void multiThreadedAsyncLoadsAreCorrect() throws Exception {
-        SegmentBlockCache cache = new SegmentBlockCache(BLOCK * 20L);
+        testCache = new SegmentBlockCache(BLOCK * 20L);
+        SegmentBlockCache cache = testCache;
         byte[] pattern = new byte[BLOCK];
         for (int i = 0; i < BLOCK; i++) {
             pattern[i] = (byte) 0xCC;
@@ -347,6 +369,121 @@ public class SegmentBlockCacheAsyncTest {
                 .get(30, TimeUnit.SECONDS);
         exec.shutdown();
         exec.awaitTermination(5, TimeUnit.SECONDS);
-        cache.cleanUp();
+    }
+
+    // -----------------------------------------------------------------------
+    // Synchronously-throwing loader must not deadlock next callers
+    // -----------------------------------------------------------------------
+
+    /**
+     * If the loader's {@code loadAsync} method throws synchronously (before
+     * returning a future), the in-flight entry must be removed and the
+     * returned future must fail — not deadlock waiting callers. A subsequent
+     * {@code getBlockAsync} call with a working loader must invoke the loader
+     * (i.e. the inFlightAsync slot was cleaned up).
+     */
+    @Test
+    public void syncThrowingLoaderDoesNotDeadlockNextCaller() throws Exception {
+        testCache = new SegmentBlockCache(BLOCK * 10L);
+        SegmentBlockCache cache = testCache;
+        RuntimeException boom = new RuntimeException("synchronous boom");
+
+        // First call: loader throws synchronously
+        SegmentBlockCache.AsyncBlockLoader throwingLoader = (p, off, len) -> {
+            throw boom;
+        };
+        CompletableFuture<ByteBuf> failFuture = cache.getBlockAsync("p", 0, BLOCK, throwingLoader);
+        try {
+            failFuture.get(5, TimeUnit.SECONDS);
+            Assert.fail("should have failed with the synchronous exception");
+        } catch (java.util.concurrent.ExecutionException e) {
+            assertEquals(boom, e.getCause());
+        }
+        assertEquals("load_failure must be incremented", 1L, cache.loadFailureCount());
+
+        // Second call: must invoke the loader (inFlightAsync slot was cleared)
+        AtomicInteger loadCount = new AtomicInteger();
+        SegmentBlockCache.AsyncBlockLoader goodLoader = (p, off, len) -> {
+            loadCount.incrementAndGet();
+            return CompletableFuture.completedFuture(direct(len, (byte) 0xAA));
+        };
+        ByteBuf result = cache.getBlockAsync("p", 0, BLOCK, goodLoader).get(5, TimeUnit.SECONDS);
+        try {
+            assertEquals("second loader must be called because inFlightAsync was cleared",
+                    1, loadCount.get());
+            assertNotNull(result);
+        } finally {
+            ReferenceCountUtil.safeRelease(result);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Concurrent sync getBlock + async getBlockAsync on the same key
+    // -----------------------------------------------------------------------
+
+    /**
+     * When a sync {@code getBlock} call races an in-flight async load on the
+     * same key (the "{@code compute()}-race" path in {@code getBlockAsync}),
+     * both callers must receive identical byte content and no {@link ByteBuf}
+     * must be leaked.
+     */
+    @Test
+    public void concurrentSyncAndAsyncMissInsertSeesSameBytes() throws Exception {
+        testCache = new SegmentBlockCache(BLOCK * 10L);
+        SegmentBlockCache cache = testCache;
+        byte[] pattern = new byte[BLOCK];
+        for (int i = 0; i < BLOCK; i++) {
+            pattern[i] = (byte) (i & 0xFF);
+        }
+
+        // Latch that holds the async loader open until the sync call has completed
+        CountDownLatch asyncLoaderHeld = new CountDownLatch(1);
+        CountDownLatch syncCallDone = new CountDownLatch(1);
+
+        SegmentBlockCache.AsyncBlockLoader slowLoader = (p, off, len) -> {
+            CompletableFuture<ByteBuf> fut = new CompletableFuture<>();
+            new Thread(() -> {
+                try {
+                    syncCallDone.await(); // wait for sync path to finish
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                ByteBuf buf = PooledByteBufAllocator.DEFAULT.directBuffer(len);
+                buf.writeBytes(pattern);
+                fut.complete(buf);
+                asyncLoaderHeld.countDown();
+            }, "slow-async-loader").start();
+            return fut;
+        };
+
+        SegmentBlockCache.BlockLoader syncLoader = (p, off, len) -> {
+            ByteBuf buf = PooledByteBufAllocator.DEFAULT.directBuffer(len);
+            buf.writeBytes(pattern);
+            return buf;
+        };
+
+        // Start the async load (in-flight, held by latch)
+        CompletableFuture<ByteBuf> asyncFuture = cache.getBlockAsync("p", 0, BLOCK, slowLoader);
+
+        // While async load is in flight, insert via sync path
+        ByteBuf syncResult = cache.getBlock("p", 0, BLOCK, syncLoader);
+        syncCallDone.countDown(); // release the async loader
+
+        // Wait for async load to complete
+        asyncLoaderHeld.await(5, TimeUnit.SECONDS);
+        ByteBuf asyncResult = asyncFuture.get(5, TimeUnit.SECONDS);
+
+        try {
+            byte[] syncBytes = new byte[BLOCK];
+            byte[] asyncBytes = new byte[BLOCK];
+            syncResult.getBytes(0, syncBytes);
+            asyncResult.getBytes(0, asyncBytes);
+            assertArrayEquals("sync and async paths must return identical bytes", pattern, syncBytes);
+            assertArrayEquals("sync and async paths must return identical bytes", pattern, asyncBytes);
+        } finally {
+            ReferenceCountUtil.safeRelease(syncResult);
+            ReferenceCountUtil.safeRelease(asyncResult);
+        }
+        // @After calls cache.clear() + cache.cleanUp() for leak detection
     }
 }

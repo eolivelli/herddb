@@ -30,6 +30,7 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.TimeUnit;
 import org.apache.bookkeeper.stats.Counter;
 import org.apache.bookkeeper.stats.NullStatsLogger;
@@ -345,7 +346,7 @@ public class RemoteRandomAccessReader implements RandomAccessReader {
             long startNanos = System.nanoTime();
 
             return blockCache.getBlockAsync(path, blockOff, blockLen,
-                    (p, off, len) -> fetchBlockFromRemoteAsync(p, off, len))
+                    this::fetchBlockFromRemoteAsync)
                     .thenApply(buf -> {
                         long elapsedNanos = System.nanoTime() - startNanos;
                         if (ctx != null) {
@@ -366,14 +367,24 @@ public class RemoteRandomAccessReader implements RandomAccessReader {
         // window once all buffers are ready. Each ByteBuf is released in the
         // finally block regardless of success or failure.
         int numBlocks = (int) (endBlock - startBlock + 1);
+        // Capture cache-hit status and block metadata before dispatching, so
+        // we can update VectorSearchRequestContext after allOf completes.
+        VectorSearchRequestContext multiCtx = VectorSearchRequestContext.current();
+        boolean[] wasCachedPerBlock = new boolean[numBlocks];
+        long[] blockOffPerBlock = new long[numBlocks];
+        int[] blockLenPerBlock = new int[numBlocks];
+        long multiStartNanos = System.nanoTime();
         @SuppressWarnings("unchecked")
         CompletableFuture<ByteBuf>[] blockFutures = new CompletableFuture[numBlocks];
         for (int i = 0; i < numBlocks; i++) {
             long blockIdx = startBlock + i;
             long blockOff = blockIdx * (long) bufferSize;
             int blockLen = (int) Math.min(bufferSize, totalSize - blockOff);
+            blockOffPerBlock[i] = blockOff;
+            blockLenPerBlock[i] = blockLen;
+            wasCachedPerBlock[i] = blockCache.containsBlock(path, blockOff, bufferSize);
             blockFutures[i] = blockCache.getBlockAsync(path, blockOff, blockLen,
-                    (p, off, len) -> fetchBlockFromRemoteAsync(p, off, len));
+                    this::fetchBlockFromRemoteAsync);
         }
 
         CompletableFuture<ByteBuffer> result = new CompletableFuture<>();
@@ -389,13 +400,25 @@ public class RemoteRandomAccessReader implements RandomAccessReader {
                 result.completeExceptionally(err);
                 return;
             }
+            // Record per-block cache stats for the completed read.
+            long multiElapsedNanos = System.nanoTime() - multiStartNanos;
+            if (multiCtx != null) {
+                for (int i = 0; i < numBlocks; i++) {
+                    if (wasCachedPerBlock[i]) {
+                        multiCtx.recordCacheHit();
+                    } else {
+                        multiCtx.recordCacheMiss();
+                    }
+                    multiCtx.recordReadFileRange(blockLenPerBlock[i], multiElapsedNanos);
+                }
+            }
             // All futures completed successfully; assemble the output byte array.
             try {
                 byte[] out = new byte[length];
                 int dstOff = 0;
                 for (int i = 0; i < numBlocks; i++) {
                     ByteBuf buf = blockFutures[i].join(); // safe: allOf guarantees done
-                    long blockOff = (startBlock + i) * (long) bufferSize;
+                    long blockOff = blockOffPerBlock[i];
                     int srcStart = (int) Math.max(0L, offset - blockOff);
                     int srcEnd = (int) Math.min((long) buf.readableBytes(), offset + length - blockOff);
                     int toCopy = srcEnd - srcStart;
@@ -405,10 +428,12 @@ public class RemoteRandomAccessReader implements RandomAccessReader {
                     }
                 }
                 result.complete(ByteBuffer.wrap(out));
-            } catch (Exception e) {
+            } catch (RuntimeException e) {
+                // Only RuntimeExceptions can escape buf.getBytes; narrow catch
+                // avoids masking programming errors with a generic catch.
                 result.completeExceptionally(e);
             } finally {
-                // Release every buffer; sliceToHeap already did a heap copy.
+                // Release every buffer; the heap byte[] copy is already done.
                 for (CompletableFuture<ByteBuf> f : blockFutures) {
                     ReferenceCountUtil.safeRelease(f.getNow(null));
                 }
@@ -422,6 +447,10 @@ public class RemoteRandomAccessReader implements RandomAccessReader {
      * {@code readFileRangeAsByteBufAsync} call, clamps {@code len} to avoid
      * reading past {@link #totalSize}, and updates the client-side counters
      * ({@code rfs_client_read_*}) on completion.
+     *
+     * <p>A {@code null} result from the client (block not found) is converted to
+     * a failed future with {@link IOException}, mirroring the null-check in the
+     * synchronous {@link #fetchBlockFromRemote}.
      *
      * <p>Back-pressure ({@code inflightReadBytes} semaphore) is handled
      * transparently inside {@link RemoteFileServiceClient#readFileRangeAsByteBufAsync},
@@ -437,13 +466,22 @@ public class RemoteRandomAccessReader implements RandomAccessReader {
         }
         long startNanos = System.nanoTime();
         return client.readFileRangeAsByteBufAsync(p, off, actualLength, writeBlockSize)
+                // thenApply converts a null result to an exceptional completion,
+                // mirroring the null-check in the synchronous fetchBlockFromRemote.
+                .thenApply(fetched -> {
+                    if (fetched == null) {
+                        throw new CompletionException(new IOException(
+                                "Block not found: path=" + p + " offset=" + off));
+                    }
+                    clientReadRequests.inc();
+                    clientReadBytes.addCount(fetched.readableBytes());
+                    return fetched;
+                })
                 .whenComplete((fetched, err) -> {
                     long elapsedNanos = System.nanoTime() - startNanos;
-                    if (err != null || fetched == null) {
+                    if (err != null) {
                         clientReadLatency.registerFailedEvent(elapsedNanos, TimeUnit.NANOSECONDS);
                     } else {
-                        clientReadRequests.inc();
-                        clientReadBytes.addCount(fetched.readableBytes());
                         clientReadLatency.registerSuccessfulEvent(elapsedNanos, TimeUnit.NANOSECONDS);
                     }
                 });
