@@ -99,7 +99,7 @@ public class SegmentRegistryReconcileTest {
     private static NewSegmentInfo info(String uuid, int segmentId) {
         return new NewSegmentInfo(segmentId, uuid,
                 "g/" + uuid, 100L, "m/" + uuid, 100L, 200L, 10L, 1L,
-                new LogSequenceNumber(1L, 100L));
+                new LogSequenceNumber(1L, 100L), /* jvectorFeatureIds */ null);
     }
 
     @Test

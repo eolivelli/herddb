@@ -21,8 +21,11 @@ package herddb.indexing.optimizer;
 
 import herddb.indexing.segment.VersionedSegmentMetadata;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.function.Predicate;
 
 /**
@@ -220,16 +223,49 @@ public interface MergePolicy {
                 return new ArrayList<>();
             }
             // Filter out graduated segments; only sub-target ones are mergeable.
-            List<VersionedSegmentMetadata> mergeable = new ArrayList<>();
+            List<VersionedSegmentMetadata> subTarget = new ArrayList<>();
             for (VersionedSegmentMetadata v : activeSegments) {
                 long size = Math.max(0L, v.metadata().getSizeBytes());
                 if (size < targetMaxBytes) {
-                    mergeable.add(v);
+                    subTarget.add(v);
                 }
             }
-            if (mergeable.size() < 2) {
+            if (subTarget.size() < 2) {
                 return new ArrayList<>();
             }
+
+            // Group sub-target candidates by their jvector feature set (issue #543).
+            // Segments with heterogeneous feature sets cannot be merged by the streaming
+            // path (OnDiskGraphIndexCompactor.validateFeatures rejects them), so we pick
+            // candidates only from the largest homogeneous group. Segments whose feature
+            // set is unknown (null — pre-#543 metadata) are placed in their own group
+            // (keyed by an empty list sentinel) and never mixed with segments that carry
+            // a known feature list.
+            //
+            // Using List<String> as the map key is correct and idiomatic: the feature
+            // lists are sorted+unmodifiable (written by featureSetToStringList), so
+            // AbstractList.equals/hashCode give value-based keying with no toString
+            // format dependency.
+            final List<String> nullFeatureKey = Collections.emptyList();
+            Map<List<String>, List<VersionedSegmentMetadata>> groups = new LinkedHashMap<>();
+            for (VersionedSegmentMetadata v : subTarget) {
+                List<String> featureIds = v.metadata().getJvectorFeatureIds();
+                List<String> key = featureIds != null ? featureIds : nullFeatureKey;
+                groups.computeIfAbsent(key, k -> new ArrayList<>()).add(v);
+            }
+
+            // Pick the largest homogeneous group (≥ 2 members).
+            List<VersionedSegmentMetadata> mergeable = null;
+            for (List<VersionedSegmentMetadata> group : groups.values()) {
+                if (group.size() >= 2
+                        && (mergeable == null || group.size() > mergeable.size())) {
+                    mergeable = group;
+                }
+            }
+            if (mergeable == null) {
+                return new ArrayList<>();
+            }
+
             mergeable.sort(Comparator.comparingLong(v -> v.metadata().getSizeBytes()));
 
             if (kwayMax >= 2) {

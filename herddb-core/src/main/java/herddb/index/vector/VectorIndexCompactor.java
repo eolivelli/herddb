@@ -745,6 +745,28 @@ final class VectorIndexCompactor {
     }
 
     /**
+     * Returns {@code true} when every candidate's on-disk graph has the same
+     * {@code FeatureId} keyset as the first. {@code false} indicates heterogeneous
+     * inputs that would cause {@code OnDiskGraphIndexCompactor.validateFeatures}
+     * to throw (issue #543).
+     *
+     * <p>Precondition: all candidates have a non-null {@code onDiskGraph}; this
+     * is enforced by the null-check loop that always runs before this helper.
+     */
+    static boolean allCandidatesHaveUniformFeatures(List<VectorSegment> candidates) {
+        if (candidates.size() <= 1) {
+            return true;
+        }
+        Set<FeatureId> ref = candidates.get(0).onDiskGraph.getFeatureSet();
+        for (int i = 1; i < candidates.size(); i++) {
+            if (!candidates.get(i).onDiskGraph.getFeatureSet().equals(ref)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
      * Drives a streaming N:1 compaction via
      * {@link OnDiskGraphIndexCompactor}. Reads each candidate's existing
      * {@link OnDiskGraphIndex}, writes a merged graph with dense output
@@ -784,6 +806,22 @@ final class VectorIndexCompactor {
                                 + " has no on-disk graph (streaming compaction)");
             }
             requireInlineVectorsFeature(seg.segmentId, odg.getFeatures());
+        }
+
+        // Issue #543: OnDiskGraphIndexCompactor.validateFeatures() requires all
+        // source segments to have the same FeatureId keyset. If the candidates
+        // were written by different code paths (e.g. some above and some below
+        // MIN_VECTORS_FOR_FUSED_PQ) their feature sets can differ. Detect this
+        // before handing control to the compactor and fall back to the legacy
+        // rebuild path (which reconstructs the graph from raw vectors and does
+        // not require feature-set uniformity).
+        if (!allCandidatesHaveUniformFeatures(candidates)) {
+            LOGGER.log(Level.WARNING,
+                    "VectorIndexCompactor (streaming): detected heterogeneous feature"
+                            + " sets across {0} candidates — falling back to legacy rebuild",
+                    candidates.size());
+            return rebuildSegmentLegacy(store, candidates, authority, dim,
+                    keptCount, filteredCount);
         }
 
         // Build per-source dense ordinal mappers so the merged segment occupies
@@ -909,6 +947,16 @@ final class VectorIndexCompactor {
                 throw new CompactionException(FailureReason.CORRUPTION,
                         "writeStreamingCompactedSegment returned null for non-empty"
                                 + " streaming compaction shard (keptCount=" + keptCount + ")");
+            }
+
+            // Stamp the feature set produced by the streaming compaction onto swr
+            // so it can be carried into NewSegmentInfo and eventually SegmentMetadata.
+            // The allCandidatesHaveUniformFeatures guard above ensures all candidates
+            // share the same feature set (heterogeneous inputs were already redirected
+            // to rebuildSegmentLegacy); the first candidate is therefore representative.
+            if (!candidates.isEmpty() && candidates.get(0).onDiskGraph != null) {
+                swr.jvectorFeatureIds = RemoteSegmentGraphMerger.featureSetToStringList(
+                        candidates.get(0).onDiskGraph.getFeatureSet());
             }
 
             // Upload succeeded — both files exist remotely. Pre-populate orphans

@@ -318,7 +318,10 @@ public final class RemoteSegmentMerger implements SegmentMerger {
                 .mapFileSize(output.mapFileSize)
                 .vectorCount(output.vectorCount)
                 .generation(maxGeneration + 1L)
-                .createdAtEpochMillis(System.currentTimeMillis());
+                .createdAtEpochMillis(System.currentTimeMillis())
+                // Carry the feature set produced by the merger so future merge
+                // candidates can be grouped by feature set (issue #543).
+                .jvectorFeatureIds(output.featureIds);
         if (latestBaseLsn != null) {
             builder.baseLsn(latestBaseLsn);
         }
@@ -354,7 +357,8 @@ public final class RemoteSegmentMerger implements SegmentMerger {
                 produced.getTablespaceUuid(), produced.getIndexUuid(), produced.getSegmentId(),
                 produced.getGraphPath(), 0L,
                 produced.getMapPath(), 0L,
-                produced.getVectorCount(), 0L, 0L));
+                produced.getVectorCount(), 0L, 0L,
+                /* featureIds not needed for abandon/deleteOutput */ null));
     }
 
     // -------------------------------------------------------------------------

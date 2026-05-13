@@ -551,6 +551,7 @@ public final class SegmentRegistryPublisher implements SegmentPublisher {
                 .vectorCount(info.getVectorCount())
                 .generation(info.getGeneration())
                 .createdAtEpochMillis(now)
+                .jvectorFeatureIds(info.getJvectorFeatureIds())
                 .build();
     }
 }
