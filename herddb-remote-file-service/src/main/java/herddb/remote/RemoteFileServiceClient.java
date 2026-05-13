@@ -747,11 +747,13 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
     }
 
     public CompletableFuture<Boolean> deleteFileAsync(String path) {
-        // Issue #551 forensics: log every delete request issued by the client.
-        // File deletions are the root cause of zombie-segment failure modes
-        // (files gone while metadata still references them); making them
-        // visible in the IS / optimizer logs makes future incidents far
-        // easier to trace from logs alone.
+        // Issue #551 forensics: log every delete request issued by the
+        // client. File deletions are the root cause of zombie-segment
+        // failure modes (files gone while metadata still references them);
+        // making them visible at INFO is required so the IS / optimizer
+        // logs alone are enough to investigate future incidents. The user
+        // explicitly chose INFO over FINE for this reason despite the
+        // higher log volume on the retention-reaper hot path.
         LOGGER.log(Level.INFO, "file-server client: deleteFile path={0}", path);
         return retryAsync(() -> doDeleteFileAsync(path), "deleteFile", path, 0);
     }

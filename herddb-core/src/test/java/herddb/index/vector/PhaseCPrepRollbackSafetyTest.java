@@ -151,27 +151,41 @@ public class PhaseCPrepRollbackSafetyTest {
             // new multipart files AND persist IndexStatus referencing them,
             // then Phase C-prep will fail when readMultipartMapDataToTempFile
             // tries to read them back.
+            //
+            // pr-reviewer pass on #552: narrow the catch to the precise
+            // exception types the Phase C-prep handler can rethrow
+            // (IOException from readMultipartMapDataToTempFile,
+            // DataStorageManagerException from the lookup, or RuntimeException
+            // from any defensive wrapping). A swallowed failure (no throw,
+            // no counter bump) must fail the test — that's what assertion
+            // (A) below catches.
             long failuresBefore = store.getConsecutiveCheckpointFailures();
+            boolean threw = false;
             try {
                 store.checkpoint();
-                // The fix path may swallow the IOException and surface it via
-                // the consecutiveCheckpointFailures counter rather than
-                // re-throwing all the way out; tolerate either outcome here.
-            } catch (Exception expected) {
-                // Phase C-prep failure surfaces as IOException/RuntimeException
-                // up the checkpoint stack. Either is acceptable.
+            } catch (RuntimeException expected) {
+                // checkpoint() declares DataStorageManagerException, which
+                // is itself a RuntimeException (via HerdDBInternalException);
+                // any defensive wrap from the rollback/recover handlers is
+                // also a RuntimeException. We deliberately do NOT catch
+                // Throwable here — an Error must still escape so a real
+                // VM-level fault doesn't get masked.
+                threw = true;
             }
 
             // ----- Post-fix assertions -----
 
-            // (A) The checkpoint must have failed (consecutiveCheckpointFailures
-            // bumped by 1). If this fails, the failure injection did not
-            // actually trip the C-prep handler — the rest of the test is
-            // meaningless.
-            assertTrue("Phase C-prep must have failed at least once — "
-                            + "failuresBefore=" + failuresBefore + ", after="
-                            + store.getConsecutiveCheckpointFailures(),
-                    store.getConsecutiveCheckpointFailures() > failuresBefore);
+            // (A) The checkpoint must have failed — surfaced by either a
+            //     thrown exception OR the consecutiveCheckpointFailures
+            //     counter advancing. If NEITHER fired, the failure
+            //     injection did not actually trip the C-prep handler and
+            //     the rest of the test is meaningless. pr-reviewer pass:
+            //     a swallowed failure now fails this assertion immediately.
+            assertTrue("Phase C-prep must have failed — either by throw"
+                            + " (threw=" + threw + ") or by counter bump"
+                            + " (failuresBefore=" + failuresBefore + ", after="
+                            + store.getConsecutiveCheckpointFailures() + ")",
+                    threw || store.getConsecutiveCheckpointFailures() > failuresBefore);
 
             // (B) THE FIX: no delete calls were made against the multipart
             // files that Phase B uploaded in the failing checkpoint. The

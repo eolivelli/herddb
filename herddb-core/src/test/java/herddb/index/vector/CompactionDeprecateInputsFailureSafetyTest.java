@@ -146,10 +146,22 @@ public class CompactionDeprecateInputsFailureSafetyTest {
 
             // ----- Post-fix assertions -----
 
-            // (A) The compaction must have actually succeeded (the throw is
-            //     in the post-swap best-effort block, NOT in the swap proper).
-            //     If the compactor itself didn't run, the test isn't
-            //     exercising the right path.
+            // (A.1) The compactor must have SELECTED candidates this cycle.
+            // pr-reviewer pass on #552: without this, a regression where
+            // configureCompaction() parameters silently stop matching the
+            // candidates would degrade the test into "compaction did nothing,
+            // pendingDeletes is empty for the wrong reason" and the
+            // assertion below would pass for an unrelated reason.
+            assertEquals("compaction must have run exactly one cycle",
+                    1, store.getCompactionRunsTotal());
+            assertTrue("compactor must have selected >= 2 inputs (got "
+                            + store.getCompactionLastInputSegments() + ")",
+                    store.getCompactionLastInputSegments() >= 2);
+
+            // (A.2) The compaction must have actually succeeded (the throw is
+            //       in the post-swap best-effort block, NOT in the swap
+            //       proper). If the compactor itself didn't run, the test
+            //       isn't exercising the right path.
             assertEquals("compaction must have completed successfully",
                     1, store.getCompactionSuccessesTotal());
             assertTrue("segment count must shrink after a successful merge — "
@@ -160,12 +172,12 @@ public class CompactionDeprecateInputsFailureSafetyTest {
             // (B) deprecateInputs must have been called (and thrown).
             //     If it wasn't called, the test path is broken — the
             //     compaction took a different branch.
-            assertTrue("publisher.deprecateInputs must have been called at"
-                            + " least once (deprecate-on-merge path)",
-                    publisher.deprecateInputsCalls.get() >= 1);
+            assertEquals("publisher.deprecateInputs must have been called"
+                            + " exactly once (deprecate-on-merge path)",
+                    1, publisher.deprecateInputsCalls.get());
 
             // (C) THE FIX: pendingDeletes must be empty. Pre-fix it would
-            //     hold at least 2 entries per input segment (graph + map);
+            //     hold exactly 2 entries per input segment (graph + map);
             //     post-fix it stays empty because the deprecate throw
             //     prevents the queue.
             //
@@ -175,9 +187,9 @@ public class CompactionDeprecateInputsFailureSafetyTest {
             //     input files while ZK still shows them as ACTIVE.
             List<PersistentVectorStore.PendingDelete> pending =
                     store.getPendingDeletesSnapshot();
-            assertEquals("pendingDeletes must be empty when deprecateInputs"
-                            + " failed (issue #551 root cause B). Found entries: "
-                            + pending,
+            assertEquals("pendingDeletes must be EXACTLY empty when"
+                            + " deprecateInputs failed (issue #551 root cause B)."
+                            + " Found entries: " + pending,
                     0, pending.size());
         }
     }
@@ -216,17 +228,111 @@ public class CompactionDeprecateInputsFailureSafetyTest {
             assertEquals(1, store.getCompactionSuccessesTotal());
             assertTrue("segment count must shrink",
                     store.getSegmentCount() < segmentsBefore);
-            assertTrue("deprecateInputs must have been called",
-                    publisher.deprecateInputsCalls.get() >= 1);
+            assertEquals("deprecateInputs must have been called exactly once",
+                    1, publisher.deprecateInputsCalls.get());
 
-            // Happy path: pendingDeletes must hold entries for the input
-            // files (graph + map per input). Without this, the fix would
-            // be over-correct and leak files in steady state.
+            // Compactor must have actually selected candidates this cycle.
+            long selected = store.getCompactionLastInputSegments();
+            assertTrue("compactor must have selected >= 2 inputs (got "
+                            + selected + ")",
+                    selected >= 2);
+
+            // Happy path: pendingDeletes must hold EXACTLY 2 entries per
+            // selected input (graph + map). pr-reviewer pass on #552: the
+            // previous `>= 2` assertion was too loose — a regression that
+            // queued only the graph (or only the first input) would still
+            // pass. The deterministic expectation is `2 * selected`.
             List<PersistentVectorStore.PendingDelete> pending =
                     store.getPendingDeletesSnapshot();
-            assertTrue("pendingDeletes must hold the swapped-out input files"
-                            + " when deprecateInputs succeeds — got " + pending.size(),
-                    pending.size() >= 2);
+            assertEquals("pendingDeletes must hold EXACTLY 2 entries per"
+                            + " selected input (graph + map) when deprecateInputs"
+                            + " succeeds — selected=" + selected
+                            + ", pending=" + pending,
+                    2L * selected, (long) pending.size());
+        }
+    }
+
+    /**
+     * pr-reviewer pass on #552 follow-up #2: empty-result compaction
+     * (rebuild returns {@code null}) with a publisher attached must NOT
+     * queue input files for deletion, because {@code deprecateInputs}
+     * was not called on them (ZK still shows ACTIVE). Pre-fix this
+     * branch fell through to the `else` and queued the files — same
+     * zombie-segment hazard as the {@code deprecateInputs}-fails case.
+     *
+     * <p>The test forces every PK to be tombstoned before running the
+     * compactor, so {@code VectorIndexCompactor.rebuildSegment} returns
+     * {@code null} and the IS takes the empty-result branch in
+     * {@code runCompactionCycle}.
+     */
+    @Test(timeout = 30_000)
+    public void emptyResultCompactionWithPublisherMustNotQueueInputsForDeletion()
+            throws Exception {
+        Path tmpDir = tmpFolder.newFolder("issue551-emptyResult").toPath();
+        MemoryDataStorageManager dsm = new MemoryDataStorageManager();
+        TrackingPublisher publisher = new TrackingPublisher();
+
+        try (PersistentVectorStore store = createStore(tmpDir, dsm)) {
+            store.setSegmentPublisher(publisher);
+            store.start();
+
+            Random rng = new Random(553);
+            int dim = 16;
+            java.util.List<Bytes> allPks = new java.util.ArrayList<>();
+            for (int c = 0; c < 4; c++) {
+                for (int i = 0; i < 200; i++) {
+                    Bytes pk = Bytes.from_int(c * 10_000 + i);
+                    allPks.add(pk);
+                    store.addVector(pk, vec(rng, dim));
+                }
+                store.checkpoint();
+            }
+            int segmentsBefore = store.getSegmentCount();
+            assertTrue("test setup must produce >= 2 segments",
+                    segmentsBefore >= 2);
+            assertEquals(0, store.getPendingDeletesSnapshot().size());
+
+            // Tombstone EVERY PK so the rebuild produces an empty result.
+            for (Bytes pk : allPks) {
+                store.removeVector(pk);
+            }
+
+            // Compaction must take the empty-result branch (rebuild ==
+            // null) → atomicSwapCompactionResult is called with
+            // mergedOutput == null → stagedInfo == null → the new
+            // `else if (stagedInfo == null)` branch fires.
+            store.runCompactionCycle();
+
+            // The compactor ran and succeeded (empty-result is still a
+            // success — the inputs were swapped out).
+            assertEquals(1, store.getCompactionRunsTotal());
+            assertEquals(1, store.getCompactionSuccessesTotal());
+            assertEquals("empty-result compaction must produce zero output"
+                            + " segments",
+                    0, store.getCompactionLastOutputSegments());
+            long selected = store.getCompactionLastInputSegments();
+            assertTrue("empty-result compactor must have selected >= 2"
+                            + " inputs (got " + selected + ")",
+                    selected >= 2);
+
+            // Publisher contract: deprecateInputs was NEVER called (the
+            // empty-result path skips the stage/commit/deprecate sequence
+            // entirely because mergedOutput == null).
+            assertEquals("publisher.deprecateInputs must NOT have been"
+                            + " called on the empty-result path",
+                    0, publisher.deprecateInputsCalls.get());
+
+            // THE FIX: pendingDeletes must be empty. Pre-fix the `else`
+            // branch would have flipped inputsSafeToDelete = true and
+            // queued the input files even though their ZK znodes were
+            // never deprecated → zombie hazard.
+            List<PersistentVectorStore.PendingDelete> pending =
+                    store.getPendingDeletesSnapshot();
+            assertEquals("pendingDeletes must be empty on the empty-result"
+                            + " path with publisher attached (issue #551"
+                            + " pr-reviewer follow-up #1). Found entries: "
+                            + pending,
+                    0, pending.size());
         }
     }
 
@@ -288,6 +394,39 @@ public class CompactionDeprecateInputsFailureSafetyTest {
                                     long retentionUntilEpochMillis) {
             deprecateInputsCalls.incrementAndGet();
             // no throw — happy path
+        }
+    }
+
+    /**
+     * Tracking publisher used by the empty-result-compaction test: counts
+     * every relevant call so the test can assert that {@code deprecateInputs}
+     * was NEVER invoked on that path.
+     */
+    private static final class TrackingPublisher implements SegmentPublisher {
+
+        final AtomicInteger stageCalls = new AtomicInteger();
+        final AtomicInteger commitCalls = new AtomicInteger();
+        final AtomicInteger deprecateInputsCalls = new AtomicInteger();
+
+        @Override
+        public void stageNewSegments(List<NewSegmentInfo> segments) {
+            stageCalls.incrementAndGet();
+        }
+
+        @Override
+        public void commitStagedSegments(List<NewSegmentInfo> segments) {
+            commitCalls.incrementAndGet();
+        }
+
+        @Override
+        public boolean revalidateInputsActive(List<NewSegmentInfo> inputs) {
+            return true;
+        }
+
+        @Override
+        public void deprecateInputs(List<NewSegmentInfo> inputs, String replacementUuid,
+                                    long retentionUntilEpochMillis) {
+            deprecateInputsCalls.incrementAndGet();
         }
     }
 }

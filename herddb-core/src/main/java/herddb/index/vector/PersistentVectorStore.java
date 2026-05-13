@@ -3068,8 +3068,46 @@ public class PersistentVectorStore extends AbstractVectorStore {
         // deleted only after the "switch to the new segments" is committed to
         // both metadata stores (IndexStatus + ZK). See the Stage 1 block above
         // for the full rationale.
+        //
+        // The variable defaults to false: input files are queued for deletion
+        // ONLY when one of three explicit paths flips it to true (publisher
+        // null, null-UUID inputs, or a successful deprecateInputs). Any new
+        // code path that exits this block without explicit handling will
+        // therefore default to "do not delete" — fail-safe.
         boolean inputsSafeToDelete = false;
-        if (publisherSnapshot != null && stagedInfo != null) {
+        if (publisherSnapshot == null) {
+            // No publisher: no ZK metadata to coordinate. IndexStatus is the
+            // sole metadata store and is already durable (Stage 2), so the
+            // switch is fully committed. Safe to delete input files.
+            inputsSafeToDelete = true;
+        } else if (stagedInfo == null) {
+            // Publisher attached, but no merged output was ever staged. There
+            // are two ways to land here:
+            //   (a) `mergedOutput == null` — empty-result compaction (every
+            //       PK in the inputs was tombstoned; the rebuild produced
+            //       nothing). The inputs were nevertheless removed from
+            //       `this.segments` and from IndexStatus.
+            //   (b) `mergedOutput != null` but the caller never built
+            //       `stagedInfo` for it (defensive; should not happen with
+            //       the current code path).
+            // In BOTH cases we did NOT call deprecateInputs on the inputs,
+            // so ZK still shows them as ACTIVE. Deleting their files here
+            // would re-create the zombie-segment hazard this PR is closing.
+            // Leave `inputsSafeToDelete = false` and let the optimizer fold
+            // the orphan ACTIVE inputs on its next tick (the same recovery
+            // path used when deprecateInputs fails — see below).
+            if (!inputs.isEmpty()) {
+                LOGGER.log(Level.WARNING,
+                        "vector store {0}: empty-result / unstaged compaction with"
+                                + " publisher attached — {1} input segments remain"
+                                + " ACTIVE in ZK; their files will NOT be queued for"
+                                + " deletion to avoid zombie-segment failure. Optimizer"
+                                + " will fold orphan ACTIVE inputs on next tick.",
+                        new Object[]{indexName, inputs.size()});
+            }
+        } else {
+            // publisher != null && stagedInfo != null: the standard
+            // merged-output path.
             try {
                 publisherSnapshot.commitStagedSegments(stagedInfo);
             } catch (RuntimeException e) {
@@ -3099,19 +3137,20 @@ public class PersistentVectorStore extends AbstractVectorStore {
                             new Object[]{indexName, inputInfosForRegistry.size(),
                                     e.getMessage()});
                     // Intentionally leave inputsSafeToDelete = false. The input
-                    // files stay in MinIO as orphans-but-intact (no zombie). A
-                    // follow-up cleanup mechanism is required to reclaim them.
+                    // files stay in MinIO as orphans-but-intact (no zombie). The
+                    // optimizer's existing orphan-ACTIVE fold path (see
+                    // IndexOptimizerEngine) reclaims them on the next merge
+                    // covering this region — typically minutes, not indefinite.
                 }
             } else {
-                // No inputs to deprecate (e.g. the very first checkpoint with
-                // a publisher attached but no merge). No files to delete either.
+                // Either inputInfosForRegistry is empty (all inputs had null
+                // segmentUuid — the very-first-checkpoint-with-publisher case;
+                // no ZK record exists to be inconsistent with) or mergedOutput
+                // is null (caught by the stagedInfo == null branch above; this
+                // path is defensive only). Safe to queue: there is nothing in
+                // ZK to leave behind.
                 inputsSafeToDelete = true;
             }
-        } else {
-            // No publisher: no ZK coordination required. The IndexStatus is the
-            // sole metadata store and is already durable, so the switch is
-            // committed. Safe to delete input files.
-            inputsSafeToDelete = true;
         }
 
         if (inputsSafeToDelete) {
@@ -5092,6 +5131,22 @@ public class PersistentVectorStore extends AbstractVectorStore {
             // durable state; the next successful indexCheckpoint cycle either
             // re-uses them (preload retry) or rewrites them. On restart, the
             // segments load cleanly because the files survive on disk.
+            //
+            // Defence in depth (pr-reviewer pass on #552): the
+            // `provisionalPageIds` tracker is currently DEAD CODE — no caller
+            // populates it; only the multipart tracker is fed by
+            // {@link #trackProvisionalMultipartFile}. A future contributor
+            // who reintroduces page-level tracking must NOT use this code
+            // path to delete pages after Phase B has persisted IndexStatus
+            // (same zombie-segment failure mode as multipart). The assert
+            // makes that constraint load-bearing: if anyone populates the
+            // page tracker in Phase B, they MUST either drain it before
+            // Phase C-prep can fail, or re-design this handler.
+            List<Long> stalePages = this.provisionalPageIds;
+            assert stalePages == null || stalePages.isEmpty()
+                    : "provisionalPageIds populated but not handled in Phase C-prep "
+                            + "rollback (would leak pages OR re-create zombie-segment "
+                            + "hazard if reintroduced naively); see issue #551 review.";
             this.provisionalPageIds = null;
             this.provisionalMultipartFiles = null;
             consecutiveCheckpointFailures.incrementAndGet();
