@@ -60,9 +60,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: eolivelli/jvector
-          # Pinned to the parallel-fusedpq-io PR branch (issue #547) while
-          # eolivelli/jvector#8 is unmerged. Revert to ref: main once merged.
-          ref: parallel-fusedpq-io
+          ref: main
           path: jvector
       - name: 'Build jvector'
         run: mvn -B install -DskipTests -Drat.skip=true --file jvector/pom.xml && rm -rf jvector
