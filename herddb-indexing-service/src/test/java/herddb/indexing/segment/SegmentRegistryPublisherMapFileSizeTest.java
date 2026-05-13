@@ -103,7 +103,8 @@ public class SegmentRegistryPublisherMapFileSizeTest {
                 /* estimatedSizeBytes */ 99_999L + expectedMapSize,
                 /* vectorCount */ 1234L,
                 /* generation */ 7L,
-                /* baseLsn */ new LogSequenceNumber(1L, 100L));
+                /* baseLsn */ new LogSequenceNumber(1L, 100L),
+                /* jvectorFeatureIds */ null);
 
         publisher.commitStagedSegments(Collections.singletonList(info));
 
@@ -130,7 +131,8 @@ public class SegmentRegistryPublisherMapFileSizeTest {
         NewSegmentInfo info = new NewSegmentInfo(
                 /* segmentId */ 7, "uuid-prov",
                 "g", 100L, "m", expectedMapSize,
-                100L + expectedMapSize, 99L, 1L, new LogSequenceNumber(1L, 50L));
+                100L + expectedMapSize, 99L, 1L, new LogSequenceNumber(1L, 50L),
+                /* jvectorFeatureIds */ null);
 
         publisher.stageNewSegments(Collections.singletonList(info));
 

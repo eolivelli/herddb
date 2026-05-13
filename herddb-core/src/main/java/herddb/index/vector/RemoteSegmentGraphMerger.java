@@ -58,11 +58,13 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.BitSet;
+import java.util.Collections;
 import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.ForkJoinPool;
 import java.util.function.Consumer;
 import java.util.function.IntFunction;
@@ -115,12 +117,18 @@ public final class RemoteSegmentGraphMerger {
     private static final Logger LOGGER = Logger.getLogger(RemoteSegmentGraphMerger.class.getName());
 
     /**
-     * Mirror of the constant in {@code PersistentVectorStore}: shards smaller
-     * than this are written without FusedPQ (PQ training cost outweighs
-     * scoring benefit for tiny graphs, and the InlineVectors path covers
-     * search just fine). Kept at the same value for behavioural parity.
+     * Minimum number of vectors required to write the FusedPQ feature. Must
+     * match {@link PersistentVectorStore#MIN_VECTORS_FOR_FUSED_PQ} exactly so
+     * that every code path (IS checkpoint, IS-local compaction, external
+     * optimizer merge) produces segments with the same feature set for the same
+     * vector count. A mismatch is the root cause of issue #543: the optimizer
+     * previously used 65,536 while the IS used 256, causing
+     * {@code OnDiskGraphIndexCompactor.validateFeatures} to throw
+     * {@code "Each source must have the same features"} whenever an
+     * optimizer-produced segment ended up in the same merge batch as an
+     * IS-checkpoint segment.
      */
-    private static final int MIN_VECTORS_FOR_FUSED_PQ = 64 * 1024;
+    static final int MIN_VECTORS_FOR_FUSED_PQ = PersistentVectorStore.MIN_VECTORS_FOR_FUSED_PQ;
 
     /** Block size used for streaming downloads via the multipart reader. */
     private static final int DOWNLOAD_CHUNK_SIZE = 4 * 1024 * 1024;
@@ -368,11 +376,19 @@ public final class RemoteSegmentGraphMerger {
         public final long vectorCount;
         public final long droppedTombstones;
         public final long droppedDuplicates;
+        /**
+         * Sorted list of jvector {@code FeatureId} names written into the merged
+         * graph file (e.g. {@code ["FUSED_PQ", "INLINE_VECTORS"]}). Propagated
+         * into {@code SegmentMetadata.jvectorFeatureIds} by the caller so the
+         * optimizer's merge policy can filter by feature set (issue #543).
+         */
+        public final List<String> featureIds;
 
         public MergeOutput(String tablespaceUuid, String indexUuid, long segmentId,
                            String graphPath, long graphFileSize,
                            String mapPath, long mapFileSize,
-                           long vectorCount, long droppedTombstones, long droppedDuplicates) {
+                           long vectorCount, long droppedTombstones, long droppedDuplicates,
+                           List<String> featureIds) {
             this.tablespaceUuid = tablespaceUuid;
             this.indexUuid = indexUuid;
             this.segmentId = segmentId;
@@ -383,6 +399,7 @@ public final class RemoteSegmentGraphMerger {
             this.vectorCount = vectorCount;
             this.droppedTombstones = droppedTombstones;
             this.droppedDuplicates = droppedDuplicates;
+            this.featureIds = featureIds;
         }
 
         /** Sum of graph and map file sizes — convenient for {@code SegmentMetadata.sizeBytes}. */
@@ -627,7 +644,8 @@ public final class RemoteSegmentGraphMerger {
                             lastMergeTimings.uploadMs});
             return new MergeOutput(outputTablespaceUuid, outputIndexUuid, outputSegmentId,
                     graphPath, graphSize, mapPath, mapSize,
-                    keptCount, droppedTombstones, droppedDuplicates);
+                    keptCount, droppedTombstones, droppedDuplicates,
+                    featureIdsForVectorCount(keptCount));
         } finally {
             for (Path tmp : mapTempFiles) {
                 try {
@@ -637,6 +655,77 @@ public final class RemoteSegmentGraphMerger {
                 }
             }
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Feature-set helpers (issue #543)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Returns a sorted, unmodifiable {@code List<String>} of feature ID names
+     * for the output of a legacy merge that produced {@code vectorCount} vectors.
+     * The list is determined by {@link #MIN_VECTORS_FOR_FUSED_PQ}: outputs with
+     * fewer vectors carry only {@code INLINE_VECTORS}; larger outputs carry both
+     * {@code FUSED_PQ} and {@code INLINE_VECTORS}.
+     */
+    private static List<String> featureIdsForVectorCount(long vectorCount) {
+        if (vectorCount >= MIN_VECTORS_FOR_FUSED_PQ) {
+            return Collections.unmodifiableList(java.util.Arrays.asList("FUSED_PQ", "INLINE_VECTORS"));
+        } else {
+            return Collections.singletonList("INLINE_VECTORS");
+        }
+    }
+
+    /**
+     * Returns a sorted, unmodifiable {@code List<String>} of feature ID names
+     * derived from the first source's feature set. Called by the streaming path
+     * after uniformity has been validated — all sources share the same features.
+     */
+    private static List<String> featureIdsFromSources(List<OnDiskGraphIndex> sources) {
+        if (sources.isEmpty()) {
+            return Collections.emptyList();
+        }
+        return featureSetToStringList(sources.get(0).getFeatureSet());
+    }
+
+    /**
+     * Converts a {@code Set<FeatureId>} into a sorted {@code List<String>} of
+     * feature names. Sorting ensures the representation is canonical so two
+     * segments with the same logical feature set always produce the same list.
+     *
+     * <p>Public so that {@link PersistentVectorStore} can stamp the feature list
+     * on existing on-disk segments without duplicating the conversion logic.
+     */
+    public static List<String> featureSetToStringList(Set<FeatureId> featureIds) {
+        List<String> names = new ArrayList<>(featureIds.size());
+        for (FeatureId fid : featureIds) {
+            names.add(fid.name());
+        }
+        Collections.sort(names);
+        return Collections.unmodifiableList(names);
+    }
+
+
+    /**
+     * Returns {@code true} when every source graph has the same {@code FeatureId}
+     * keyset as the first. {@code false} indicates heterogeneous inputs that
+     * would cause {@code OnDiskGraphIndexCompactor.validateFeatures} to throw.
+     *
+     * @param sources opened on-disk graphs (parallel to {@code inputs})
+     * @param inputs  matching input descriptors (used only for logging)
+     */
+    private static boolean allSourcesHaveUniformFeatures(List<OnDiskGraphIndex> sources,
+                                                          List<RemoteSegmentInput> inputs) {
+        if (sources.size() <= 1) {
+            return true;
+        }
+        Set<FeatureId> ref = sources.get(0).getFeatureSet();
+        for (int s = 1; s < sources.size(); s++) {
+            if (!sources.get(s).getFeatureSet().equals(ref)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**
@@ -818,6 +907,50 @@ public final class RemoteSegmentGraphMerger {
                 sources.add(odg);
             }
 
+            // 5b. Feature-set uniformity check (issue #543). jvector's
+            //     OnDiskGraphIndexCompactor.validateFeatures requires every
+            //     source to share exactly the same FeatureId keyset. If the
+            //     sources are heterogeneous (e.g. some FusedPQ, some
+            //     InlineVectors-only) the compactor would throw
+            //     "Each source must have the same features". Detect this
+            //     BEFORE calling the compactor and fall back to the legacy
+            //     in-memory rebuild, which works from map-file vectors and
+            //     does not require uniform graph features.
+            if (!allSourcesHaveUniformFeatures(sources, inputs)) {
+                // Graph files are already downloaded; close readers and let
+                // the finally block clean up the temp files. The legacy path
+                // downloads only the map files, which it needs anyway.
+                LOGGER.log(Level.WARNING,
+                        "RemoteSegmentGraphMerger (streaming): detected heterogeneous"
+                                + " feature sets across {0} input segments"
+                                + " — falling back to legacy in-memory rebuild."
+                                + " Segment feature details logged at FINE level.",
+                        n);
+                if (LOGGER.isLoggable(Level.FINE)) {
+                    for (int s = 0; s < n; s++) {
+                        LOGGER.log(Level.FINE,
+                                "  segment {0}: featureIds={1}",
+                                new Object[]{inputs.get(s).segmentUuid,
+                                        featureSetToStringList(sources.get(s).getFeatureSet())});
+                    }
+                }
+                // Close reader suppliers before falling through to the finally block.
+                for (ReaderSupplier rs : readerSuppliers) {
+                    try {
+                        rs.close();
+                    } catch (IOException ignored) {
+                        // best-effort
+                    }
+                }
+                readerSuppliers.clear();
+                // The legacy rebuild reads map files from remote storage;
+                // temp map files downloaded in step 1 are already on disk.
+                // Pass the inputs directly; the legacy path re-downloads its
+                // own copies so we just let the finally block delete ours.
+                return mergeLegacy(inputs, outputTablespaceUuid, outputIndexUuid,
+                        outputSegmentId, dim);
+            }
+
             // 6. Build dense per-source mappers. Align bitset length to the
             //    graph's level-0 size (jvector validates the bitset bounds).
             List<OrdinalMapper> mappers = new ArrayList<>(n);
@@ -957,7 +1090,8 @@ public final class RemoteSegmentGraphMerger {
                             timings != null ? timings.uploadMs : -1});
             return new MergeOutput(outputTablespaceUuid, outputIndexUuid, outputSegmentId,
                     graphPath, graphSize, mapPath, mapSize,
-                    keptCount, droppedTombstones, droppedDuplicates);
+                    keptCount, droppedTombstones, droppedDuplicates,
+                    featureIdsFromSources(sources));
         } finally {
             for (ReaderSupplier rs : readerSuppliers) {
                 try {

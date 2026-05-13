@@ -20,6 +20,7 @@
 package herddb.index.vector;
 
 import herddb.log.LogSequenceNumber;
+import java.util.List;
 
 /**
  * Snapshot of a freshly-emitted vector index segment, handed to a {@link SegmentPublisher}
@@ -42,12 +43,20 @@ public final class NewSegmentInfo {
     private final long vectorCount;
     private final long generation;
     private final LogSequenceNumber baseLsn;
+    /**
+     * Sorted list of jvector {@code FeatureId} names recorded when this
+     * segment's graph file was written (e.g. {@code ["FUSED_PQ",
+     * "INLINE_VECTORS"]}). May be {@code null} for segments loaded from
+     * a pre-#543 IndexStatus that did not record feature information.
+     */
+    private final List<String> jvectorFeatureIds;
 
     public NewSegmentInfo(int segmentId, String segmentUuid,
                           String graphFilePath, long graphFileSize,
                           String mapFilePath, long mapFileSize,
                           long estimatedSizeBytes, long vectorCount, long generation,
-                          LogSequenceNumber baseLsn) {
+                          LogSequenceNumber baseLsn,
+                          List<String> jvectorFeatureIds) {
         this.segmentId = segmentId;
         this.segmentUuid = segmentUuid;
         this.graphFilePath = graphFilePath;
@@ -58,6 +67,7 @@ public final class NewSegmentInfo {
         this.vectorCount = vectorCount;
         this.generation = generation;
         this.baseLsn = baseLsn;
+        this.jvectorFeatureIds = jvectorFeatureIds;
     }
 
     public int getSegmentId() {
@@ -105,6 +115,15 @@ public final class NewSegmentInfo {
         return baseLsn;
     }
 
+    /**
+     * Returns the sorted list of jvector {@code FeatureId} names recorded when
+     * this segment's graph file was written, or {@code null} when unknown
+     * (segments loaded from a pre-#543 IndexStatus).
+     */
+    public List<String> getJvectorFeatureIds() {
+        return jvectorFeatureIds;
+    }
+
     @Override
     public String toString() {
         return "NewSegmentInfo{segmentId=" + segmentId
@@ -117,6 +136,7 @@ public final class NewSegmentInfo {
                 + ", vectorCount=" + vectorCount
                 + ", generation=" + generation
                 + ", baseLsn=" + baseLsn
+                + ", jvectorFeatureIds=" + jvectorFeatureIds
                 + '}';
     }
 }

@@ -1666,6 +1666,15 @@ public class PersistentVectorStore extends AbstractVectorStore {
         /** Number of live vectors written to this segment. */
         final long vectorCount;
         /**
+         * Sorted list of jvector {@code FeatureId} names written into the graph
+         * file (e.g. {@code ["FUSED_PQ", "INLINE_VECTORS"]}). Carried through
+         * to {@link NewSegmentInfo} and persisted in the ZK segment znode so the
+         * external optimizer's merge policy can group candidates by feature set
+         * (issue #543). Set immediately after construction by the writer that
+         * knows which features were used.
+         */
+        List<String> jvectorFeatureIds;
+        /**
          * Stable UUID stamped onto this segment once we know we will publish to a
          * {@link SegmentPublisher}. Populated by {@link #stampSegmentUuid(String)} in
          * Phase B; carried through to {@link NewSegmentInfo} and persisted in the v4
@@ -2685,12 +2694,17 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 mergedOutput.segmentUuid = java.util.UUID.randomUUID().toString();
             }
             long nextGen = currentIndexStatusGeneration.get() + 1;
+            List<String> mergedFeatureIds = (mergedOutput.onDiskGraph != null)
+                    ? RemoteSegmentGraphMerger.featureSetToStringList(
+                            mergedOutput.onDiskGraph.getFeatureSet())
+                    : null;
             NewSegmentInfo mergedInfo = new NewSegmentInfo(
                     mergedOutput.segmentId, mergedOutput.segmentUuid,
                     mergedOutput.graphFilePath, mergedOutput.graphFileSize,
                     mergedOutput.mapFilePath, mergedOutput.mapFileSize,
                     mergedOutput.estimatedSizeBytes, mergedVectorCount,
-                    nextGen, LogSequenceNumber.START_OF_TIME);
+                    nextGen, LogSequenceNumber.START_OF_TIME,
+                    mergedFeatureIds);
             stagedInfo = java.util.Collections.singletonList(mergedInfo);
 
             inputInfosForRegistry = new ArrayList<>(inputs.size());
@@ -2701,12 +2715,18 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 // Such segments are not registered in ZK yet; they will be picked up by
                 // the next reconcile pass. Skip them in the validate/deprecate set.
                 if (in.segmentUuid != null) {
+                    java.util.List<String> inFeatureIds =
+                            (in.onDiskGraph != null)
+                                    ? RemoteSegmentGraphMerger.featureSetToStringList(
+                                            in.onDiskGraph.getFeatureSet())
+                                    : null;
                     inputInfosForRegistry.add(new NewSegmentInfo(
                             in.segmentId, in.segmentUuid,
                             in.graphFilePath, in.graphFileSize,
                             in.mapFilePath, in.mapFileSize,
                             in.estimatedSizeBytes, /* vectorCount unknown for an existing input */ 0L,
-                            in.generation, LogSequenceNumber.START_OF_TIME));
+                            in.generation, LogSequenceNumber.START_OF_TIME,
+                            inFeatureIds));
                 }
             }
 
@@ -5448,7 +5468,8 @@ public class PersistentVectorStore extends AbstractVectorStore {
                     swr.graphFilePath, swr.graphFileSize,
                     swr.mapFilePath, swr.mapFileSize,
                     swr.estimatedSizeBytes, swr.vectorCount, generation,
-                    sequenceNumber));
+                    sequenceNumber,
+                    swr.jvectorFeatureIds));
         }
         return info;
     }
@@ -5524,13 +5545,21 @@ public class PersistentVectorStore extends AbstractVectorStore {
             // the segment); use START_OF_TIME as a sentinel — the registry never
             // overwrites baseLsn during reconcile so an existing znode keeps its
             // original value.
+            // Derive feature IDs from the loaded on-disk graph when available.
+            // onDiskGraph may be null for segments that have not yet been
+            // opened (e.g. lazy-loaded segments pre-start). In that case pass
+            // null and let the registry keep whatever the znode already has.
+            List<String> featureIds = (seg.onDiskGraph != null)
+                    ? RemoteSegmentGraphMerger.featureSetToStringList(seg.onDiskGraph.getFeatureSet())
+                    : null;
             info.add(new NewSegmentInfo(
                     seg.segmentId, seg.segmentUuid,
                     seg.graphFilePath, seg.graphFileSize,
                     seg.mapFilePath, seg.mapFileSize,
                     seg.estimatedSizeBytes, /* vectorCount unknown post-restart */ 0L,
                     Math.max(seg.generation, generation),
-                    LogSequenceNumber.START_OF_TIME));
+                    LogSequenceNumber.START_OF_TIME,
+                    featureIds));
         }
         return info;
     }
@@ -5891,11 +5920,17 @@ public class PersistentVectorStore extends AbstractVectorStore {
                     }
                     trackProvisionalMultipartFile(segUuid, "map");
                     compactionNodesDone.addAndGet(shardSize);
-                    return new SegmentWriteResult(segmentId,
+                    SegmentWriteResult swr = new SegmentWriteResult(segmentId,
                             graphFilePath, graphSize,
                             mapFilePath, mapSize,
                             graphSize + mapSize,
                             shardSize);
+                    // Record which jvector features were written so the optimizer
+                    // can group segments by feature set (issue #543).
+                    swr.jvectorFeatureIds = useFusedPQForShard
+                            ? java.util.Arrays.asList("FUSED_PQ", "INLINE_VECTORS")
+                            : java.util.Collections.singletonList("INLINE_VECTORS");
+                    return swr;
                 } finally {
                     Files.deleteIfExists(mapFile);
                 }

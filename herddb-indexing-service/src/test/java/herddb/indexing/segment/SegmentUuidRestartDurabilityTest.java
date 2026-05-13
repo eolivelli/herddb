@@ -221,7 +221,7 @@ public class SegmentUuidRestartDurabilityTest {
         herddb.index.vector.NewSegmentInfo invalid = new herddb.index.vector.NewSegmentInfo(
                 42, /* segmentUuid */ null,
                 "g/x", 100L, "m/x", 100L, 200L, 10L, 1L,
-                new herddb.log.LogSequenceNumber(1L, 100L));
+                new herddb.log.LogSequenceNumber(1L, 100L), /* jvectorFeatureIds */ null);
         try {
             // The two-phase entry points must reject a null UUID just as the
             // legacy single-phase one did. We test stage; commit goes through the
@@ -243,7 +243,7 @@ public class SegmentUuidRestartDurabilityTest {
         herddb.index.vector.NewSegmentInfo info = new herddb.index.vector.NewSegmentInfo(
                 7, stableUuid,
                 "g/x", 100L, "m/x", 100L, 200L, 10L, 1L,
-                new herddb.log.LogSequenceNumber(1L, 100L));
+                new herddb.log.LogSequenceNumber(1L, 100L), /* jvectorFeatureIds */ null);
         publisher.stageNewSegments(java.util.Collections.singletonList(info));
         publisher.commitStagedSegments(java.util.Collections.singletonList(info));
         // Second pair (retry) must not throw.

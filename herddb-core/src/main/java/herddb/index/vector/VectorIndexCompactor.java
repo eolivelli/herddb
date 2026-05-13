@@ -911,6 +911,15 @@ final class VectorIndexCompactor {
                                 + " streaming compaction shard (keptCount=" + keptCount + ")");
             }
 
+            // Stamp the feature set produced by the streaming compaction onto swr
+            // so it can be carried into NewSegmentInfo and eventually SegmentMetadata.
+            // Streaming compaction preserves the inputs' feature set (homogeneity is
+            // validated above); the first candidate is representative.
+            if (!candidates.isEmpty() && candidates.get(0).onDiskGraph != null) {
+                swr.jvectorFeatureIds = RemoteSegmentGraphMerger.featureSetToStringList(
+                        candidates.get(0).onDiskGraph.getFeatureSet());
+            }
+
             // Upload succeeded — both files exist remotely. Pre-populate orphans
             // so any subsequent failure (preloadCompactedSegment, etc.) routes
             // them through pendingDeletes for retention-aware cleanup.

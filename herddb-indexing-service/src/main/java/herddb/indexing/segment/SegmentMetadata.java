@@ -25,6 +25,7 @@ import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import herddb.log.LogSequenceNumber;
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
@@ -140,6 +141,19 @@ public final class SegmentMetadata {
     private final List<String> replacedBy;
     private final long retentionUntilEpochMillis;
     private final long createdAtEpochMillis;
+    /**
+     * Sorted list of jvector {@code FeatureId} names (e.g. {@code ["FUSED_PQ",
+     * "INLINE_VECTORS"]}) recorded at the time the segment's graph file was
+     * written. Used by the external optimizer's merge policy to group segments
+     * by feature set before scheduling a merge task — jvector's
+     * {@code OnDiskGraphIndexCompactor.validateFeatures} requires all inputs in
+     * a streaming merge to share an identical feature set (issue #543).
+     *
+     * <p>{@code null} when the field is absent from the znode payload (segments
+     * written by a pre-#543 IS or optimizer version that did not record this
+     * information).
+     */
+    private final List<String> jvectorFeatureIds;
 
     @JsonCreator
     public SegmentMetadata(
@@ -167,7 +181,8 @@ public final class SegmentMetadata {
             @JsonProperty("generation") long generation,
             @JsonProperty("replacedBy") List<String> replacedBy,
             @JsonProperty("retentionUntilEpochMillis") long retentionUntilEpochMillis,
-            @JsonProperty("createdAtEpochMillis") long createdAtEpochMillis) {
+            @JsonProperty("createdAtEpochMillis") long createdAtEpochMillis,
+            @JsonProperty("jvectorFeatureIds") List<String> jvectorFeatureIds) {
         // Treat absent or zero schemaVersion as v1 so payloads written before the
         // field existed deserialize cleanly (review item D5).
         this.schemaVersion = (schemaVersionOrNull == null || schemaVersionOrNull == 0)
@@ -195,9 +210,12 @@ public final class SegmentMetadata {
         this.generation = generation;
         this.replacedBy = replacedBy == null
                 ? Collections.emptyList()
-                : Collections.unmodifiableList(new java.util.ArrayList<>(replacedBy));
+                : Collections.unmodifiableList(new ArrayList<>(replacedBy));
         this.retentionUntilEpochMillis = retentionUntilEpochMillis;
         this.createdAtEpochMillis = createdAtEpochMillis;
+        this.jvectorFeatureIds = jvectorFeatureIds == null
+                ? null
+                : Collections.unmodifiableList(new ArrayList<>(jvectorFeatureIds));
     }
 
     public int getSchemaVersion() {
@@ -300,6 +318,16 @@ public final class SegmentMetadata {
         return createdAtEpochMillis;
     }
 
+    /**
+     * Returns the sorted list of jvector {@code FeatureId} names recorded when
+     * this segment's graph file was written (e.g. {@code ["FUSED_PQ",
+     * "INLINE_VECTORS"]}), or {@code null} if the field was absent from the
+     * znode payload (segments written before issue #543 was fixed).
+     */
+    public List<String> getJvectorFeatureIds() {
+        return jvectorFeatureIds;
+    }
+
     public LogSequenceNumber tombstoneLsn() {
         if (tombstoneLsnLedgerId == NO_LSN_LEDGER_ID) {
             return null;
@@ -357,7 +385,8 @@ public final class SegmentMetadata {
                 .generation(generation)
                 .replacedBy(replacedBy)
                 .retentionUntilEpochMillis(retentionUntilEpochMillis)
-                .createdAtEpochMillis(createdAtEpochMillis);
+                .createdAtEpochMillis(createdAtEpochMillis)
+                .jvectorFeatureIds(jvectorFeatureIds);
     }
 
     public static Builder builder() {
@@ -395,13 +424,15 @@ public final class SegmentMetadata {
                 && Objects.equals(graphPath, that.graphPath)
                 && Objects.equals(mapPath, that.mapPath)
                 && Objects.equals(tombstonePath, that.tombstonePath)
-                && Objects.equals(replacedBy, that.replacedBy);
+                && Objects.equals(replacedBy, that.replacedBy)
+                && Objects.equals(jvectorFeatureIds, that.jvectorFeatureIds);
     }
 
     @Override
     public int hashCode() {
         return Objects.hash(segmentUuid, tablespaceUuid, indexUuid, state,
-                ownerInstanceId, pendingOwnerInstanceId, generation, sizeBytes);
+                ownerInstanceId, pendingOwnerInstanceId, generation, sizeBytes,
+                jvectorFeatureIds);
     }
 
     @Override
@@ -418,6 +449,7 @@ public final class SegmentMetadata {
                 + ", vectorCount=" + vectorCount
                 + ", baseLsn=" + baseLsnLedgerId + ":" + baseLsnOffset
                 + ", tombstoneLsn=" + tombstoneLsnLedgerId + ":" + tombstoneLsnOffset
+                + ", jvectorFeatureIds=" + jvectorFeatureIds
                 + '}';
     }
 
@@ -450,6 +482,7 @@ public final class SegmentMetadata {
         private List<String> replacedBy = Collections.emptyList();
         private long retentionUntilEpochMillis = NO_RETENTION;
         private long createdAtEpochMillis;
+        private List<String> jvectorFeatureIds;
 
         public Builder segmentUuid(String value) {
             this.segmentUuid = value;
@@ -585,6 +618,11 @@ public final class SegmentMetadata {
             return this;
         }
 
+        public Builder jvectorFeatureIds(List<String> value) {
+            this.jvectorFeatureIds = value;
+            return this;
+        }
+
         public SegmentMetadata build() {
             // The builder always stamps the current code's SCHEMA_VERSION; callers
             // never manipulate it directly. Loading from an older payload that lacks
@@ -595,7 +633,8 @@ public final class SegmentMetadata {
                     state, ownerInstanceId, pendingOwnerInstanceId, segmentId, graphPath, mapPath,
                     tombstonePath, tombstoneLsnLedgerId, tombstoneLsnOffset, overlayGeneration,
                     baseLsnLedgerId, baseLsnOffset, sizeBytes, mapFileSize, vectorCount, generation,
-                    replacedBy, retentionUntilEpochMillis, createdAtEpochMillis);
+                    replacedBy, retentionUntilEpochMillis, createdAtEpochMillis,
+                    jvectorFeatureIds);
         }
     }
 }

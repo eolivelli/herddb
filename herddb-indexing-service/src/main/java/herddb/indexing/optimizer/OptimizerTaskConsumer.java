@@ -213,6 +213,16 @@ public final class OptimizerTaskConsumer {
             LOGGER.log(Level.WARNING,
                     "merger threw while processing task {0}: {1}",
                     new Object[]{task.getTaskId(), mergerThrew.getMessage()});
+            if (LOGGER.isLoggable(Level.FINE)) {
+                // Log each input's feature set to help diagnose heterogeneous-feature
+                // failures (issue #543: "Each source must have the same features").
+                StringBuilder sb = new StringBuilder("  Input segment feature sets:");
+                for (VersionedSegmentMetadata v : inputs) {
+                    sb.append("\n    ").append(v.metadata().getSegmentUuid())
+                            .append(" -> ").append(v.metadata().getJvectorFeatureIds());
+                }
+                LOGGER.log(Level.FINE, sb.toString());
+            }
             return finishWithFailureOrPoison(claimed,
                     "merger threw: " + mergerThrew.getMessage());
         }

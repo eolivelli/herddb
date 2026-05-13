@@ -105,7 +105,7 @@ public class LocalCompactionRegistryRaceTest {
         return new NewSegmentInfo(segmentId, segmentUuid,
                 "graph-" + segmentId, 1024L,
                 "map-" + segmentId, 256L,
-                4096L, 100L, generation, LogSequenceNumber.START_OF_TIME);
+                4096L, 100L, generation, LogSequenceNumber.START_OF_TIME, null);
     }
 
     private SegmentMetadata buildActive(NewSegmentInfo i, long now) {
