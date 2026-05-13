@@ -179,7 +179,11 @@ public final class OptimizerTaskConsumer {
      *
      * @param newMerger the new merger — must not be {@code null}
      */
-    public void setMerger(SegmentMerger newMerger) {
+    /**
+     * Package-private: only {@link IndexOptimizerMain#maybeUpgradeMerger()} is
+     * expected to call this from production code.
+     */
+    void setMerger(SegmentMerger newMerger) {
         this.merger = Objects.requireNonNull(newMerger, "newMerger");
     }
 
