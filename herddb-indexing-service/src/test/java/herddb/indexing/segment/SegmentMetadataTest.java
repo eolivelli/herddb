@@ -146,6 +146,56 @@ public class SegmentMetadataTest {
         assertEquals(SegmentState.ACTIVE, m.getState());
     }
 
+    /**
+     * {@code jvectorFeatureIds} must round-trip through JSON serialization (issue #543).
+     */
+    @Test
+    public void roundTripWithJvectorFeatureIds() throws Exception {
+        SegmentMetadata original = SegmentMetadata.builder()
+                .segmentUuid("seg-fid").tablespaceUuid("ts-1").tableName("docs")
+                .indexUuid("idx-1").indexName("docs_v1").state(SegmentState.ACTIVE)
+                .jvectorFeatureIds(Arrays.asList("FUSED_PQ", "INLINE_VECTORS"))
+                .build();
+        byte[] data = original.serialize();
+        SegmentMetadata roundtripped = SegmentMetadata.deserialize(data);
+        assertEquals(original, roundtripped);
+        assertEquals(Arrays.asList("FUSED_PQ", "INLINE_VECTORS"),
+                roundtripped.getJvectorFeatureIds());
+    }
+
+    /**
+     * A {@code null} {@code jvectorFeatureIds} must round-trip as {@code null}.
+     */
+    @Test
+    public void roundTripWithNullJvectorFeatureIds() throws Exception {
+        SegmentMetadata original = SegmentMetadata.builder()
+                .segmentUuid("seg-nfid").tablespaceUuid("ts-1").tableName("docs")
+                .indexUuid("idx-1").indexName("docs_v1").state(SegmentState.ACTIVE)
+                .jvectorFeatureIds(null)
+                .build();
+        byte[] data = original.serialize();
+        SegmentMetadata roundtripped = SegmentMetadata.deserialize(data);
+        assertEquals(original, roundtripped);
+        assertNull(roundtripped.getJvectorFeatureIds());
+    }
+
+    /**
+     * A pre-#543 JSON payload without the {@code jvectorFeatureIds} key must
+     * deserialize with {@code getJvectorFeatureIds() == null} (no regression
+     * on old znode payloads still in ZooKeeper).
+     */
+    @Test
+    public void oldPayloadWithoutJvectorFeatureIdsDeserializesAsNull() throws Exception {
+        String oldJson = "{\"segmentUuid\":\"seg-old\",\"tablespaceUuid\":\"ts-1\","
+                + "\"tableName\":\"docs\",\"indexUuid\":\"idx-1\",\"indexName\":\"docs_v1\","
+                + "\"state\":\"ACTIVE\",\"ownerInstanceId\":0,\"pendingOwnerInstanceId\":-1}";
+        SegmentMetadata m = SegmentMetadata.deserialize(
+                oldJson.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        assertNotNull(m);
+        assertNull("pre-#543 payload must deserialize jvectorFeatureIds as null",
+                m.getJvectorFeatureIds());
+    }
+
     @Test
     public void equalityIsValueBased() {
         SegmentMetadata a = SegmentMetadata.builder()

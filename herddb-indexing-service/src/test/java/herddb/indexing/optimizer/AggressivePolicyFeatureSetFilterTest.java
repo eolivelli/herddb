@@ -173,6 +173,30 @@ public class AggressivePolicyFeatureSetFilterTest {
     }
 
     /**
+     * When two homogeneous groups have exactly the same size, the policy must
+     * pick one deterministically (not crash, not return empty). The chosen group
+     * is the first one encountered in {@link java.util.LinkedHashMap} iteration
+     * order, which mirrors insertion order — i.e. the first feature-set seen
+     * while iterating the sub-target candidate list.
+     */
+    @Test
+    public void equalSizedGroupsPicksDeterministicFirstSeen() {
+        MergePolicy policy = new MergePolicy.AggressivePolicy(TARGET, Long.MAX_VALUE, 100);
+        // 2 FUSED_PQ segments appear first in the list → first feature-set seen
+        List<VersionedSegmentMetadata> active = List.of(
+                seg("f1", 1_000L, FUSED_PQ),
+                seg("f2", 2_000L, FUSED_PQ),
+                seg("i1", 3_000L, INLINE_ONLY),
+                seg("i2", 4_000L, INLINE_ONLY));
+        List<VersionedSegmentMetadata> picked = policy.pickMergeCandidates(active);
+        assertEquals("tie — 2 segments from the first-encountered group", 2, picked.size());
+        assertEquals("first-seen group (FUSED_PQ) wins the tie",
+                FUSED_PQ, picked.get(0).metadata().getJvectorFeatureIds());
+        assertEquals("both picks from the same group",
+                FUSED_PQ, picked.get(1).metadata().getJvectorFeatureIds());
+    }
+
+    /**
      * A graduated segment (at or above {@code targetMaxBytes}) must never be
      * included even if it happens to belong to the largest group by feature set.
      */

@@ -241,4 +241,86 @@ public class RemoteSegmentGraphMergerHeterogeneousInputTest {
         // Cleanup: delete the output so the temporary directory can be removed.
         merger.deleteOutput(output);
     }
+
+    /**
+     * Variant of the end-to-end fallback test where both input segments share
+     * the same tablespace + index UUID — the production naming pattern. Uses a
+     * single {@link PersistentVectorStore} that emits two checkpoints with
+     * different vector counts so the segments land in the same DSM namespace
+     * but carry different feature sets (below/above the FusedPQ threshold).
+     */
+    @Test
+    public void heterogeneousInputsSameNamespaceFallBackToLegacy() throws Exception {
+        final int dim = 8;
+        final int smallCount = 30;  // below MIN_VECTORS_FOR_FUSED_PQ → InlineVectors only
+        final int largeCount = PersistentVectorStore.MIN_VECTORS_FOR_FUSED_PQ; // → FusedPQ+InlineVectors
+
+        MemoryDataStorageManager dsm = new MemoryDataStorageManager();
+        Path tmpDir = tmpFolder.newFolder().toPath();
+
+        // Single store → both segments share tablespaceUuid + indexUuid.
+        List<RemoteSegmentGraphMerger.RemoteSegmentInput> inputs;
+        String sharedTs;
+        String sharedIdx;
+
+        MemoryManager mm = new MemoryManager(64 * 1024 * 1024, 0, 1024 * 1024, 1024 * 1024);
+        try (PersistentVectorStore store = new PersistentVectorStore(
+                "ts-shared", "tbl", "ts-shared", "vec_col",
+                tmpDir, dsm, mm,
+                16, 100, 1.2f, 1.4f, true, 2_000_000_000L, 0,
+                /*compactionIntervalMs*/ Long.MAX_VALUE)) {
+            store.start();
+            sharedTs = "ts-shared";
+            sharedIdx = store.indexUUID();
+
+            Random rng = new Random(42L);
+            // First checkpoint: smallCount vectors → InlineVectors only
+            for (int i = 0; i < smallCount; i++) {
+                store.addVector(Bytes.from_long(i), vec(rng, dim));
+            }
+            store.checkpoint();
+
+            // Second checkpoint: largeCount vectors → FusedPQ + InlineVectors
+            for (int i = 0; i < largeCount; i++) {
+                store.addVector(Bytes.from_long(1_000_000L + i), vec(rng, dim));
+            }
+            store.checkpoint();
+
+            assertEquals("expected exactly two segments", 2, store.getSegmentCount());
+
+            List<VectorSegment> segs = store.getOnDiskSegmentsSnapshotForTest();
+            inputs = new ArrayList<>(segs.size());
+            for (VectorSegment seg : segs) {
+                String segUuid = seg.segmentUuid != null ? seg.segmentUuid
+                        : sharedIdx + "_seg" + seg.segmentId;
+                inputs.add(new RemoteSegmentGraphMerger.RemoteSegmentInput(
+                        sharedTs, sharedIdx, segUuid,
+                        seg.segmentId,
+                        /* mapFileSize  */ seg.mapFileSize,
+                        /* graphFileSize */ seg.graphFileSize,
+                        /* generation  */ seg.generation,
+                        /* tombstones  */ new int[0]));
+            }
+        }
+
+        VectorIndexCompactor.streamingCompactionEnabled = true;
+
+        RemoteSegmentGraphMerger merger = new RemoteSegmentGraphMerger(
+                dsm, tmpFolder.newFolder().toPath(),
+                /* graphM */ 16, /* beamWidth */ 100,
+                /* neighborOverflow */ 1.2f, /* alpha */ 1.4f,
+                VectorSimilarityFunction.COSINE);
+
+        RemoteSegmentGraphMerger.MergeOutput output =
+                merger.merge(inputs, sharedTs, sharedIdx, 999L, dim);
+
+        assertNotNull("merge must produce a non-null output", output);
+        assertEquals("output must cover all input PKs",
+                smallCount + largeCount, output.vectorCount);
+        assertNotNull("output.featureIds must be set", output.featureIds);
+        assertTrue("combined count >= threshold → output includes FUSED_PQ",
+                output.featureIds.contains("FUSED_PQ"));
+
+        merger.deleteOutput(output);
+    }
 }

@@ -5545,10 +5545,20 @@ public class PersistentVectorStore extends AbstractVectorStore {
             // the segment); use START_OF_TIME as a sentinel — the registry never
             // overwrites baseLsn during reconcile so an existing znode keeps its
             // original value.
+            //
             // Derive feature IDs from the loaded on-disk graph when available.
-            // onDiskGraph may be null for segments that have not yet been
-            // opened (e.g. lazy-loaded segments pre-start). In that case pass
-            // null and let the registry keep whatever the znode already has.
+            // onDiskGraph may be null for segments that have not yet been opened
+            // (e.g. lazy-loaded segments pre-start). In that case pass null:
+            //   * If the znode already exists, reconcileWithIndexStatus does NOT
+            //     call buildMetadata on it (it only re-registers MISSING znodes),
+            //     so the existing znode's jvectorFeatureIds value is preserved.
+            //   * If the znode is genuinely missing and the graph has not been
+            //     opened, the re-registered znode will carry null featureIds.
+            //     AggressivePolicy places that segment in the "null" group; it will
+            //     still be merged (via the legacy rebuild fallback), and the next
+            //     checkpoint that opens the graph will stamp a real value.
+            //     Pre-opening every lazy segment here would require a remote download
+            //     just to read a FeatureId set, which is too expensive for reconcile.
             List<String> featureIds = (seg.onDiskGraph != null)
                     ? RemoteSegmentGraphMerger.featureSetToStringList(seg.onDiskGraph.getFeatureSet())
                     : null;
@@ -5864,6 +5874,11 @@ public class PersistentVectorStore extends AbstractVectorStore {
             // Write graph + features to temp file, streaming via suppliers
             Path tempFile = Files.createTempFile(
                     tmpDirectory, "herddb-vector-shard-", ".idx");
+            // Capture the written feature set outside the writer try-with-resources
+            // so it can be stamped onto SegmentWriteResult after the writer closes.
+            // Derived from suppliers.keySet() so this list cannot drift if a future
+            // change adds or removes a feature from the writer (issue #543).
+            List<String> writtenFeatureIds;
             boolean success = false;
             try {
                 OnDiskGraphIndexWriter.Builder builder = new OnDiskGraphIndexWriter.Builder(
@@ -5884,6 +5899,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
                     suppliers.put(FeatureId.INLINE_VECTORS,
                             ordinal -> new InlineVectors.State(shardView.getVector(ordinal)));
                     writer.write(suppliers);
+                    writtenFeatureIds = RemoteSegmentGraphMerger.featureSetToStringList(suppliers.keySet());
                 }
                 success = true;
 
@@ -5927,9 +5943,9 @@ public class PersistentVectorStore extends AbstractVectorStore {
                             shardSize);
                     // Record which jvector features were written so the optimizer
                     // can group segments by feature set (issue #543).
-                    swr.jvectorFeatureIds = useFusedPQForShard
-                            ? java.util.Arrays.asList("FUSED_PQ", "INLINE_VECTORS")
-                            : java.util.Collections.singletonList("INLINE_VECTORS");
+                    // writtenFeatureIds was derived from suppliers.keySet() inside the
+                    // writer block so it cannot drift if future code adds/removes features.
+                    swr.jvectorFeatureIds = writtenFeatureIds;
                     return swr;
                 } finally {
                     Files.deleteIfExists(mapFile);

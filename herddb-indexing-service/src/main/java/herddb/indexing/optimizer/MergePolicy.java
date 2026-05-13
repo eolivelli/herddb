@@ -21,6 +21,7 @@ package herddb.indexing.optimizer;
 
 import herddb.indexing.segment.VersionedSegmentMetadata;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -237,14 +238,19 @@ public interface MergePolicy {
             // Segments with heterogeneous feature sets cannot be merged by the streaming
             // path (OnDiskGraphIndexCompactor.validateFeatures rejects them), so we pick
             // candidates only from the largest homogeneous group. Segments whose feature
-            // set is unknown (null — pre-#543 metadata) are placed in their own "null"
-            // group and never mixed with segments that carry a known feature list.
-            Map<String, List<VersionedSegmentMetadata>> groups = new LinkedHashMap<>();
+            // set is unknown (null — pre-#543 metadata) are placed in their own group
+            // (keyed by an empty list sentinel) and never mixed with segments that carry
+            // a known feature list.
+            //
+            // Using List<String> as the map key is correct and idiomatic: the feature
+            // lists are sorted+unmodifiable (written by featureSetToStringList), so
+            // AbstractList.equals/hashCode give value-based keying with no toString
+            // format dependency.
+            final List<String> nullFeatureKey = Collections.emptyList();
+            Map<List<String>, List<VersionedSegmentMetadata>> groups = new LinkedHashMap<>();
             for (VersionedSegmentMetadata v : subTarget) {
                 List<String> featureIds = v.metadata().getJvectorFeatureIds();
-                // Use the feature-list's toString() as a stable map key;
-                // null → literal "null" so null-feature groups don't collide.
-                String key = featureIds == null ? "null" : featureIds.toString();
+                List<String> key = featureIds != null ? featureIds : nullFeatureKey;
                 groups.computeIfAbsent(key, k -> new ArrayList<>()).add(v);
             }
 
