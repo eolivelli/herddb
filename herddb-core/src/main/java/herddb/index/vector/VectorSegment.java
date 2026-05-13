@@ -219,6 +219,10 @@ class VectorSegment implements Closeable {
                 searcher = new GraphSearcher(odg);
                 searcherCache.set(searcher);
             }
+            // Apply the current async-pipeline setting on every search so that
+            // a runtime toggle (issue #547) takes effect without discarding
+            // cached searchers. setAsyncPipelineEnabled is a cheap field write.
+            searcher.setAsyncPipelineEnabled(PersistentVectorStore.searchAsyncPipelineEnabled);
             OnDiskGraphIndex.View view = (OnDiskGraphIndex.View) searcher.getView();
             io.github.jbellis.jvector.graph.similarity.ScoreFunction.ExactScoreFunction reranker =
                     view.rerankerFor(qv, similarityFunction);

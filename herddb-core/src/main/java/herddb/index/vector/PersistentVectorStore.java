@@ -3280,6 +3280,33 @@ public class PersistentVectorStore extends AbstractVectorStore {
     }
 
     /**
+     * Process-wide switch for the jvector async IO pipeline introduced in
+     * issue #547. When {@code true}, {@link VectorSegment#search} calls
+     * {@link io.github.jbellis.jvector.graph.GraphSearcher#setAsyncPipelineEnabled(boolean)
+     * setAsyncPipelineEnabled(true)} on every {@code GraphSearcher} before each
+     * search, activating the 2-slot speculative read pipeline on the FusedPQ
+     * layer-0 path. Disabled by default until a production profile confirms a
+     * net win (see issue #547 acceptance criteria).
+     *
+     * <p>Called by {@code IndexingServiceEngine.start()} when the
+     * {@code indexing.vector.search.asyncPipelineEnabled} config key is resolved
+     * at IS startup. Operators may also set the flag via the
+     * {@code herddb.vectorindex.searchAsyncPipelineEnabled} system property —
+     * the config key wins.
+     */
+    static volatile boolean searchAsyncPipelineEnabled = false;
+
+    /** Enables or disables the jvector async IO pipeline (issue #547). */
+    public static void setSearchAsyncPipelineEnabled(boolean enabled) {
+        searchAsyncPipelineEnabled = enabled;
+    }
+
+    /** Returns the current value of {@link #setSearchAsyncPipelineEnabled(boolean)}. */
+    public static boolean isSearchAsyncPipelineEnabled() {
+        return searchAsyncPipelineEnabled;
+    }
+
+    /**
      * Test-only accessor: returns a defensive snapshot of the on-disk
      * segment list. Used by streaming-compaction tests (issue #485) to walk
      * the merged segment's {@code pkOffsets / pkLengths / pkData} and assert
