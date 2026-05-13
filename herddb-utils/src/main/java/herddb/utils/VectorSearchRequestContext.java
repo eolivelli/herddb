@@ -78,6 +78,7 @@ public final class VectorSearchRequestContext {
     private final LongAdder readFileRangeWaitNanos = new LongAdder();
     private final LongAdder cacheHits = new LongAdder();
     private final LongAdder cacheMisses = new LongAdder();
+    private final LongAdder segmentsQueried = new LongAdder();
 
     private VectorSearchRequestContext() {
         // created via begin()
@@ -145,6 +146,19 @@ public final class VectorSearchRequestContext {
         cacheMisses.increment();
     }
 
+    /**
+     * Records one segment or in-memory shard as having been queried during
+     * this search request. Called once per Phase-1 on-disk segment and once
+     * per Phase-2/3 in-memory shard task that is actually scheduled in
+     * {@code PersistentVectorStore.searchInternal}. Concurrent worker threads
+     * accumulate into the same context via {@link LongAdder}, so this is
+     * safe to call from any thread that has bound this context via
+     * {@link #bind(VectorSearchRequestContext)}.
+     */
+    public void recordSegmentQueried() {
+        segmentsQueried.increment();
+    }
+
     public long getReadFileRangeCalls() {
         return readFileRangeCalls.sum();
     }
@@ -163,5 +177,9 @@ public final class VectorSearchRequestContext {
 
     public long getCacheMisses() {
         return cacheMisses.sum();
+    }
+
+    public long getSegmentsQueried() {
+        return segmentsQueried.sum();
     }
 }

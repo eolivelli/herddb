@@ -20,12 +20,15 @@
 
 package herddb.indexing;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import herddb.auth.oidc.OidcBootstrap;
 import herddb.auth.oidc.OidcTokenValidator;
 import herddb.auth.oidc.grpc.JwtAuthServerInterceptor;
 import herddb.core.MemoryManager;
 import herddb.core.stats.NettyMemoryMetrics;
 import herddb.file.FileDataStorageManager;
+import herddb.log.LogSequenceNumber;
 import herddb.mem.MemoryDataStorageManager;
 import herddb.metadata.IndexingServiceInstanceDescriptor;
 import herddb.metadata.MetadataStorageManager;
@@ -51,6 +54,9 @@ import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import javax.servlet.http.HttpServlet;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
 import org.apache.bookkeeper.stats.StatsLogger;
 import org.apache.bookkeeper.stats.prometheus.PrometheusMetricsProvider;
 import org.apache.bookkeeper.stats.prometheus.PrometheusServlet;
@@ -88,6 +94,9 @@ public class IndexingServer implements AutoCloseable {
     private org.eclipse.jetty.server.Server httpServer;
     private MetadataStorageManager metadataStorageManager;
     private String registeredServiceId;
+    // Stored so the /status HTTP servlet can read aggregate search counters
+    // (issue #541). Set in start() before the HTTP server is mounted.
+    private IndexingServiceImpl serviceImpl;
 
     // When storage.type=remote, these are set by buildDataStorageManager
     // and consumed by the tablespace-resolved hook.
@@ -345,7 +354,7 @@ public class IndexingServer implements AutoCloseable {
         NettyMemoryMetrics.register(statsLogger);
 
         engine.setStatsLogger(statsLogger);
-        IndexingServiceImpl serviceImpl = new IndexingServiceImpl(engine, statsLogger);
+        this.serviceImpl = new IndexingServiceImpl(engine, statsLogger);
         ServerBuilder<?> grpcBuilder = ServerBuilder.forPort(port).addService(serviceImpl);
         java.util.Properties oidcProps = config.asProperties();
         if (OidcBootstrap.isEnabled(oidcProps)) {
@@ -377,6 +386,7 @@ public class IndexingServer implements AutoCloseable {
                 ServletContextHandler context = new ServletContextHandler(ServletContextHandler.GZIP);
                 context.setContextPath("/");
                 context.addServlet(new ServletHolder(new PrometheusServlet(statsProvider)), "/metrics");
+                context.addServlet(new ServletHolder(new StatusServlet()), "/status");
                 httpServer.setHandler(context);
                 httpServer.start();
                 LOGGER.log(Level.INFO, "Metrics HTTP server started on {0}:{1}",
@@ -637,5 +647,171 @@ public class IndexingServer implements AutoCloseable {
     @Override
     public void close() throws Exception {
         stop();
+    }
+
+    // -------------------------------------------------------------------------
+    // /status — JSON snapshot of instance info, engine stats, shadow status,
+    // and per-search metric totals (issue #541).
+    // Mirrors the union of GetInstanceInfo + GetEngineStats + GetShadowStatus
+    // gRPC RPCs so operators can curl a single pod without gRPC tooling.
+    // -------------------------------------------------------------------------
+
+    /**
+     * Shared {@link ObjectMapper} instance — Jackson's ObjectMapper is
+     * thread-safe after construction and expensive to create; a single
+     * instance shared across all /status requests is correct.
+     */
+    private static final ObjectMapper STATUS_MAPPER = new ObjectMapper();
+
+    /**
+     * Jetty servlet that serves a JSON status snapshot on {@code GET /status}.
+     * Reads from the outer {@link IndexingServer}'s {@code engine},
+     * {@code config}, and {@code serviceImpl} fields — no synchronization
+     * needed beyond what each engine accessor already guarantees.
+     */
+    private final class StatusServlet extends HttpServlet {
+
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        protected void doGet(HttpServletRequest req, HttpServletResponse resp)
+                throws IOException {
+            ObjectNode node = buildStatusNode();
+            byte[] body = STATUS_MAPPER.writeValueAsBytes(node);
+            resp.setContentType("application/json; charset=utf-8");
+            resp.setContentLength(body.length);
+            resp.setStatus(HttpServletResponse.SC_OK);
+            resp.getOutputStream().write(body);
+        }
+
+        private ObjectNode buildStatusNode() {
+            ObjectNode node = STATUS_MAPPER.createObjectNode();
+
+            // --- GetInstanceInfo ---
+            IndexingServerConfiguration cfg = engine.getConfig();
+            String storageType = cfg != null
+                    ? cfg.getString(IndexingServerConfiguration.PROPERTY_STORAGE_TYPE,
+                            IndexingServerConfiguration.PROPERTY_STORAGE_TYPE_DEFAULT)
+                    : "";
+            String dataDir = engine.getDataDirectory() != null
+                    ? engine.getDataDirectory().toAbsolutePath().toString()
+                    : "";
+            String tablespaceName = cfg != null
+                    ? cfg.getString(IndexingServerConfiguration.PROPERTY_TABLESPACE_NAME,
+                            IndexingServerConfiguration.PROPERTY_TABLESPACE_NAME_DEFAULT)
+                    : "";
+            int grpcPort = cfg != null
+                    ? cfg.getInt(IndexingServerConfiguration.PROPERTY_GRPC_PORT,
+                            IndexingServerConfiguration.PROPERTY_GRPC_PORT_DEFAULT)
+                    : 0;
+            String grpcHost = cfg != null
+                    ? cfg.getString(IndexingServerConfiguration.PROPERTY_GRPC_HOST,
+                            IndexingServerConfiguration.PROPERTY_GRPC_HOST_DEFAULT)
+                    : "";
+            int instanceOrdinal = cfg != null
+                    ? cfg.getInt(IndexingServerConfiguration.PROPERTY_INSTANCE_ID,
+                            IndexingServerConfiguration.PROPERTY_INSTANCE_ID_DEFAULT)
+                    : 0;
+            int numInstances = cfg != null
+                    ? cfg.getInt(IndexingServerConfiguration.PROPERTY_NUM_INSTANCES,
+                            IndexingServerConfiguration.PROPERTY_NUM_INSTANCES_DEFAULT)
+                    : 1;
+            String role = cfg != null
+                    ? cfg.getString(IndexingServerConfiguration.PROPERTY_ROLE,
+                            IndexingServerConfiguration.PROPERTY_ROLE_DEFAULT)
+                    : IndexingServerConfiguration.ROLE_PRIMARY;
+            node.put("instance_id", emptyToNull(engine.getInstanceIdLabel()));
+            node.put("grpc_host", emptyToNull(grpcHost));
+            node.put("grpc_port", grpcPort);
+            node.put("storage_type", emptyToNull(storageType));
+            node.put("data_dir", emptyToNull(dataDir));
+            node.put("tablespace_name", emptyToNull(tablespaceName));
+            node.put("tablespace_uuid", emptyToNull(engine.getTableSpaceUUID()));
+            node.put("instance_ordinal", instanceOrdinal);
+            node.put("num_instances", numInstances);
+            node.put("role", emptyToNull(role));
+            node.put("shadow_of",
+                    engine.isConfiguredAsShadow() ? engine.getShadowOfOrMinusOne() : -1);
+            node.put("jvm_max_heap_bytes", Runtime.getRuntime().maxMemory());
+
+            // --- GetEngineStats ---
+            long startMs = engine.getStartTimeMillis();
+            long uptime = startMs > 0 ? System.currentTimeMillis() - startMs : 0L;
+            LogSequenceNumber lsn = engine.getLastProcessedLsn();
+            java.lang.management.MemoryUsage heap =
+                    java.lang.management.ManagementFactory.getMemoryMXBean().getHeapMemoryUsage();
+            long heapUsed = heap.getUsed();
+            long heapMax = heap.getMax();
+            long heapPct = heapMax > 0 ? Math.min(100L, (100L * heapUsed) / heapMax) : -1L;
+            node.put("uptime_millis", uptime);
+            node.put("tailer_running", engine.isTailerRunning());
+            node.put("tailer_watermark_ledger", lsn != null ? lsn.ledgerId : -1L);
+            node.put("tailer_watermark_offset", lsn != null ? lsn.offset : -1L);
+            node.put("tailer_entries_processed", engine.getTailerEntriesProcessed());
+            node.put("tailer_entries_accepted", engine.getTailerEntriesAccepted());
+            node.put("tailer_entries_skipped", engine.getTailerEntriesSkipped());
+            node.put("tailer_entries_shard_filtered", engine.getTailerEntriesShardFiltered());
+            node.put("tailer_inserts", engine.getTailerInserts());
+            node.put("tailer_updates", engine.getTailerUpdates());
+            node.put("tailer_deletes", engine.getTailerDeletes());
+            node.put("tailer_ddl", engine.getTailerDdl());
+            node.put("tailer_batches", engine.getTailerBatchesProcessed());
+            node.put("apply_queue_size", engine.getApplyQueueSize());
+            node.put("apply_queue_capacity", engine.getApplyQueueCapacity());
+            node.put("apply_parallelism", engine.getApplyParallelism());
+            node.put("loaded_index_count", engine.getLoadedIndexCount());
+            node.put("total_estimated_memory_bytes", engine.getTotalEstimatedMemoryBytes());
+            node.put("jvm_heap_used_bytes", heapUsed);
+            node.put("jvm_heap_max_bytes", heapMax);
+            node.put("jvm_heap_used_pct", heapPct);
+
+            // --- GetShadowStatus ---
+            LogSequenceNumber shadowLoaded = engine.getShadowLoadedLsn();
+            LogSequenceNumber primaryAdvertised = engine.getPrimaryAdvertisedLsn();
+            node.put("is_shadow", engine.isConfiguredAsShadow());
+            node.put("shadow_ready",
+                    engine.isConfiguredAsShadow() ? engine.isShadowReady() : true);
+            node.put("shadow_loaded_ledger_id",
+                    shadowLoaded != null ? shadowLoaded.ledgerId : -1L);
+            node.put("shadow_loaded_offset",
+                    shadowLoaded != null ? shadowLoaded.offset : -1L);
+            node.put("primary_advertised_ledger_id",
+                    primaryAdvertised != null ? primaryAdvertised.ledgerId : -1L);
+            node.put("primary_advertised_offset",
+                    primaryAdvertised != null ? primaryAdvertised.offset : -1L);
+            node.put("shadow_last_reload_timestamp_ms", engine.getShadowLastReloadTimestampMs());
+            node.put("shadow_reload_count", engine.getShadowReloadCount());
+            node.put("applied_index_status_generation",
+                    engine.getMinAppliedIndexStatusGeneration());
+            node.put("shadow_loaded_entry_timestamp_ms", engine.getShadowLoadedEntryTimestamp());
+
+            // --- Search metrics (issue #541) ---
+            // serviceImpl is set in start() before the HTTP server is mounted;
+            // guard against null defensively in case this is ever called early.
+            IndexingServiceImpl si = serviceImpl;
+            node.put("search_requests_total",
+                    si != null ? si.getSearchRequestsTotal() : 0L);
+            node.put("search_errors_total",
+                    si != null ? si.getSearchErrorsTotal() : 0L);
+            node.put("search_readfilerange_calls_total",
+                    si != null ? si.getSearchReadFileRangeCallsTotal() : 0L);
+            node.put("search_readfilerange_bytes_total",
+                    si != null ? si.getSearchReadFileRangeBytesTotal() : 0L);
+            node.put("search_readfilerange_wait_nanos_total",
+                    si != null ? si.getSearchReadFileRangeWaitNanosTotal() : 0L);
+            node.put("search_segments_queried_total",
+                    si != null ? si.getSearchSegmentsQueriedTotal() : 0L);
+            node.put("search_cache_hits_total",
+                    si != null ? si.getSearchCacheHitsTotal() : 0L);
+            node.put("search_cache_misses_total",
+                    si != null ? si.getSearchCacheMissesTotal() : 0L);
+
+            return node;
+        }
+
+        /** Returns {@code null} when the string is null or empty, else the string itself. */
+        private String emptyToNull(String s) {
+            return (s == null || s.isEmpty()) ? null : s;
+        }
     }
 }

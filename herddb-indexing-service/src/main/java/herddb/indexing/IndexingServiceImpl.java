@@ -92,8 +92,16 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
     private final OpStatsLogger searchReadFileRangeCallsPerRequest;
     private final OpStatsLogger searchReadFileRangeBytesPerRequest;
     private final OpStatsLogger searchReadFileRangeWaitPerRequest;
+    // Aggregate cache-hit/miss counters (issue #541). Per-request histograms
+    // existed before; the aggregate Counter totals are new so /status can
+    // expose running totals without scraping Prometheus.
+    private final Counter searchCacheHits;
+    private final Counter searchCacheMisses;
     private final OpStatsLogger searchCacheHitsPerRequest;
     private final OpStatsLogger searchCacheMissesPerRequest;
+    // Per-search segments-queried metric (issue #541).
+    private final Counter searchSegmentsQueried;
+    private final OpStatsLogger searchSegmentsQueriedPerRequest;
 
     public IndexingServiceImpl(IndexingServiceEngine engine, StatsLogger statsLogger) {
         this.engine = engine;
@@ -114,8 +122,13 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
                 scope.getOpStatsLogger("search_readfilerange_bytes_per_request");
         this.searchReadFileRangeWaitPerRequest =
                 scope.getOpStatsLogger("search_readfilerange_wait_per_request");
+        this.searchCacheHits = scope.getCounter("search_cache_hits");
+        this.searchCacheMisses = scope.getCounter("search_cache_misses");
         this.searchCacheHitsPerRequest = scope.getOpStatsLogger("search_cache_hits_per_request");
         this.searchCacheMissesPerRequest = scope.getOpStatsLogger("search_cache_misses_per_request");
+        this.searchSegmentsQueried = scope.getCounter("search_segments_queried");
+        this.searchSegmentsQueriedPerRequest =
+                scope.getOpStatsLogger("search_segments_queried_per_request");
     }
 
     /**
@@ -208,21 +221,27 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
         long waitNanos = ctx.getReadFileRangeWaitNanos();
         long hits = ctx.getCacheHits();
         long misses = ctx.getCacheMisses();
+        long segments = ctx.getSegmentsQueried();
         searchReadFileRangeCalls.addCount(calls);
         searchReadFileRangeBytes.addCount(bytes);
         searchReadFileRangeWaitNanos.addCount(waitNanos);
+        searchCacheHits.addCount(hits);
+        searchCacheMisses.addCount(misses);
+        searchSegmentsQueried.addCount(segments);
         if (success) {
             searchReadFileRangeCallsPerRequest.registerSuccessfulEvent(calls, TimeUnit.NANOSECONDS);
             searchReadFileRangeBytesPerRequest.registerSuccessfulEvent(bytes, TimeUnit.NANOSECONDS);
             searchReadFileRangeWaitPerRequest.registerSuccessfulEvent(waitNanos, TimeUnit.NANOSECONDS);
             searchCacheHitsPerRequest.registerSuccessfulEvent(hits, TimeUnit.NANOSECONDS);
             searchCacheMissesPerRequest.registerSuccessfulEvent(misses, TimeUnit.NANOSECONDS);
+            searchSegmentsQueriedPerRequest.registerSuccessfulEvent(segments, TimeUnit.NANOSECONDS);
         } else {
             searchReadFileRangeCallsPerRequest.registerFailedEvent(calls, TimeUnit.NANOSECONDS);
             searchReadFileRangeBytesPerRequest.registerFailedEvent(bytes, TimeUnit.NANOSECONDS);
             searchReadFileRangeWaitPerRequest.registerFailedEvent(waitNanos, TimeUnit.NANOSECONDS);
             searchCacheHitsPerRequest.registerFailedEvent(hits, TimeUnit.NANOSECONDS);
             searchCacheMissesPerRequest.registerFailedEvent(misses, TimeUnit.NANOSECONDS);
+            searchSegmentsQueriedPerRequest.registerFailedEvent(segments, TimeUnit.NANOSECONDS);
         }
     }
 
@@ -672,5 +691,51 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
                 .setCurrentOffset(cur.offset)
                 .setReached(reached)
                 .build();
+    }
+
+    // -------------------------------------------------------------------------
+    // Package-visible getters for the /status HTTP endpoint (issue #541).
+    // BookKeeper Counter.get() may return null before the first increment;
+    // all getters coerce null to 0L.
+    // -------------------------------------------------------------------------
+
+    long getSearchRequestsTotal() {
+        Long v = searchRequests.get();
+        return v != null ? v : 0L;
+    }
+
+    long getSearchErrorsTotal() {
+        Long v = searchErrors.get();
+        return v != null ? v : 0L;
+    }
+
+    long getSearchReadFileRangeCallsTotal() {
+        Long v = searchReadFileRangeCalls.get();
+        return v != null ? v : 0L;
+    }
+
+    long getSearchReadFileRangeBytesTotal() {
+        Long v = searchReadFileRangeBytes.get();
+        return v != null ? v : 0L;
+    }
+
+    long getSearchReadFileRangeWaitNanosTotal() {
+        Long v = searchReadFileRangeWaitNanos.get();
+        return v != null ? v : 0L;
+    }
+
+    long getSearchCacheHitsTotal() {
+        Long v = searchCacheHits.get();
+        return v != null ? v : 0L;
+    }
+
+    long getSearchCacheMissesTotal() {
+        Long v = searchCacheMisses.get();
+        return v != null ? v : 0L;
+    }
+
+    long getSearchSegmentsQueriedTotal() {
+        Long v = searchSegmentsQueried.get();
+        return v != null ? v : 0L;
     }
 }
