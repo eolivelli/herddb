@@ -1012,6 +1012,13 @@ public final class IndexOptimizerMain {
             }
             this.merger = upgraded;
             engine.upgradeMerger(upgraded, mergerDataStorageManager);
+            // Issue #542: propagate the upgrade to the task consumer.
+            // taskConsumer.merger was private final before this fix and was
+            // never updated, causing every merge to be declined by the stale
+            // NoopMerger even after the engine was correctly upgraded.
+            if (taskConsumer != null) {
+                taskConsumer.setMerger(upgraded);
+            }
             LOGGER.log(Level.INFO,
                     "maybeUpgradeMerger: successfully upgraded to {0}",
                     upgraded.getClass().getSimpleName());
