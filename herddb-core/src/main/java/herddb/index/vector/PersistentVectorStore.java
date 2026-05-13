@@ -4172,6 +4172,9 @@ public class PersistentVectorStore extends AbstractVectorStore {
             // between the snapshot and task execution — see invariant above).
             final List<VectorSegment> currentSegments = this.segments;
             for (final VectorSegment seg : currentSegments) {
+                if (ctx != null) {
+                    ctx.recordSegmentQueried();
+                }
                 tasks.add(wrapInContext(ctx, () -> {
                     List<Map.Entry<Bytes, Float>> local = new ArrayList<>(perSourceK);
                     seg.search(qv, perSourceK, similarityFunction, local);
@@ -4182,6 +4185,9 @@ public class PersistentVectorStore extends AbstractVectorStore {
             // Phase 2: live in-memory shards (no pending-deletes filtering).
             for (final LiveGraphShard shard : liveShards) {
                 if (shard.builder != null && !shard.nodeToPk.isEmpty()) {
+                    if (ctx != null) {
+                        ctx.recordSegmentQueried();
+                    }
                     tasks.add(wrapInContext(ctx, () -> searchLiveShard(shard, qv, perSourceK, null)));
                 }
             }
@@ -4192,6 +4198,9 @@ public class PersistentVectorStore extends AbstractVectorStore {
             if (frozen != null) {
                 for (final LiveGraphShard shard : frozen) {
                     if (shard.builder != null && !shard.nodeToPk.isEmpty()) {
+                        if (ctx != null) {
+                            ctx.recordSegmentQueried();
+                        }
                         tasks.add(wrapInContext(ctx,
                                 () -> searchLiveShard(shard, qv, perSourceK, pending)));
                     }
@@ -4201,6 +4210,9 @@ public class PersistentVectorStore extends AbstractVectorStore {
             if (deferred != null) {
                 for (final LiveGraphShard shard : deferred) {
                     if (shard.builder != null && !shard.nodeToPk.isEmpty()) {
+                        if (ctx != null) {
+                            ctx.recordSegmentQueried();
+                        }
                         tasks.add(wrapInContext(ctx,
                                 () -> searchLiveShard(shard, qv, perSourceK, pending)));
                     }
