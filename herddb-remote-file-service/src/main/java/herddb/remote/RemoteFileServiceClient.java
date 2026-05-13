@@ -747,6 +747,14 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
     }
 
     public CompletableFuture<Boolean> deleteFileAsync(String path) {
+        // Issue #551 forensics: log every delete request issued by the
+        // client. File deletions are the root cause of zombie-segment
+        // failure modes (files gone while metadata still references them);
+        // making them visible at INFO is required so the IS / optimizer
+        // logs alone are enough to investigate future incidents. The user
+        // explicitly chose INFO over FINE for this reason despite the
+        // higher log volume on the retention-reaper hot path.
+        LOGGER.log(Level.INFO, "file-server client: deleteFile path={0}", path);
         return retryAsync(() -> doDeleteFileAsync(path), "deleteFile", path, 0);
     }
 
@@ -1068,6 +1076,11 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
     }
 
     public CompletableFuture<Integer> deleteByPrefixAsync(String prefix) {
+        // Issue #551 forensics: log every prefix-delete request. Prefix
+        // deletes are the bulk-removal entry point (DROP INDEX, segment
+        // wholesale wipe) so a stray call here can take out an entire
+        // segment or index in one shot.
+        LOGGER.log(Level.INFO, "file-server client: deleteByPrefix prefix={0}", prefix);
         return retryAsync(() -> doDeleteByPrefixAsync(prefix), "deleteByPrefix", prefix, 0);
     }
 
@@ -1096,6 +1109,15 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
         if (paths == null || paths.isEmpty()) {
             return CompletableFuture.completedFuture(0);
         }
+        // Issue #551 forensics: log every batch-delete request. Batch deletes
+        // are the dominant deletion path in steady-state operation (compaction
+        // input cleanup, retention reaper). Log the count plus the first/last
+        // path so a stuck or runaway reaper is obvious from grep'ing the IS
+        // and optimizer logs (full-list logging at INFO would be too noisy in
+        // healthy operation).
+        LOGGER.log(Level.INFO,
+                "file-server client: deleteFiles count={0} first={1} last={2}",
+                new Object[]{paths.size(), paths.get(0), paths.get(paths.size() - 1)});
         return retryAsync(() -> doDeleteFilesAsync(paths), "deleteFiles", paths.get(0), 0);
     }
 
