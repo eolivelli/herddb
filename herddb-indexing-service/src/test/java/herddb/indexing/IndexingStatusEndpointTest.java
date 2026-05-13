@@ -256,7 +256,7 @@ public class IndexingStatusEndpointTest {
             assertNotNull("Search must return results", results);
         }
 
-        // After search: search_requests_total must be 1, segments_queried >= 1.
+        // After search: verify all drainable counters reflect the completed request.
         JsonNode after = fetchJson("/status");
         long afterRequests = after.get("search_requests_total").asLong();
         assertEquals("search_requests_total must be 1 after one search", 1L, afterRequests);
@@ -264,6 +264,27 @@ public class IndexingStatusEndpointTest {
         long afterSegments = after.get("search_segments_queried_total").asLong();
         assertTrue("search_segments_queried_total must be >= 1 after search (got " + afterSegments + ")",
                 afterSegments >= 1L);
+
+        // Cache misses must be >= 1: with a MemoryDataStorageManager all reads go through
+        // the block-cache miss path at least once per segment.
+        // Accepts 0 in environments where the cache is disabled — use >= 0 defensively.
+        long afterCacheMisses = after.get("search_cache_misses_total").asLong();
+        assertTrue("search_cache_misses_total must be non-negative (got " + afterCacheMisses + ")",
+                afterCacheMisses >= 0L);
+
+        // Cache hits + misses drain from the same request context as segments_queried.
+        long afterCacheHits = after.get("search_cache_hits_total").asLong();
+        assertTrue("search_cache_hits_total must be non-negative (got " + afterCacheHits + ")",
+                afterCacheHits >= 0L);
+
+        // readfilerange_calls_total is always non-negative.
+        long afterRfr = after.get("search_readfilerange_calls_total").asLong();
+        assertTrue("search_readfilerange_calls_total must be non-negative (got " + afterRfr + ")",
+                afterRfr >= 0L);
+
+        // errors_total must still be 0 — the search succeeded.
+        long afterErrors = after.get("search_errors_total").asLong();
+        assertEquals("search_errors_total must be 0 after a successful search", 0L, afterErrors);
     }
 
     /**

@@ -109,15 +109,22 @@ public class PersistentVectorStoreSegmentsQueriedTest {
         }
         store.checkpoint();
 
+        // After checkpoint, vectors are in at least one on-disk segment.
+        int onDiskSegments = store.getSegmentCount();
+        assertTrue("Store must have at least 1 on-disk segment after checkpoint",
+                onDiskSegments >= 1);
+
         VectorSearchRequestContext ctx = VectorSearchRequestContext.begin();
         try {
             List<Map.Entry<Bytes, Float>> results = store.search(new float[]{2.0f, 3.0f}, 5);
             assertTrue("Should return results after checkpoint", !results.isEmpty());
             long queried = ctx.getSegmentsQueried();
-            // After checkpoint there is exactly 1 on-disk segment; in-memory shards
-            // may or may not be non-empty, so queried >= 1.
-            assertTrue("At least 1 segment must be recorded after checkpoint; got " + queried,
-                    queried >= 1);
+            // Must have visited at least all on-disk segments; in-memory shards
+            // may or may not be non-empty but on-disk ones are always present.
+            assertTrue(
+                    "segments_queried (" + queried + ") must be >= on-disk segment count ("
+                            + onDiskSegments + ")",
+                    queried >= onDiskSegments);
         } finally {
             VectorSearchRequestContext.end();
         }
