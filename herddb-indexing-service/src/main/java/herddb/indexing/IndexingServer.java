@@ -20,6 +20,8 @@
 
 package herddb.indexing;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import herddb.auth.oidc.OidcBootstrap;
 import herddb.auth.oidc.OidcTokenValidator;
 import herddb.auth.oidc.grpc.JwtAuthServerInterceptor;
@@ -42,9 +44,7 @@ import herddb.storage.DataStorageManager;
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
 import java.io.IOException;
-import java.io.OutputStream;
 import java.net.URI;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Collections;
@@ -657,10 +657,17 @@ public class IndexingServer implements AutoCloseable {
     // -------------------------------------------------------------------------
 
     /**
+     * Shared {@link ObjectMapper} instance — Jackson's ObjectMapper is
+     * thread-safe after construction and expensive to create; a single
+     * instance shared across all /status requests is correct.
+     */
+    private static final ObjectMapper STATUS_MAPPER = new ObjectMapper();
+
+    /**
      * Jetty servlet that serves a JSON status snapshot on {@code GET /status}.
-     * Reads directly from the outer {@link IndexingServer}'s {@code engine},
+     * Reads from the outer {@link IndexingServer}'s {@code engine},
      * {@code config}, and {@code serviceImpl} fields — no synchronization
-     * needed beyond what each accessor already guarantees.
+     * needed beyond what each engine accessor already guarantees.
      */
     private final class StatusServlet extends HttpServlet {
 
@@ -669,19 +676,16 @@ public class IndexingServer implements AutoCloseable {
         @Override
         protected void doGet(HttpServletRequest req, HttpServletResponse resp)
                 throws IOException {
-            String json = buildStatusJson();
-            byte[] body = json.getBytes(StandardCharsets.UTF_8);
+            ObjectNode node = buildStatusNode();
+            byte[] body = STATUS_MAPPER.writeValueAsBytes(node);
             resp.setContentType("application/json; charset=utf-8");
             resp.setContentLength(body.length);
             resp.setStatus(HttpServletResponse.SC_OK);
-            try (OutputStream os = resp.getOutputStream()) {
-                os.write(body);
-            }
+            resp.getOutputStream().write(body);
         }
 
-        private String buildStatusJson() {
-            StringBuilder sb = new StringBuilder(2048);
-            sb.append("{\n");
+        private ObjectNode buildStatusNode() {
+            ObjectNode node = STATUS_MAPPER.createObjectNode();
 
             // --- GetInstanceInfo ---
             IndexingServerConfiguration cfg = engine.getConfig();
@@ -716,19 +720,19 @@ public class IndexingServer implements AutoCloseable {
                     ? cfg.getString(IndexingServerConfiguration.PROPERTY_ROLE,
                             IndexingServerConfiguration.PROPERTY_ROLE_DEFAULT)
                     : IndexingServerConfiguration.ROLE_PRIMARY;
-            appendJsonStr(sb, "instance_id", engine.getInstanceIdLabel(), true);
-            appendJsonStr(sb, "grpc_host", grpcHost, true);
-            appendJsonNum(sb, "grpc_port", grpcPort, true);
-            appendJsonStr(sb, "storage_type", storageType, true);
-            appendJsonStr(sb, "data_dir", dataDir, true);
-            appendJsonStr(sb, "tablespace_name", tablespaceName, true);
-            appendJsonStr(sb, "tablespace_uuid", engine.getTableSpaceUUID(), true);
-            appendJsonNum(sb, "instance_ordinal", instanceOrdinal, true);
-            appendJsonNum(sb, "num_instances", numInstances, true);
-            appendJsonStr(sb, "role", role, true);
-            appendJsonNum(sb, "shadow_of",
-                    engine.isConfiguredAsShadow() ? engine.getShadowOfOrMinusOne() : -1L, true);
-            appendJsonNum(sb, "jvm_max_heap_bytes", Runtime.getRuntime().maxMemory(), true);
+            node.put("instance_id", emptyToNull(engine.getInstanceIdLabel()));
+            node.put("grpc_host", emptyToNull(grpcHost));
+            node.put("grpc_port", grpcPort);
+            node.put("storage_type", emptyToNull(storageType));
+            node.put("data_dir", emptyToNull(dataDir));
+            node.put("tablespace_name", emptyToNull(tablespaceName));
+            node.put("tablespace_uuid", emptyToNull(engine.getTableSpaceUUID()));
+            node.put("instance_ordinal", instanceOrdinal);
+            node.put("num_instances", numInstances);
+            node.put("role", emptyToNull(role));
+            node.put("shadow_of",
+                    engine.isConfiguredAsShadow() ? engine.getShadowOfOrMinusOne() : -1);
+            node.put("jvm_max_heap_bytes", Runtime.getRuntime().maxMemory());
 
             // --- GetEngineStats ---
             long startMs = engine.getStartTimeMillis();
@@ -739,122 +743,75 @@ public class IndexingServer implements AutoCloseable {
             long heapUsed = heap.getUsed();
             long heapMax = heap.getMax();
             long heapPct = heapMax > 0 ? Math.min(100L, (100L * heapUsed) / heapMax) : -1L;
-            appendJsonNum(sb, "uptime_millis", uptime, true);
-            appendJsonBool(sb, "tailer_running", engine.isTailerRunning(), true);
-            appendJsonNum(sb, "tailer_watermark_ledger", lsn != null ? lsn.ledgerId : -1L, true);
-            appendJsonNum(sb, "tailer_watermark_offset", lsn != null ? lsn.offset : -1L, true);
-            appendJsonNum(sb, "tailer_entries_processed", engine.getTailerEntriesProcessed(), true);
-            appendJsonNum(sb, "tailer_entries_accepted", engine.getTailerEntriesAccepted(), true);
-            appendJsonNum(sb, "tailer_entries_skipped", engine.getTailerEntriesSkipped(), true);
-            appendJsonNum(sb, "tailer_entries_shard_filtered",
-                    engine.getTailerEntriesShardFiltered(), true);
-            appendJsonNum(sb, "tailer_inserts", engine.getTailerInserts(), true);
-            appendJsonNum(sb, "tailer_updates", engine.getTailerUpdates(), true);
-            appendJsonNum(sb, "tailer_deletes", engine.getTailerDeletes(), true);
-            appendJsonNum(sb, "tailer_ddl", engine.getTailerDdl(), true);
-            appendJsonNum(sb, "tailer_batches", engine.getTailerBatchesProcessed(), true);
-            appendJsonNum(sb, "apply_queue_size", engine.getApplyQueueSize(), true);
-            appendJsonNum(sb, "apply_queue_capacity", engine.getApplyQueueCapacity(), true);
-            appendJsonNum(sb, "apply_parallelism", engine.getApplyParallelism(), true);
-            appendJsonNum(sb, "loaded_index_count", engine.getLoadedIndexCount(), true);
-            appendJsonNum(sb, "total_estimated_memory_bytes",
-                    engine.getTotalEstimatedMemoryBytes(), true);
-            appendJsonNum(sb, "jvm_heap_used_bytes", heapUsed, true);
-            appendJsonNum(sb, "jvm_heap_max_bytes", heapMax, true);
-            appendJsonNum(sb, "jvm_heap_used_pct", heapPct, true);
+            node.put("uptime_millis", uptime);
+            node.put("tailer_running", engine.isTailerRunning());
+            node.put("tailer_watermark_ledger", lsn != null ? lsn.ledgerId : -1L);
+            node.put("tailer_watermark_offset", lsn != null ? lsn.offset : -1L);
+            node.put("tailer_entries_processed", engine.getTailerEntriesProcessed());
+            node.put("tailer_entries_accepted", engine.getTailerEntriesAccepted());
+            node.put("tailer_entries_skipped", engine.getTailerEntriesSkipped());
+            node.put("tailer_entries_shard_filtered", engine.getTailerEntriesShardFiltered());
+            node.put("tailer_inserts", engine.getTailerInserts());
+            node.put("tailer_updates", engine.getTailerUpdates());
+            node.put("tailer_deletes", engine.getTailerDeletes());
+            node.put("tailer_ddl", engine.getTailerDdl());
+            node.put("tailer_batches", engine.getTailerBatchesProcessed());
+            node.put("apply_queue_size", engine.getApplyQueueSize());
+            node.put("apply_queue_capacity", engine.getApplyQueueCapacity());
+            node.put("apply_parallelism", engine.getApplyParallelism());
+            node.put("loaded_index_count", engine.getLoadedIndexCount());
+            node.put("total_estimated_memory_bytes", engine.getTotalEstimatedMemoryBytes());
+            node.put("jvm_heap_used_bytes", heapUsed);
+            node.put("jvm_heap_max_bytes", heapMax);
+            node.put("jvm_heap_used_pct", heapPct);
 
             // --- GetShadowStatus ---
             LogSequenceNumber shadowLoaded = engine.getShadowLoadedLsn();
             LogSequenceNumber primaryAdvertised = engine.getPrimaryAdvertisedLsn();
-            appendJsonBool(sb, "is_shadow", engine.isConfiguredAsShadow(), true);
-            appendJsonBool(sb, "shadow_ready",
-                    engine.isConfiguredAsShadow() ? engine.isShadowReady() : true, true);
-            appendJsonNum(sb, "shadow_loaded_ledger_id",
-                    shadowLoaded != null ? shadowLoaded.ledgerId : -1L, true);
-            appendJsonNum(sb, "shadow_loaded_offset",
-                    shadowLoaded != null ? shadowLoaded.offset : -1L, true);
-            appendJsonNum(sb, "primary_advertised_ledger_id",
-                    primaryAdvertised != null ? primaryAdvertised.ledgerId : -1L, true);
-            appendJsonNum(sb, "primary_advertised_offset",
-                    primaryAdvertised != null ? primaryAdvertised.offset : -1L, true);
-            appendJsonNum(sb, "shadow_last_reload_timestamp_ms",
-                    engine.getShadowLastReloadTimestampMs(), true);
-            appendJsonNum(sb, "shadow_reload_count", engine.getShadowReloadCount(), true);
-            appendJsonNum(sb, "applied_index_status_generation",
-                    engine.getMinAppliedIndexStatusGeneration(), true);
-            appendJsonNum(sb, "shadow_loaded_entry_timestamp_ms",
-                    engine.getShadowLoadedEntryTimestamp(), true);
+            node.put("is_shadow", engine.isConfiguredAsShadow());
+            node.put("shadow_ready",
+                    engine.isConfiguredAsShadow() ? engine.isShadowReady() : true);
+            node.put("shadow_loaded_ledger_id",
+                    shadowLoaded != null ? shadowLoaded.ledgerId : -1L);
+            node.put("shadow_loaded_offset",
+                    shadowLoaded != null ? shadowLoaded.offset : -1L);
+            node.put("primary_advertised_ledger_id",
+                    primaryAdvertised != null ? primaryAdvertised.ledgerId : -1L);
+            node.put("primary_advertised_offset",
+                    primaryAdvertised != null ? primaryAdvertised.offset : -1L);
+            node.put("shadow_last_reload_timestamp_ms", engine.getShadowLastReloadTimestampMs());
+            node.put("shadow_reload_count", engine.getShadowReloadCount());
+            node.put("applied_index_status_generation",
+                    engine.getMinAppliedIndexStatusGeneration());
+            node.put("shadow_loaded_entry_timestamp_ms", engine.getShadowLoadedEntryTimestamp());
 
             // --- Search metrics (issue #541) ---
             // serviceImpl is set in start() before the HTTP server is mounted;
             // guard against null defensively in case this is ever called early.
             IndexingServiceImpl si = serviceImpl;
-            appendJsonNum(sb, "search_requests_total",
-                    si != null ? si.getSearchRequestsTotal() : 0L, true);
-            appendJsonNum(sb, "search_errors_total",
-                    si != null ? si.getSearchErrorsTotal() : 0L, true);
-            appendJsonNum(sb, "search_readfilerange_calls_total",
-                    si != null ? si.getSearchReadFileRangeCallsTotal() : 0L, true);
-            appendJsonNum(sb, "search_readfilerange_bytes_total",
-                    si != null ? si.getSearchReadFileRangeBytesTotal() : 0L, true);
-            appendJsonNum(sb, "search_readfilerange_wait_nanos_total",
-                    si != null ? si.getSearchReadFileRangeWaitNanosTotal() : 0L, true);
-            appendJsonNum(sb, "search_segments_queried_total",
-                    si != null ? si.getSearchSegmentsQueriedTotal() : 0L, true);
-            appendJsonNum(sb, "search_cache_hits_total",
-                    si != null ? si.getSearchCacheHitsTotal() : 0L, true);
-            appendJsonNum(sb, "search_cache_misses_total",
-                    si != null ? si.getSearchCacheMissesTotal() : 0L, false);
+            node.put("search_requests_total",
+                    si != null ? si.getSearchRequestsTotal() : 0L);
+            node.put("search_errors_total",
+                    si != null ? si.getSearchErrorsTotal() : 0L);
+            node.put("search_readfilerange_calls_total",
+                    si != null ? si.getSearchReadFileRangeCallsTotal() : 0L);
+            node.put("search_readfilerange_bytes_total",
+                    si != null ? si.getSearchReadFileRangeBytesTotal() : 0L);
+            node.put("search_readfilerange_wait_nanos_total",
+                    si != null ? si.getSearchReadFileRangeWaitNanosTotal() : 0L);
+            node.put("search_segments_queried_total",
+                    si != null ? si.getSearchSegmentsQueriedTotal() : 0L);
+            node.put("search_cache_hits_total",
+                    si != null ? si.getSearchCacheHitsTotal() : 0L);
+            node.put("search_cache_misses_total",
+                    si != null ? si.getSearchCacheMissesTotal() : 0L);
 
-            sb.append("}\n");
-            return sb.toString();
+            return node;
         }
-    }
 
-    // -------------------------------------------------------------------------
-    // JSON helpers shared by StatusServlet (issue #541)
-    // -------------------------------------------------------------------------
-
-    private static void appendJsonStr(StringBuilder sb, String key, String value,
-                                      boolean trailingComma) {
-        sb.append("  \"").append(key).append("\": ");
-        if (value == null || value.isEmpty()) {
-            sb.append("null");
-        } else {
-            sb.append('"');
-            for (int i = 0; i < value.length(); i++) {
-                char c = value.charAt(i);
-                if (c == '"') {
-                    sb.append("\\\"");
-                } else if (c == '\\') {
-                    sb.append("\\\\");
-                } else {
-                    sb.append(c);
-                }
-            }
-            sb.append('"');
+        /** Returns {@code null} when the string is null or empty, else the string itself. */
+        private String emptyToNull(String s) {
+            return (s == null || s.isEmpty()) ? null : s;
         }
-        if (trailingComma) {
-            sb.append(',');
-        }
-        sb.append('\n');
-    }
-
-    private static void appendJsonNum(StringBuilder sb, String key, long value,
-                                      boolean trailingComma) {
-        sb.append("  \"").append(key).append("\": ").append(value);
-        if (trailingComma) {
-            sb.append(',');
-        }
-        sb.append('\n');
-    }
-
-    private static void appendJsonBool(StringBuilder sb, String key, boolean value,
-                                       boolean trailingComma) {
-        sb.append("  \"").append(key).append("\": ").append(value);
-        if (trailingComma) {
-            sb.append(',');
-        }
-        sb.append('\n');
     }
 }
