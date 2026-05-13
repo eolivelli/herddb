@@ -80,7 +80,15 @@ public final class OptimizerTaskConsumer {
     private final OptimizerTaskRegistry taskRegistry;
     private final SegmentRegistryClient segmentRegistry;
     private final SegmentRevalidator revalidator;
-    private final SegmentMerger merger;
+    /**
+     * Active merger. Declared {@code volatile} (not {@code final}) so that
+     * {@link IndexOptimizerMain#maybeUpgradeMerger()} can propagate a
+     * NoopMerger → RemoteSegmentMerger upgrade to this consumer after startup
+     * (issue #542). The upgrade write happens inside the {@code synchronized}
+     * {@code maybeUpgradeMerger()} method; the {@code volatile} keyword ensures
+     * visibility for the unsynchronized {@link #consumeOneTask()} reader.
+     */
+    private volatile SegmentMerger merger;
     private final String tablespaceUuid;
     private final String workerId;
     private final long retentionMillis;
@@ -150,6 +158,29 @@ public final class OptimizerTaskConsumer {
         }
         tasksClaimedTotal.incrementAndGet();
         return executeClaimedTask(claimed);
+    }
+
+    /**
+     * Returns the currently active merger. {@code volatile} read; safe to call
+     * from any thread without synchronization. Exposed for observability and
+     * testing (e.g. verifying that a NoopMerger → RemoteSegmentMerger upgrade
+     * propagated to the consumer — issue #542).
+     */
+    public SegmentMerger getMerger() {
+        return merger;
+    }
+
+    /**
+     * Replaces the active merger. Called by
+     * {@link IndexOptimizerMain#maybeUpgradeMerger()} under {@code synchronized}
+     * to propagate a late-binding upgrade (issue #542). The
+     * {@code volatile} write is visible to the unsynchronized
+     * {@link #consumeOneTask()} reader on the scheduler thread.
+     *
+     * @param newMerger the new merger — must not be {@code null}
+     */
+    public void setMerger(SegmentMerger newMerger) {
+        this.merger = Objects.requireNonNull(newMerger, "newMerger");
     }
 
     public long getTasksClaimedTotal() {

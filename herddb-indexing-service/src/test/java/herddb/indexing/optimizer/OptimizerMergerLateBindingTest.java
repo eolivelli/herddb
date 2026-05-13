@@ -253,6 +253,64 @@ public class OptimizerMergerLateBindingTest {
     }
 
     /**
+     * Issue #542 — upgrade must reach the task consumer.
+     *
+     * <p>Before the fix, {@link OptimizerTaskConsumer#merger} was {@code private final}
+     * and captured the startup-time {@link IndexOptimizerMain.NoopMerger}. Every merge
+     * task was then declined by the stale reference even though the engine's own field
+     * was correctly upgraded to a real merger. This test verifies that after a
+     * watcher-driven upgrade (the same upgrade path tested in
+     * {@link #watcherDrivenUpgradeReplacesNoopMergerWhenFileServerRegisters}),
+     * {@code main.getTaskConsumer().getMerger()} is no longer a {@link IndexOptimizerMain.NoopMerger}.
+     */
+    @Test
+    public void mergerUpgradePropagatesFromEngineToTaskConsumer() throws Exception {
+        Properties props = baseProps();
+        // Short debounce so the watcher-triggered tick fires quickly.
+        props.setProperty(OptimizerConfiguration.PROPERTY_EVENT_DEBOUNCE_MS, "50");
+
+        IndexOptimizerMain main = new IndexOptimizerMain(new OptimizerConfiguration(props));
+        main.mergerBuilderForTests = servers -> new InMemorySegmentMerger();
+
+        try {
+            main.start();
+            assertNotNull("engine must be initialised", main.getEngine());
+            assertNotNull("taskConsumer must be initialised", main.getTaskConsumer());
+
+            // No file server at startup → consumer's merger is also NoopMerger.
+            assertTrue("taskConsumer.getMerger() must be NoopMerger before upgrade",
+                    main.getTaskConsumer().getMerger() instanceof IndexOptimizerMain.NoopMerger);
+
+            // Register a file server: ZK watch fires → maybeUpgradeMerger() upgrades
+            // the engine AND — since issue #542 is fixed — the task consumer.
+            registerFileServer(FILE_SERVER_ID, FILE_SERVER_ADDR);
+
+            // Wait for the upgrade to complete (up to 10 s).
+            long deadline = System.currentTimeMillis() + 10_000L;
+            while (System.currentTimeMillis() < deadline) {
+                if (!(main.getTaskConsumer().getMerger() instanceof IndexOptimizerMain.NoopMerger)) {
+                    break;
+                }
+                Thread.sleep(50);
+            }
+
+            // Core assertion for issue #542: the consumer must see the new merger.
+            assertFalse("taskConsumer.getMerger() must NOT be NoopMerger after upgrade (issue #542)",
+                    main.getTaskConsumer().getMerger() instanceof IndexOptimizerMain.NoopMerger);
+            assertTrue("taskConsumer.getMerger() must be InMemorySegmentMerger after upgrade",
+                    main.getTaskConsumer().getMerger() instanceof InMemorySegmentMerger);
+
+            // Sanity: engine and main-level fields are also upgraded (pre-existing behaviour).
+            assertFalse("engine.getMerger() must not be NoopMerger",
+                    main.getEngine().getMerger() instanceof IndexOptimizerMain.NoopMerger);
+            assertFalse("main.getMerger() must not be NoopMerger",
+                    main.getMerger() instanceof IndexOptimizerMain.NoopMerger);
+        } finally {
+            main.shutdown();
+        }
+    }
+
+    /**
      * Issue #507 — churn resilience: the merger stays real after file-server churn.
      *
      * <p>Once the optimizer upgrades from {@link IndexOptimizerMain.NoopMerger} to a real
