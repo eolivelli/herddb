@@ -22,6 +22,7 @@ package herddb.indexing;
 
 import static org.junit.Assert.assertEquals;
 import herddb.core.MemoryManager;
+import herddb.utils.HerdDBByteBufAllocators;
 import java.util.Properties;
 import org.junit.Test;
 
@@ -29,27 +30,34 @@ import org.junit.Test;
  * Unit tests for {@link IndexingServer} configuration logic.
  *
  * <p>{@link IndexingServer#buildMemoryManager()} and the vector-budget set in
- * {@link IndexingServer#start()} must both use 1/3 of JVM max heap when
- * {@code indexing.memory.vector.limit} is 0 (auto).
+ * {@link IndexingServer#start()} must both use 1/3 of Netty direct memory when
+ * {@code indexing.memory.vector.limit} is 0 (auto). Both paths share
+ * {@link IndexingServer#resolveEffectiveVectorMemoryLimit()} so they cannot drift.
  */
 public class IndexingServerTest {
 
     /**
      * When {@code indexing.memory.vector.limit} is not set (defaults to 0),
-     * {@code buildMemoryManager()} must use {@code Runtime.maxMemory() / 3}.
+     * {@code buildMemoryManager()} must use
+     * {@code HerdDBByteBufAllocators.maxDirectMemoryBytes() * 0.33}.
      */
     @Test
     public void testBuildMemoryManagerDefaultUsesOneThird() {
-        IndexingServerConfiguration config = new IndexingServerConfiguration();
-        // engine is not used by buildMemoryManager(), so null is safe here
-        IndexingServer server = new IndexingServer("localhost", 0, null, config);
+        try {
+            IndexingServerConfiguration config = new IndexingServerConfiguration();
+            // engine is not used by buildMemoryManager(), so null is safe here
+            IndexingServer server = new IndexingServer("localhost", 0, null, config);
 
-        MemoryManager mm = server.buildMemoryManager();
+            MemoryManager mm = server.buildMemoryManager();
 
-        long expected = Runtime.getRuntime().maxMemory() / 3;
-        assertEquals(
-                "buildMemoryManager() must use maxMemory()/3 when limit is 0",
-                expected, mm.getMaxDataUsedMemory());
+            long expected = (long) (IndexingServerConfiguration.PROPERTY_MEMORY_VECTOR_PERCENTAGE_DEFAULT
+                    * HerdDBByteBufAllocators.maxDirectMemoryBytes());
+            assertEquals(
+                    "buildMemoryManager() must use maxDirectMemoryBytes()*0.33 when limit is 0",
+                    expected, mm.getMaxDataUsedMemory());
+        } finally {
+            HerdDBByteBufAllocators.resetMaxDirectMemoryCacheForTesting();
+        }
     }
 
     /**
@@ -73,22 +81,75 @@ public class IndexingServerTest {
     }
 
     /**
-     * Ensures the auto-computed limit in {@code buildMemoryManager()} (1/3)
-     * matches the vector back-pressure budget set by {@code start()}, also 1/3.
-     * Both code paths read the same property so they must agree on the fraction.
+     * Ensures the auto-computed limit in {@code buildMemoryManager()} (default 33%)
+     * matches the vector back-pressure budget set by {@code start()}, also resolved via
+     * {@code resolveEffectiveVectorMemoryLimit()}. Both paths share the same helper,
+     * so they must produce the same value.
      */
     @Test
     public void testBuildMemoryManagerAndStartAgreeOnDefaultFraction() {
-        IndexingServerConfiguration config = new IndexingServerConfiguration();
+        try {
+            IndexingServerConfiguration config = new IndexingServerConfiguration();
+            IndexingServer server = new IndexingServer("localhost", 0, null, config);
+
+            MemoryManager mm = server.buildMemoryManager();
+
+            // resolveEffectiveVectorMemoryLimit() uses maxDirectMemoryBytes() * percentage
+            long expectedVectorBudget = (long) (IndexingServerConfiguration.PROPERTY_MEMORY_VECTOR_PERCENTAGE_DEFAULT
+                    * HerdDBByteBufAllocators.maxDirectMemoryBytes());
+
+            assertEquals(
+                    "buildMemoryManager() and start() must use the same fraction of direct memory",
+                    expectedVectorBudget, mm.getMaxDataUsedMemory());
+        } finally {
+            HerdDBByteBufAllocators.resetMaxDirectMemoryCacheForTesting();
+        }
+    }
+
+    /**
+     * When {@code indexing.memory.vector.percentage=0.5} is configured and no explicit
+     * limit is set, {@code buildMemoryManager()} must use 50% of
+     * {@code HerdDBByteBufAllocators.maxDirectMemoryBytes()}.
+     */
+    @Test
+    public void testBuildMemoryManagerUsesConfiguredPercentage() {
+        try {
+            Properties props = new Properties();
+            props.setProperty(IndexingServerConfiguration.PROPERTY_MEMORY_VECTOR_PERCENTAGE, "0.5");
+            IndexingServerConfiguration config = new IndexingServerConfiguration(props);
+            IndexingServer server = new IndexingServer("localhost", 0, null, config);
+
+            MemoryManager mm = server.buildMemoryManager();
+
+            long expected = (long) (0.5d * HerdDBByteBufAllocators.maxDirectMemoryBytes());
+            assertEquals(
+                    "buildMemoryManager() must use 50% of maxDirectMemoryBytes() when percentage=0.5",
+                    expected, mm.getMaxDataUsedMemory());
+        } finally {
+            HerdDBByteBufAllocators.resetMaxDirectMemoryCacheForTesting();
+        }
+    }
+
+    /**
+     * When both {@code indexing.memory.vector.limit} and
+     * {@code indexing.memory.vector.percentage} are configured, the explicit absolute
+     * limit must win regardless of what the percentage would compute to.
+     */
+    @Test
+    public void testBuildMemoryManagerExplicitLimitOverridesPercentage() {
+        long explicitLimit = 1_234_567L;
+        Properties props = new Properties();
+        props.setProperty(IndexingServerConfiguration.PROPERTY_MEMORY_VECTOR_LIMIT,
+                String.valueOf(explicitLimit));
+        // A nonsense percentage that would produce a very different number if used
+        props.setProperty(IndexingServerConfiguration.PROPERTY_MEMORY_VECTOR_PERCENTAGE, "0.99");
+        IndexingServerConfiguration config = new IndexingServerConfiguration(props);
         IndexingServer server = new IndexingServer("localhost", 0, null, config);
 
         MemoryManager mm = server.buildMemoryManager();
 
-        // start() computes: maxMemory <= 0 ? maxMemory()/3 : maxVectorMemory
-        long expectedVectorBudget = Runtime.getRuntime().maxMemory() / 3;
-
         assertEquals(
-                "buildMemoryManager() and start() must use the same 1/3 fraction",
-                expectedVectorBudget, mm.getMaxDataUsedMemory());
+                "explicit limit must override percentage when limit > 0",
+                explicitLimit, mm.getMaxDataUsedMemory());
     }
 }

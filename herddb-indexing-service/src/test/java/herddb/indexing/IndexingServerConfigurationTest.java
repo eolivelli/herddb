@@ -62,6 +62,9 @@ public class IndexingServerConfigurationTest {
         assertEquals(0L, config.getLong(
                 IndexingServerConfiguration.PROPERTY_MEMORY_VECTOR_LIMIT,
                 IndexingServerConfiguration.PROPERTY_MEMORY_VECTOR_LIMIT_DEFAULT));
+        assertEquals(0.33d, config.getDouble(
+                IndexingServerConfiguration.PROPERTY_MEMORY_VECTOR_PERCENTAGE,
+                IndexingServerConfiguration.PROPERTY_MEMORY_VECTOR_PERCENTAGE_DEFAULT), 0.001);
         assertEquals(1048576L, config.getLong(
                 IndexingServerConfiguration.PROPERTY_MEMORY_PAGE_SIZE,
                 IndexingServerConfiguration.PROPERTY_MEMORY_PAGE_SIZE_DEFAULT));

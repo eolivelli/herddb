@@ -166,9 +166,11 @@ public final class HerdDBByteBufAllocators {
 
     /**
      * Test-only hook to force re-resolution on the next call to
-     * {@link #maxDirectMemoryBytes()}.
+     * {@link #maxDirectMemoryBytes()}. Made public so tests in other packages
+     * (e.g. {@code herddb.indexing}) can clear the lazy cache after injecting
+     * a custom probe or changing JVM state between test methods.
      */
-    static void resetMaxDirectMemoryCacheForTesting() {
+    public static void resetMaxDirectMemoryCacheForTesting() {
         cachedMaxDirectMemoryBytes = -1L;
     }
 

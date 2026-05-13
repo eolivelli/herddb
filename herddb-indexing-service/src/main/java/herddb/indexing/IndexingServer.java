@@ -41,6 +41,7 @@ import herddb.server.RemoteFileServiceFactory;
 import herddb.server.RemoteFileStorageManager;
 import herddb.server.SharedCheckpointMetadata;
 import herddb.storage.DataStorageManager;
+import herddb.utils.HerdDBByteBufAllocators;
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
 import java.io.IOException;
@@ -117,28 +118,42 @@ public class IndexingServer implements AutoCloseable {
     }
 
     /**
+     * Resolves the effective vector memory budget. When the operator sets
+     * {@code indexing.memory.vector.limit > 0}, that absolute value is used
+     * verbatim. Otherwise the budget defaults to
+     * {@code indexing.memory.vector.percentage × HerdDBByteBufAllocators.maxDirectMemoryBytes()}
+     * — i.e. a fraction of the JVM's Netty direct-memory pool (typically set
+     * via {@code -XX:MaxDirectMemorySize}). Direct memory is the correct reference
+     * because the underlying index page allocations, remote-file inflight
+     * buffers, and segment-page cache all live off-heap.
+     */
+    long resolveEffectiveVectorMemoryLimit() {
+        long explicit = config.getLong(
+                IndexingServerConfiguration.PROPERTY_MEMORY_VECTOR_LIMIT,
+                IndexingServerConfiguration.PROPERTY_MEMORY_VECTOR_LIMIT_DEFAULT);
+        if (explicit > 0) {
+            return explicit;
+        }
+        double pct = config.getDouble(
+                IndexingServerConfiguration.PROPERTY_MEMORY_VECTOR_PERCENTAGE,
+                IndexingServerConfiguration.PROPERTY_MEMORY_VECTOR_PERCENTAGE_DEFAULT);
+        long maxDirect = HerdDBByteBufAllocators.maxDirectMemoryBytes();
+        return (long) (pct * maxDirect);
+    }
+
+    /**
      * Builds a MemoryManager based on configuration.
-     * If {@code indexing.memory.vector.limit} is 0 (auto), uses 33% of JVM max heap
-     * (consistent with the vector back-pressure budget set in {@link #start()}).
+     * When {@code indexing.memory.vector.limit} is 0 (auto), the budget is derived from
+     * {@code indexing.memory.vector.percentage} (default 33%) of the Netty direct-memory
+     * pool ({@code HerdDBByteBufAllocators.maxDirectMemoryBytes()}), consistent with the
+     * vector back-pressure budget set in {@link #start()}. Both paths share the same
+     * {@link #resolveEffectiveVectorMemoryLimit()} helper so the two values cannot drift.
      */
     MemoryManager buildMemoryManager() {
-        long maxVectorMemory = config.getLong(IndexingServerConfiguration.PROPERTY_MEMORY_VECTOR_LIMIT,
-                IndexingServerConfiguration.PROPERTY_MEMORY_VECTOR_LIMIT_DEFAULT);
         long maxLogicalPageSize = config.getLong(IndexingServerConfiguration.PROPERTY_MEMORY_PAGE_SIZE,
                 IndexingServerConfiguration.PROPERTY_MEMORY_PAGE_SIZE_DEFAULT);
 
-        long maxDataUsedMemory;
-        if (maxVectorMemory <= 0) {
-            // Auto: use 33% of JVM max heap (same fraction as vector back-pressure budget)
-            maxDataUsedMemory = Runtime.getRuntime().maxMemory() / 3;
-        } else {
-            maxDataUsedMemory = maxVectorMemory;
-        }
-
-        // Ensure maxDataUsedMemory is at least maxLogicalPageSize
-        if (maxDataUsedMemory < maxLogicalPageSize) {
-            maxDataUsedMemory = maxLogicalPageSize;
-        }
+        long maxDataUsedMemory = Math.max(resolveEffectiveVectorMemoryLimit(), maxLogicalPageSize);
 
         LOGGER.log(Level.INFO, "Building MemoryManager: maxDataUsedMemory={0} MB, maxLogicalPageSize={1}",
                 new Object[]{maxDataUsedMemory / (1024 * 1024), maxLogicalPageSize});
@@ -325,12 +340,9 @@ public class IndexingServer implements AutoCloseable {
         MemoryManager memoryManager = buildMemoryManager();
         engine.setMemoryManager(memoryManager);
 
-        // Set the effective vector memory limit for back-pressure enforcement
-        long maxVectorMemory = config.getLong(IndexingServerConfiguration.PROPERTY_MEMORY_VECTOR_LIMIT,
-                IndexingServerConfiguration.PROPERTY_MEMORY_VECTOR_LIMIT_DEFAULT);
-        long effectiveVectorMemoryLimit = maxVectorMemory <= 0
-                ? Runtime.getRuntime().maxMemory() / 3
-                : maxVectorMemory;
+        // Set the effective vector memory limit for back-pressure enforcement.
+        // Uses the same helper as buildMemoryManager() so both values are always consistent.
+        long effectiveVectorMemoryLimit = resolveEffectiveVectorMemoryLimit();
         engine.setMaxVectorMemoryBytes(effectiveVectorMemoryLimit);
 
         DataStorageManager dataStorageManager = buildDataStorageManager(engine.getDataDirectory());
