@@ -362,6 +362,25 @@ public final class IndexingServerConfiguration {
             "vector.index.compaction.streaming.enabled";
     public static final boolean PROPERTY_VECTOR_INDEX_COMPACTION_STREAMING_ENABLED_DEFAULT = true;
 
+    /**
+     * Async IO pipeline for FusedPQ vector search (issue #547). When
+     * {@code true}, the jvector {@code GraphSearcher} is given a 2-slot
+     * speculative-read pipeline: while similarities are computed for the
+     * current frontier node, the next likely-visited node's block is already
+     * in flight via {@code RemoteRandomAccessReader.readRangeAsync}. This
+     * overlaps network IO with SIMD compute on the remote-file-service path.
+     *
+     * <p>Disabled by default until a production profile confirms a net win
+     * (see issue #547 acceptance criteria). Enable via this config key or
+     * via the {@code herddb.vectorindex.searchAsyncPipelineEnabled} system
+     * property — the config key takes precedence at IS startup.
+     */
+    public static final String PROPERTY_VECTOR_SEARCH_ASYNC_PIPELINE_ENABLED =
+            "indexing.vector.search.asyncPipelineEnabled";
+    public static final String SYSPROP_VECTOR_SEARCH_ASYNC_PIPELINE_ENABLED =
+            "herddb.vectorindex.searchAsyncPipelineEnabled";
+    public static final boolean PROPERTY_VECTOR_SEARCH_ASYNC_PIPELINE_ENABLED_DEFAULT = false;
+
     // Apply parallelism
     public static final String PROPERTY_APPLY_PARALLELISM = "indexing.apply.parallelism";
     public static final int PROPERTY_APPLY_PARALLELISM_DEFAULT = 0; // 0 = auto: max(1, availableProcessors/2)

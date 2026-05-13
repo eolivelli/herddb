@@ -29,6 +29,7 @@ import io.netty.util.ReferenceCountUtil;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import org.apache.bookkeeper.stats.Counter;
 import org.apache.bookkeeper.stats.NullStatsLogger;
@@ -288,6 +289,179 @@ public class RemoteRandomAccessReader implements RandomAccessReader {
             ReferenceCountUtil.safeRelease(blockBuffer);
             blockBuffer = null;
             bufferedBlockIndex = -1;
+        }
+    }
+
+    /**
+     * Non-blocking read of an arbitrary byte range. This override routes the
+     * read through {@link SegmentBlockCache#getBlockAsync} so that jvector's
+     * 2-slot async pipeline (enabled via
+     * {@link io.github.jbellis.jvector.graph.GraphSearcher#setAsyncPipelineEnabled})
+     * can overlap IO with similarity computation on the FusedPQ search path.
+     *
+     * <p><b>Thread-safety contract</b>: this method intentionally does NOT
+     * touch {@link #position}, {@link #blockBuffer}, or
+     * {@link #bufferedBlockIndex}. Async reads bypass this reader's sliding
+     * window so they can safely interleave with synchronous calls on the same
+     * reader instance (jvector's contract on
+     * {@code RandomAccessReader.readRangeAsync}).
+     *
+     * <p><b>ByteBuf ownership</b>: each {@link ByteBuf} slice obtained from the
+     * block cache is released inside the completion callback (after its bytes
+     * have been copied to the returned on-heap {@link ByteBuffer}), so no
+     * off-heap memory escapes this method.
+     *
+     * <p><b>Stats</b>: {@code clientReadRequests}, {@code clientReadBytes},
+     * and {@code clientReadLatency} are updated via
+     * {@link #fetchBlockFromRemoteAsync} for every cache-miss network call,
+     * keeping the Grafana panels consistent with the sync path. The
+     * {@link VectorSearchRequestContext} hit/miss/readFileRange counters are
+     * updated once per {@code readRangeAsync} invocation on the single-block
+     * fast path and per covering block on the multi-block path.
+     */
+    @Override
+    public CompletableFuture<ByteBuffer> readRangeAsync(long offset, int length) {
+        if (length <= 0) {
+            return CompletableFuture.completedFuture(ByteBuffer.allocate(0));
+        }
+        if (offset < 0 || offset + length > totalSize) {
+            CompletableFuture<ByteBuffer> failed = new CompletableFuture<>();
+            failed.completeExceptionally(new IOException(
+                    "Read past end of file: offset=" + offset
+                            + " length=" + length + " totalSize=" + totalSize));
+            return failed;
+        }
+
+        long startBlock = offset / bufferSize;
+        long endBlock = (offset + length - 1) / bufferSize;
+
+        if (startBlock == endBlock) {
+            // ---- Single-block fast path ----
+            long blockOff = startBlock * (long) bufferSize;
+            int blockLen = (int) Math.min(bufferSize, totalSize - blockOff);
+
+            VectorSearchRequestContext ctx = VectorSearchRequestContext.current();
+            boolean wasCached = blockCache.containsBlock(path, blockOff, bufferSize);
+            long startNanos = System.nanoTime();
+
+            return blockCache.getBlockAsync(path, blockOff, blockLen,
+                    (p, off, len) -> fetchBlockFromRemoteAsync(p, off, len))
+                    .thenApply(buf -> {
+                        long elapsedNanos = System.nanoTime() - startNanos;
+                        if (ctx != null) {
+                            if (wasCached) {
+                                ctx.recordCacheHit();
+                            } else {
+                                ctx.recordCacheMiss();
+                            }
+                            ctx.recordReadFileRange((int) Math.min(bufferSize, totalSize - blockOff),
+                                    elapsedNanos);
+                        }
+                        return sliceToHeap(buf, (int) (offset - blockOff), length);
+                    });
+        }
+
+        // ---- Multi-block path ----
+        // Issue all block fetches in parallel; splice the [offset, offset+length)
+        // window once all buffers are ready. Each ByteBuf is released in the
+        // finally block regardless of success or failure.
+        int numBlocks = (int) (endBlock - startBlock + 1);
+        @SuppressWarnings("unchecked")
+        CompletableFuture<ByteBuf>[] blockFutures = new CompletableFuture[numBlocks];
+        for (int i = 0; i < numBlocks; i++) {
+            long blockIdx = startBlock + i;
+            long blockOff = blockIdx * (long) bufferSize;
+            int blockLen = (int) Math.min(bufferSize, totalSize - blockOff);
+            blockFutures[i] = blockCache.getBlockAsync(path, blockOff, blockLen,
+                    (p, off, len) -> fetchBlockFromRemoteAsync(p, off, len));
+        }
+
+        CompletableFuture<ByteBuffer> result = new CompletableFuture<>();
+        CompletableFuture.allOf(blockFutures).whenComplete((ignored, err) -> {
+            if (err != null) {
+                // Release any buffers that completed successfully before
+                // the failure to avoid ByteBuf reference-count leaks.
+                for (CompletableFuture<ByteBuf> f : blockFutures) {
+                    if (f.isDone() && !f.isCompletedExceptionally() && !f.isCancelled()) {
+                        ReferenceCountUtil.safeRelease(f.getNow(null));
+                    }
+                }
+                result.completeExceptionally(err);
+                return;
+            }
+            // All futures completed successfully; assemble the output byte array.
+            try {
+                byte[] out = new byte[length];
+                int dstOff = 0;
+                for (int i = 0; i < numBlocks; i++) {
+                    ByteBuf buf = blockFutures[i].join(); // safe: allOf guarantees done
+                    long blockOff = (startBlock + i) * (long) bufferSize;
+                    int srcStart = (int) Math.max(0L, offset - blockOff);
+                    int srcEnd = (int) Math.min((long) buf.readableBytes(), offset + length - blockOff);
+                    int toCopy = srcEnd - srcStart;
+                    if (toCopy > 0) {
+                        buf.getBytes(srcStart, out, dstOff, toCopy);
+                        dstOff += toCopy;
+                    }
+                }
+                result.complete(ByteBuffer.wrap(out));
+            } catch (Exception e) {
+                result.completeExceptionally(e);
+            } finally {
+                // Release every buffer; sliceToHeap already did a heap copy.
+                for (CompletableFuture<ByteBuf> f : blockFutures) {
+                    ReferenceCountUtil.safeRelease(f.getNow(null));
+                }
+            }
+        });
+        return result;
+    }
+
+    /**
+     * Async equivalent of {@link #fetchBlockFromRemote}: fires a non-blocking
+     * {@code readFileRangeAsByteBufAsync} call, clamps {@code len} to avoid
+     * reading past {@link #totalSize}, and updates the client-side counters
+     * ({@code rfs_client_read_*}) on completion.
+     *
+     * <p>Back-pressure ({@code inflightReadBytes} semaphore) is handled
+     * transparently inside {@link RemoteFileServiceClient#readFileRangeAsByteBufAsync},
+     * so callers do not need to acquire/release it explicitly.
+     */
+    private CompletableFuture<ByteBuf> fetchBlockFromRemoteAsync(String p, long off, int len) {
+        int actualLength = (int) Math.min((long) len, totalSize - off);
+        if (actualLength <= 0) {
+            CompletableFuture<ByteBuf> failed = new CompletableFuture<>();
+            failed.completeExceptionally(new IOException(
+                    "Read past end of file: offset=" + off + " totalSize=" + totalSize));
+            return failed;
+        }
+        long startNanos = System.nanoTime();
+        return client.readFileRangeAsByteBufAsync(p, off, actualLength, writeBlockSize)
+                .whenComplete((fetched, err) -> {
+                    long elapsedNanos = System.nanoTime() - startNanos;
+                    if (err != null || fetched == null) {
+                        clientReadLatency.registerFailedEvent(elapsedNanos, TimeUnit.NANOSECONDS);
+                    } else {
+                        clientReadRequests.inc();
+                        clientReadBytes.addCount(fetched.readableBytes());
+                        clientReadLatency.registerSuccessfulEvent(elapsedNanos, TimeUnit.NANOSECONDS);
+                    }
+                });
+    }
+
+    /**
+     * Copies bytes {@code [offsetInBlock, offsetInBlock + length)} from a
+     * {@link ByteBuf} into a freshly-allocated on-heap {@link ByteBuffer}, then
+     * releases the source buffer. The returned {@link ByteBuffer} is
+     * independent of the pooled direct buffer.
+     */
+    private static ByteBuffer sliceToHeap(ByteBuf src, int offsetInBlock, int length) {
+        try {
+            byte[] out = new byte[length];
+            src.getBytes(offsetInBlock, out);
+            return ByteBuffer.wrap(out);
+        } finally {
+            ReferenceCountUtil.safeRelease(src);
         }
     }
 

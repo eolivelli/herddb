@@ -29,6 +29,8 @@ import io.netty.util.ReferenceCountUtil;
 import java.io.IOException;
 import java.util.Iterator;
 import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -66,6 +68,18 @@ public final class SegmentBlockCache {
         ByteBuf load(String path, long offset, int length) throws IOException;
     }
 
+    /**
+     * Async sibling of {@link BlockLoader}: returns a {@link CompletableFuture}
+     * that completes with a caller-owned {@link ByteBuf}. The cache takes
+     * ownership of the buffer on insert (refCnt → 2: one for the cache, one
+     * for the first caller) and releases its reference via the eviction
+     * listener, exactly like the sync path.
+     */
+    @FunctionalInterface
+    public interface AsyncBlockLoader {
+        CompletableFuture<ByteBuf> loadAsync(String path, long offset, int length);
+    }
+
     private static final SegmentBlockCache DISABLED = new SegmentBlockCache(0L);
 
     /**
@@ -80,6 +94,13 @@ public final class SegmentBlockCache {
 
     private final long maxBytes;
     private final Cache<BlockKey, ByteBuf> cache;
+    /**
+     * Tracks async loads currently in flight so that concurrent callers for the
+     * same {@code (path, blockIndex)} share a single network read (single-flight
+     * semantics). Non-null only when caching is enabled ({@code cache != null}).
+     * Entries are removed by the owning caller's {@code whenComplete} hook.
+     */
+    private final ConcurrentHashMap<BlockKey, CompletableFuture<ByteBuf>> inFlightAsync;
     // We track hit/miss/load stats ourselves because the only way to do an
     // atomic retain-under-lock is via asMap().compute(), and Caffeine's
     // recordStats() does not count compute() invocations as gets. Keeping our
@@ -96,6 +117,7 @@ public final class SegmentBlockCache {
         this.maxBytes = maxBytes;
         if (maxBytes <= 0) {
             this.cache = null;
+            this.inFlightAsync = null;
         } else {
             this.cache = Caffeine.newBuilder()
                     .maximumWeight(maxBytes)
@@ -120,6 +142,7 @@ public final class SegmentBlockCache {
                         ReferenceCountUtil.safeRelease(v);
                     })
                     .build();
+            this.inFlightAsync = new ConcurrentHashMap<>();
         }
     }
 
@@ -234,6 +257,155 @@ public final class SegmentBlockCache {
             // outstanding.
             retained.release();
         }
+    }
+
+    /**
+     * Async sibling of {@link #getBlock}: fetches the block at
+     * {@code (path, offset, length)} and returns a {@link CompletableFuture}
+     * that completes with a <em>caller-owned retained slice</em> of the cached
+     * buffer. Ownership rules are identical to those of {@link #getBlock}:
+     * the caller MUST release the returned {@link ByteBuf} exactly once; the
+     * cache's own reference is released on eviction.
+     *
+     * <p><b>Single-flight</b>: concurrent callers for the same
+     * {@code (path, blockIndex)} share a single in-flight loader call via
+     * {@link #inFlightAsync}. Piggybacking callers each receive an independent
+     * {@link ByteBuf#retainedSlice retained slice} of the winner's result,
+     * so they can release independently.
+     *
+     * <p><b>Stats</b>: hits and misses are recorded the same way as
+     * {@link #getBlock} — each piggybacking concurrent miss counts as a miss
+     * (unlike the sync path where concurrent callers serialise inside
+     * {@code compute()} and the later arrivals see a hit). This is a minor
+     * overcounting of misses that is documented here and accepted for
+     * simplicity.
+     *
+     * <p><b>Pass-through</b>: when the cache is disabled ({@code cache == null})
+     * the loader is invoked directly; load-time and success/failure stats are
+     * still tracked.
+     *
+     * @param path   logical multipart path
+     * @param offset block start, must be a multiple of {@code length}
+     * @param length block length in bytes (&gt; 0)
+     * @param loader invoked at most once per key on miss
+     * @return future completing with a caller-owned retained-slice {@link ByteBuf}
+     */
+    public CompletableFuture<ByteBuf> getBlockAsync(String path, long offset, int length,
+                                                    AsyncBlockLoader loader) {
+        Objects.requireNonNull(path, "path");
+        Objects.requireNonNull(loader, "loader");
+        if (length <= 0) {
+            throw new IllegalArgumentException("length must be > 0, got " + length);
+        }
+        if (offset < 0) {
+            throw new IllegalArgumentException("offset must be >= 0, got " + offset);
+        }
+
+        if (cache == null) {
+            // Pass-through: no retain/release dance, just track load stats.
+            long startNanos = System.nanoTime();
+            return loader.loadAsync(path, offset, length).whenComplete((buf, err) -> {
+                loadTimeNanos.addAndGet(System.nanoTime() - startNanos);
+                if (err != null || buf == null) {
+                    loadFailure.incrementAndGet();
+                } else {
+                    loadSuccess.incrementAndGet();
+                }
+            });
+        }
+
+        long blockIndex = offset / length;
+        BlockKey key = new BlockKey(path, blockIndex);
+
+        // --- Fast path: check cache with atomic retain-under-lock ---
+        // Use computeIfPresent so the retain and the entry-present check are
+        // serialised with the removal listener, exactly as in getBlock().
+        ByteBuf[] retained = new ByteBuf[1];
+        cache.asMap().computeIfPresent(key, (k, existing) -> {
+            hits.incrementAndGet();
+            existing.retain();
+            retained[0] = existing;
+            return existing;
+        });
+        if (retained[0] != null) {
+            ByteBuf slice = retained[0].retainedSlice(0, retained[0].readableBytes());
+            retained[0].release();
+            return CompletableFuture.completedFuture(slice);
+        }
+
+        // --- Miss path: single-flight via inFlightAsync ---
+        // putIfAbsent is atomic; only the first thread for this key proceeds
+        // as the "owner" that fires the loader. All others piggyback on the
+        // winner's future, each receiving their own retained slice.
+        CompletableFuture<ByteBuf> ourFuture = new CompletableFuture<>();
+        CompletableFuture<ByteBuf> existing = inFlightAsync.putIfAbsent(key, ourFuture);
+        if (existing != null) {
+            // Piggyback: return an independent retained slice from the winner.
+            // We deliberately do NOT increment misses here — the in-flight
+            // owner already counted the miss.
+            return existing.thenApply(b -> b.retainedSlice(0, b.readableBytes()));
+        }
+
+        // We are the in-flight owner.
+        misses.incrementAndGet();
+        long startNanos = System.nanoTime();
+        loader.loadAsync(path, offset, length).whenComplete((loaded, err) -> {
+            loadTimeNanos.addAndGet(System.nanoTime() - startNanos);
+            inFlightAsync.remove(key, ourFuture);
+
+            if (err != null) {
+                loadFailure.incrementAndGet();
+                ourFuture.completeExceptionally(err);
+                return;
+            }
+            if (loaded == null) {
+                loadFailure.incrementAndGet();
+                ourFuture.completeExceptionally(new IOException(
+                        "loader returned null for " + path + "@" + offset));
+                return;
+            }
+            loadSuccess.incrementAndGet();
+
+            // Adopt into Caffeine cache. retain() brings refCnt from 1 → 2
+            // (1 for the cache's eviction-listener release, 1 for the caller
+            // slice we are about to create).
+            loaded.retain();
+
+            // compute() serialises with any concurrent sync getBlock() call on
+            // the same key: if another thread raced and inserted first, we
+            // discard our 'loaded' and build the caller slice from what's
+            // already there.
+            ByteBuf[] inserted = new ByteBuf[1];
+            cache.asMap().compute(key, (k, prev) -> {
+                if (prev != null) {
+                    // Concurrent sync insert won the race. Retain prev so we
+                    // can build a caller slice outside compute().
+                    prev.retain();
+                    inserted[0] = prev;
+                    return prev;
+                }
+                inserted[0] = loaded;
+                return loaded; // cache takes the extra retain we did above
+            });
+
+            if (inserted[0] == loaded) {
+                // We inserted successfully.
+                // refCnt = 2: cache ref (released on eviction) + slice ref.
+                ByteBuf slice = loaded.retainedSlice(0, loaded.readableBytes());
+                // Drop the "original" ref the loader gave us; cache holds its ref.
+                loaded.release();
+                ourFuture.complete(slice);
+            } else {
+                // concurrent sync call already inserted an entry; discard ours.
+                // loaded: refCnt=2 (original + our retain) — release both.
+                loaded.release(2);
+                // inserted[0] = prev, retained once inside compute().
+                ByteBuf slice = inserted[0].retainedSlice(0, inserted[0].readableBytes());
+                inserted[0].release();
+                ourFuture.complete(slice);
+            }
+        });
+        return ourFuture;
     }
 
     private ByteBuf invokeLoader(BlockLoader loader, String path, long offset, int length)

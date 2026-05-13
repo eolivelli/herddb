@@ -810,6 +810,16 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                             vectorCompactionLocalKickFraction,
                             vectorCompactionLocalEnabledWithOptimizer,
                             vectorCompactionStreamingEnabled});
+            // Async IO pipeline for FusedPQ search (issue #547).
+            // Config key takes precedence over the system property.
+            final boolean vectorSearchAsyncPipelineEnabled = config.getBoolean(
+                    IndexingServerConfiguration.PROPERTY_VECTOR_SEARCH_ASYNC_PIPELINE_ENABLED,
+                    Boolean.getBoolean(
+                            IndexingServerConfiguration.SYSPROP_VECTOR_SEARCH_ASYNC_PIPELINE_ENABLED));
+            herddb.index.vector.PersistentVectorStore.setSearchAsyncPipelineEnabled(
+                    vectorSearchAsyncPipelineEnabled);
+            LOGGER.log(Level.INFO, "vector search async IO pipeline (issue #547): enabled={0}",
+                    vectorSearchAsyncPipelineEnabled);
             final long maxLiveBytesPerCheckpoint = config.getLong(
                     IndexingServerConfiguration.PROPERTY_VECTOR_MAX_LIVE_BYTES_PER_CHECKPOINT,
                     IndexingServerConfiguration.PROPERTY_VECTOR_MAX_LIVE_BYTES_PER_CHECKPOINT_DEFAULT);
