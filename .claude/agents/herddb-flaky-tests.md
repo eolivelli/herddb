@@ -109,7 +109,7 @@ Cap at 400 lines per run to keep the context budget bounded.
 
 ### B.2 Identify the failure category
 
-If the failed job name is `Build and validate` (checkstyle / RAT /
+If the failed job name is `Build and validate` (Spotless / RAT /
 SpotBugs) the run is a build/lint failure, **not** a flaky-test
 candidate. Record it in the build/lint bucket only and skip the rest of
 Phase B for this run.

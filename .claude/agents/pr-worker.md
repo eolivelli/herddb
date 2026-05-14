@@ -196,7 +196,9 @@ mvn -pl herddb-utils \
 
 **Pre-PR validation:**
 ```
-mvn -B checkstyle:check apache-rat:check spotbugs:check \
+mvn -B spotless:apply -DskipTests \
+    -Dmaven.repo.local=$MAVEN_REPO
+mvn -B spotless:check apache-rat:check spotbugs:check \
     install -DskipTests -Pci \
     -Dmaven.repo.local=$MAVEN_REPO
 ```
@@ -244,12 +246,15 @@ signal. If the user gives revision feedback, update the plan and stop again.
 ## Phase E — Validation + commit + PR
 
 ### E.1 Pre-PR validation (must be green)
+First auto-fix formatting with Spotless, then run the full validation:
 ```
-mvn -B checkstyle:check apache-rat:check spotbugs:check \
+mvn -B spotless:apply -DskipTests \
+    -Dmaven.repo.local=$MAVEN_REPO
+mvn -B spotless:check apache-rat:check spotbugs:check \
     install -DskipTests -Pci \
     -Dmaven.repo.local=$MAVEN_REPO
 ```
-Fix every checkstyle, Apache RAT, or SpotBugs violation before continuing.
+Fix every Spotless, Apache RAT, or SpotBugs violation before continuing.
 
 ### E.2 Commit
 Stage specific files only — never `git add -A` or `git add .`:

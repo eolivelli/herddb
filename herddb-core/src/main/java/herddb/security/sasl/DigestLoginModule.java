@@ -57,4 +57,3 @@ public class DigestLoginModule  implements LoginModule {
         return true;
     }
 }
-

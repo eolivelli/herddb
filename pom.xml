@@ -113,7 +113,7 @@
         <libs.spotbugsannotations>4.9.8</libs.spotbugsannotations>
         <libs.spotbugsmaven>4.9.8.2</libs.spotbugsmaven>
         <fbs.version>1.9.0</fbs.version>
-        <checkstyle.version>10.4</checkstyle.version>
+        <libs.spotless>3.4.0</libs.spotless>
         <libs.grpc>1.68.2</libs.grpc>
         <libs.protobuf>3.25.5</libs.protobuf>
         <libs.caffeine>3.1.8</libs.caffeine>
@@ -544,29 +544,53 @@
         <pluginManagement>
             <plugins>
                 <plugin>
-                    <groupId>org.apache.maven.plugins</groupId>
-                    <artifactId>maven-checkstyle-plugin</artifactId>
-                    <version>3.1.1</version>
-                    <dependencies>
-                        <dependency>
-                            <groupId>com.puppycrawl.tools</groupId>
-                            <artifactId>checkstyle</artifactId>
-                            <version>${checkstyle.version}</version>
-                        </dependency>
-                    </dependencies>
+                    <!--
+                        Spotless replaces the previous maven-checkstyle-plugin
+                        setup (see issue #544). Agents and contributors run
+                        `mvn spotless:apply` to auto-fix formatting, and CI
+                        runs `mvn spotless:check` to validate. The rules below
+                        mirror the auto-fixable subset of the old checkstyle
+                        config that we can apply without forcing a large
+                        per-file diff: no unused imports, no trailing
+                        whitespace, single trailing newline, and no tab
+                        characters (4-space indentation).
+
+                        Note: we intentionally do NOT enable Spotless's
+                        importOrder step. In Spotless 3.4.0, importOrder
+                        always inserts a blank line between import groups,
+                        which is not configurable at the Maven layer and
+                        would touch hundreds of files in the existing
+                        codebase for a purely stylistic change. Import
+                        ordering is therefore left to contributors and IDE
+                        conventions, same as it would be after dropping
+                        checkstyle's ImportOrder rule.
+                    -->
+                    <groupId>com.diffplug.spotless</groupId>
+                    <artifactId>spotless-maven-plugin</artifactId>
+                    <version>${libs.spotless}</version>
                     <configuration>
-                        <configLocation>checkstyle.xml</configLocation>
-                        <suppressionsLocation>suppressions.xml</suppressionsLocation>
-                        <encoding>UTF-8</encoding>
-                        <consoleOutput>true</consoleOutput>
-                        <failOnViolation>true</failOnViolation>
-                        <includeResources>false</includeResources>
-                        <includeTestSourceDirectory>true</includeTestSourceDirectory>
-                        <includeTestResources>false</includeTestResources>
+                        <java>
+                            <includes>
+                                <include>src/main/java/**/*.java</include>
+                                <include>src/test/java/**/*.java</include>
+                            </includes>
+                            <excludes>
+                                <exclude>**/generated/**/*.java</exclude>
+                                <exclude>**/generated-sources/**/*.java</exclude>
+                                <exclude>**/generated-test-sources/**/*.java</exclude>
+                            </excludes>
+                            <removeUnusedImports/>
+                            <trimTrailingWhitespace/>
+                            <endWithNewline/>
+                            <indent>
+                                <spaces>true</spaces>
+                                <spacesPerTab>4</spacesPerTab>
+                            </indent>
+                        </java>
                     </configuration>
                     <executions>
                         <execution>
-                            <id>checkstyle</id>
+                            <id>spotless-check</id>
                             <phase>validate</phase>
                             <goals>
                                 <goal>check</goal>
@@ -632,7 +656,6 @@
 				<!-- IDE files (eclipse & intellij) -->
 				<exclude>**/.classpath</exclude>
 				<exclude>**/.project</exclude>
-				<exclude>**/.checkstyle</exclude>
 				<exclude>**/.settings/*</exclude>
 				<exclude>**/*.iml</exclude>
 				<exclude>**/*.iws</exclude>

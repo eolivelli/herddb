@@ -56,11 +56,14 @@ Never push commits directly to the `master` branch. Always create a feature bran
 open a pull request so that CI runs and changes can be reviewed before merging.
 
 ## Before Sending a PR
-Run the code validation checks locally before opening a pull request:
+First auto-fix formatting (unused imports, trailing whitespace, trailing
+newline, tabs → spaces) with Spotless, then run the code validation checks
+locally before opening a pull request:
 ```
-mvn -B checkstyle:check apache-rat:check spotbugs:check install -DskipTests -Pci
+mvn -B spotless:apply -DskipTests
+mvn -B spotless:check apache-rat:check spotbugs:check install -DskipTests -Pci
 ```
-This matches what `.github/workflows/pr-validation.yml` runs in CI (checkstyle, Apache RAT license headers, SpotBugs).
+This matches what `.github/workflows/ci.yml` runs in CI (spotless, Apache RAT license headers, SpotBugs).
 
 For any change related to indexes, checkpoints, or concurrency, also run every
 subclass of `DirectMultipleConcurrentUpdatesSuite` (in

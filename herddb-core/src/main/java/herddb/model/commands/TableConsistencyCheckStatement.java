@@ -32,4 +32,3 @@ public final class TableConsistencyCheckStatement extends TableAwareStatement {
     }
 
 }
-
