@@ -32,7 +32,7 @@ These are the GitHub Actions workflows configured for the repository:
 
 | Workflow file | Job | What it checks |
 |---|---|---|
-| `ci.yml` | Build and validate | Build + checkstyle + Apache RAT + SpotBugs |
+| `ci.yml` | Build and validate | Build + Spotless + Apache RAT + SpotBugs |
 | `ci.yml` | HerdDB Core tests | herddb-core non-cluster tests |
 | `ci.yml` | HerdDB Core Cluster tests | herddb-core cluster tests |
 | `ci.yml` | Other modules tests | All modules except core, remote-file-service, indexing-service |
@@ -97,7 +97,7 @@ For each failed check:
    - `Tests run:.*Errors:`
    - `Exception`, `Error` (Java stack traces)
    - `FAILED`
-   - `checkstyle`, `spotbugs`, `rat` violations
+   - `spotless`, `spotbugs`, `rat` violations
 
 Return this format:
 

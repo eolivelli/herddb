@@ -88,8 +88,8 @@ jobs:
         with:
           java-version: '25'
           distribution: 'oracle'
-      - name: 'Build with Maven (with checkstyle, rat, spotbugs)'
-        run: mvn -B checkstyle:check apache-rat:check install -DskipTests spotbugs:check -Dmaven.test.redirectTestOutputToFile=true -Dherddb.file.requirefsync=false --file pom.xml -Pci
+      - name: 'Build with Maven (with spotless, rat, spotbugs)'
+        run: mvn -B spotless:check apache-rat:check install -DskipTests spotbugs:check -Dmaven.test.redirectTestOutputToFile=true -Dherddb.file.requirefsync=false --file pom.xml -Pci
       - name: 'Upload build artifacts'
         uses: actions/upload-artifact@v4
         with:
