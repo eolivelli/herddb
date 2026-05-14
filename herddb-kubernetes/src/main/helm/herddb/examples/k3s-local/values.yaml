@@ -310,7 +310,7 @@ indexingService:
   # drove IS heap to 91% during a bigann-200M run (issue #180). 1000 leaves
   # the steady-state throughput headroom while cutting the retained working
   # set by 10x.
-  javaOpts: "-Xms7g -Xmx7g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector -Dio.netty.maxDirectMemory=6442450944 -XX:MaxDirectMemorySize=6g -Dio.netty.allocator.numDirectArenas=8 -Dherddb.commitlog.tailbatchsize=1000"
+  javaOpts: "-Xms7g -Xmx7g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector -Dio.netty.maxDirectMemory=6442450944 -XX:MaxDirectMemorySize=6g -Dio.netty.allocator.numDirectArenas=8 -Dherddb.commitlog.tailbatchsize=1000 -Dherddb.vectorindex.streamingCompactionEnabled=false"
   storage:
     data:
       size: 5Gi
@@ -358,20 +358,25 @@ indexingService:
     # 64 MiB caps the queue at 16 in-flight blocks (vs. ~165 unbounded)
     # so concurrent ANN reads are not starved on the shared event-loop
     # pool / file server.
-    remote.file.client.max.inflight.write.bytes: "67108864"
+    remote.file.client.max.inflight.write.bytes: "536870912"   # 512 MiB (raised from 64 MiB; Run 7 showed the 64 MiB cap stalled the IS tailer for 10+ min during Phase B concurrent segment uploads)
     # BookKeeper V2 wire protocol for the IS commit-log tailer (no protobuf framing
     # on readEntries). Code-level default since issue #392; kept here explicitly
     # for parity with the GKE example. Set to "false" to fall back to V3.
     bookkeeper.useV2WireProtocol: "true"
-    # Raise the live-graph (in-memory HNSW shard) size from the built-in default
-    # of 50000 to 200000 vectors per shard. Larger shards reduce the total number
-    # of segments created during ingest (fewer, bigger segments), which benefits
-    # both checkpoint Phase B merge time and ANN recall accuracy because a single
-    # HNSW graph is searched without cross-segment merging overhead.
-    # Memory impact: gist1m 960-dim, M=16 → ~200k × (16×2×4 B edges + 960×4 B
-    # vector) = ~900 MB heap per live shard. One shard per IS replica fits within
-    # the 7g heap budget; raise heap if using more concurrent shards or larger dims.
-    indexing.vector.maxLiveGraphSize: "200000"
+    # Live-graph (in-memory HNSW shard) size set to 100,000 vectors per shard.
+    # Larger shards produce fewer, larger segments compared to 50k, reducing the
+    # total number of IS-local compaction cycles during bigann-100M ingest.
+    # At 100k vectors/shard the jvector OnDiskGraphIndexCompactor finishes each
+    # merge in reasonable time while keeping segment count well below the
+    # back-pressure threshold (80) with the optimizer enabled.
+    # Memory impact: bigann 128-dim, M=16 → ~100k × (16×2×4 B edges + 128×4 B
+    # vector) = ~64 MB heap per live shard (well within the 7g IS heap budget).
+    indexing.vector.maxLiveGraphSize: "100000"
+    # Cap segment count at 80 to prevent heap exhaustion (issue #534).
+    # IS-local fallback kicks at 70% × 80 = 56 segments; full back-pressure
+    # (tailer blocks) at 80. Prevents the 150+ segment explosion observed
+    # during bigann-100M ingest with the default threshold of 500.
+    vector.index.compaction.backpressure.segments: "80"
   resources:
     requests:
       memory: "20Gi"
@@ -390,16 +395,6 @@ indexOptimizer:
   # fallback for the rare case ZK delivers no event. 5 min is fine for bench
   # workloads; production may want longer.
   intervalMs: 300000
-  # Issue #484: aggressive merge policy + RemoteSegmentMerger require a
-  # vector dimension up-front (SegmentMetadata znodes do NOT carry it).
-  # Override per-bench: GIST1M is 960, SIFT* is 128, etc.
-  merger:
-    dim: 960
-    M: 16
-    beamWidth: 100
-    neighborOverflow: 1.2
-    alpha: 1.4
-    similarity: "DOT_PRODUCT"
   # Memory budget for gist1m M=16 merges (issue #499 Bug 1).
   #
   # For a full 8-segment gist1m merge (8 × ~125k vectors, 960-dim):
@@ -446,7 +441,12 @@ indexOptimizer:
   #   Overlap at 94% batches: JVM + /tmp_graph + residual_page_cache > 20 GiB
   # Set limit=28Gi to accommodate the full 1M convergence merge.
   # Kernel reclaims file-backed pages aggressively, so host RAM is not exhausted.
-  javaOpts: "-Xms512m -Xmx2g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector -XX:MaxDirectMemorySize=1g"
+  remoteFileClient:
+    # Raised from 256 MiB default to 512 MiB to match the IS write-buffer bump.
+    # Run 7 showed the 64 MiB IS write cap stalled Phase B uploads; the optimizer
+    # merges much larger segments and needs at least as much write headroom.
+    maxInflightWriteBytes: "536870912"   # 512 MiB
+  javaOpts: "-Xms512m -Xmx2g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector -XX:MaxDirectMemorySize=1g -Dherddb.vectorindex.streamingCompactionEnabled=false"
   resources:
     requests:
       memory: "2Gi"

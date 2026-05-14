@@ -6,6 +6,9 @@
 # Usage (heap dump):
 #   ./scripts/diagnostics.sh [--pod <pod>] [--analyze] [--mat-home <path>]
 #
+# Usage (class histogram):
+#   ./scripts/diagnostics.sh --pod <pod> --histo [--histo-live]
+#
 # Usage (async-profiler profiles):
 #   ./scripts/diagnostics.sh --pod <pod> --profile \
 #       [--profile-duration <secs>] [--profiler-home <path>]
@@ -14,6 +17,7 @@
 #   --pod               herddb-file-server-0
 #   --analyze           disabled (pass --analyze to run MAT after download)
 #   --mat-home          $MAT_HOME or ~/mat
+#   --histo-live        disabled (pass --histo-live to force GC before histogram)
 #   --profile-duration  30  (total seconds for the single JFR recording)
 #   --profiler-home     $PROFILER_HOME  (local async-profiler distribution
 #                       containing lib/jfr-converter.jar)
@@ -22,6 +26,11 @@
 #   Prints  HEAP_DUMP=<local-path>  on the last line on success.
 #   If --analyze is passed also prints  MAT_REPORT=<dir>  pointing at the
 #   MAT "leak_suspects" report directory.
+#
+# Output (class histogram):
+#   Runs  jcmd <pid> GC.class_histogram  inside the pod, downloads the output
+#   to a local text file, and prints HISTO=<local-path> on the last line.
+#   With --histo-live, first triggers a full GC so only live objects appear.
 #
 # Output (profiles):
 #   Runs async-profiler once (--all, ${PROFILE_DURATION}s) inside the pod
@@ -48,6 +57,8 @@ source "$SCRIPT_DIR/common.sh"
 POD="herddb-file-server-0"
 ANALYZE=false
 MAT_HOME="${MAT_HOME:-${HOME}/mat}"
+HISTO=false
+HISTO_LIVE=false
 PROFILE=false
 PROFILE_DURATION=30
 PROFILER_HOME="${PROFILER_HOME:-}"
@@ -57,6 +68,8 @@ while [[ $# -gt 0 ]]; do
         --pod)               POD="$2";               shift 2 ;;
         --analyze)           ANALYZE=true;            shift   ;;
         --mat-home)          MAT_HOME="$2";           shift 2 ;;
+        --histo)             HISTO=true;              shift   ;;
+        --histo-live)        HISTO_LIVE=true;         shift   ;;
         --profile)           PROFILE=true;            shift   ;;
         --profile-duration)  PROFILE_DURATION="$2";  shift 2 ;;
         --profiler-home)     PROFILER_HOME="$2";     shift 2 ;;
@@ -129,6 +142,50 @@ if $PROFILE; then
 
     echo ""
     echo "PROFILES_DIR=$LOCAL_DIR"
+    exit 0
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# HISTO MODE — jcmd GC.class_histogram (equivalent to jmap -histo)
+# ═══════════════════════════════════════════════════════════════════════════════
+if $HISTO; then
+    section "JVM class histogram from pod $POD"
+
+    # ── 1. Find the JVM PID ──────────────────────────────────────────────────
+    echo "  Locating JVM PID..."
+    JVM_PID=$(kubectl -n default exec "$POD" -- sh -c \
+        'jps 2>/dev/null | grep -v "^[0-9]* Jps$" | head -1 | cut -d" " -f1')
+    if [[ -z "$JVM_PID" ]]; then
+        echo "ERROR: could not determine JVM PID in $POD (is jps available?)" >&2
+        exit 1
+    fi
+    echo "  JVM PID: $JVM_PID"
+
+    # ── 2. Optional full-GC before histogram to show only live objects ────────
+    if $HISTO_LIVE; then
+        echo "  Triggering full GC (--histo-live) ..."
+        kubectl -n default exec "$POD" -- jcmd "$JVM_PID" GC.run 2>&1 || true
+        sleep 2
+    fi
+
+    # ── 3. Collect histogram inside the pod and write to /tmp ─────────────────
+    TS_POD="$(date +%Y%m%d-%H%M%S)"
+    REMOTE_HISTO="/tmp/histo-${TS_POD}.txt"
+    echo "  Running jcmd GC.class_histogram (top-300 classes) ..."
+    kubectl -n default exec "$POD" -- sh -c \
+        "jcmd ${JVM_PID} GC.class_histogram 2>&1 | head -310 > ${REMOTE_HISTO}"
+
+    # ── 4. Download and display ───────────────────────────────────────────────
+    TS_LOCAL="$(timestamp)"
+    LOCAL_HISTO="$REPORTS_DIR/histo-${POD}-${TS_LOCAL}.txt"
+    kubectl -n default cp "${POD}:${REMOTE_HISTO}" "$LOCAL_HISTO"
+    kubectl -n default exec "$POD" -- rm -f "$REMOTE_HISTO" || true
+
+    echo ""
+    echo "=== Top heap consumers (num_instances  num_bytes  class_name) ==="
+    cat "$LOCAL_HISTO"
+    echo ""
+    echo "HISTO=$LOCAL_HISTO"
     exit 0
 fi
 
