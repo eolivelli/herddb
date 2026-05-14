@@ -20,6 +20,7 @@
 package herddb.indexing.segment;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -28,6 +29,7 @@ import java.util.Optional;
 import java.util.function.Supplier;
 import org.apache.zookeeper.CreateMode;
 import org.apache.zookeeper.KeeperException;
+import org.apache.zookeeper.Op;
 import org.apache.zookeeper.Watcher;
 import org.apache.zookeeper.ZooDefs;
 import org.apache.zookeeper.ZooKeeper;
@@ -61,6 +63,20 @@ public final class SegmentRegistryClient {
     public static final String REGISTRY_SUBPATH = "/index-segments";
 
     /**
+     * Sub-path appended to the ZK base path for the per-segment swap-ack
+     * subtree (issue #555). Layout:
+     * <pre>
+     *   {basePath}/index-segments-acks/                  (PERSISTENT, root)
+     *   {basePath}/index-segments-acks/{segmentUuid}/    (PERSISTENT, created when PROVISIONAL is staged)
+     *   {basePath}/index-segments-acks/{segmentUuid}/{serviceId}  (EPHEMERAL, created by each interested IS pod after adoptExternalSegment)
+     * </pre>
+     * Stored OUTSIDE the segment znode tree on purpose: {@link #casDeleteSegment}
+     * requires the segment znode to be childless, and a per-segment acks
+     * subtree under the segment would block deletion at retention time.
+     */
+    public static final String ACKS_SUBPATH = "/index-segments-acks";
+
+    /**
      * Number of attempts for a ZK operation that fails with
      * {@link KeeperException.ConnectionLossException} (review item D4).
      * Bounded — each retry waits {@link #RETRY_BACKOFF_MS} so we never busy-loop.
@@ -72,6 +88,7 @@ public final class SegmentRegistryClient {
 
     private final Supplier<ZooKeeper> zkSupplier;
     private final String registryRootPath;
+    private final String acksRootPath;
 
     /**
      * @param zkSupplier returns a live, connected {@link ZooKeeper} instance. The
@@ -84,6 +101,7 @@ public final class SegmentRegistryClient {
         this.zkSupplier = Objects.requireNonNull(zkSupplier, "zkSupplier");
         Objects.requireNonNull(basePath, "basePath");
         this.registryRootPath = basePath + REGISTRY_SUBPATH;
+        this.acksRootPath = basePath + ACKS_SUBPATH;
     }
 
     /**
@@ -115,17 +133,43 @@ public final class SegmentRegistryClient {
     }
 
     /**
-     * Creates the registry root znode if it does not exist. Idempotent. Call once at
+     * Returns the absolute ZK path of the acks subtree root.
+     */
+    public String getAcksRootPath() {
+        return acksRootPath;
+    }
+
+    /**
+     * Returns the absolute ZK path of the per-segment acks parent znode
+     * (PERSISTENT, holds ephemeral child znodes from each interested IS pod).
+     */
+    public String acksParentPath(String segmentUuid) {
+        return acksRootPath + "/" + segmentUuid;
+    }
+
+    /**
+     * Returns the absolute ZK path of an ack znode owned by a specific IS pod
+     * (EPHEMERAL, dies with the IS pod's ZK session).
+     */
+    public String ackPath(String segmentUuid, String serviceId) {
+        return acksParentPath(segmentUuid) + "/" + serviceId;
+    }
+
+    /**
+     * Creates the registry roots if they do not exist. Idempotent. Call once at
      * startup (the IS already does this for its own metadata; the optimizer will too).
      */
     public void ensureRoot() throws SegmentRegistryException {
         try {
             createIfMissing(registryRootPath);
+            createIfMissing(acksRootPath);
         } catch (KeeperException | InterruptedException e) {
             if (e instanceof InterruptedException) {
                 Thread.currentThread().interrupt();
             }
-            throw new SegmentRegistryException("failed to ensure registry root " + registryRootPath, e);
+            throw new SegmentRegistryException(
+                    "failed to ensure registry roots " + registryRootPath
+                            + " / " + acksRootPath, e);
         }
     }
 
@@ -319,6 +363,254 @@ public final class SegmentRegistryClient {
                 Thread.currentThread().interrupt();
             }
             throw new SegmentRegistryException("failed to delete segment " + previous.getSegmentUuid(), e);
+        }
+    }
+
+    /**
+     * Atomically swaps a PROVISIONAL output to ACTIVE and every input from
+     * ACTIVE to DEPRECATED (with {@code replacedBy=[output.uuid]} and
+     * {@code retentionUntilEpochMillis}) inside a single {@code ZooKeeper.multi(...)}
+     * transaction. This is the issue #555 fix: the swap is observable as
+     * either "before" or "after" by every watcher snapshot — never a partial
+     * "output ACTIVE without inputs DEPRECATED" or "inputs DEPRECATED without
+     * output ACTIVE" intermediate state.
+     *
+     * <p>Behaviour:
+     * <ul>
+     *   <li>{@code provisional.metadata().getState()} must be
+     *       {@link SegmentState#PROVISIONAL}. The committed output carries the
+     *       same metadata with {@code state=ACTIVE}.</li>
+     *   <li>Every input must be in {@link SegmentState#ACTIVE}; the new state
+     *       carries {@code replacedBy=[output.uuid]} +
+     *       {@code retentionUntilEpochMillis}.</li>
+     *   <li>On {@code BadVersionException} or {@code NoNodeException} from any
+     *       element, the entire multi-op rolls back and the caller receives a
+     *       {@link SegmentRegistryException.VersionMismatch} (we surface the
+     *       offending UUID so the caller can re-read and decide whether to
+     *       retry or abort).</li>
+     * </ul>
+     *
+     * <p>Hot-path note: {@code ZooKeeper.multi} is one round-trip with one
+     * server-side transaction, so the cost is comparable to a single CAS no
+     * matter how many inputs are deprecated together.
+     *
+     * @return the committed output as a {@link VersionedSegmentMetadata} (the
+     *     znode version is bumped by ZK from {@code provisional.zkVersion()};
+     *     we read it back via {@link #getSegment} because {@code multi} does
+     *     not return per-op stats for {@code setData}).
+     */
+    public VersionedSegmentMetadata atomicSwap(VersionedSegmentMetadata provisional,
+                                               List<VersionedSegmentMetadata> inputsToDeprecate,
+                                               long retentionUntilEpochMillis)
+            throws SegmentRegistryException {
+        Objects.requireNonNull(provisional, "provisional");
+        Objects.requireNonNull(inputsToDeprecate, "inputsToDeprecate");
+        SegmentMetadata provMeta = provisional.metadata();
+        if (provMeta.getState() != SegmentState.PROVISIONAL) {
+            throw new IllegalStateException(
+                    "atomicSwap: expected output " + provMeta.getSegmentUuid()
+                            + " to be PROVISIONAL, was " + provMeta.getState());
+        }
+        SegmentMetadata committed = provMeta.toBuilder()
+                .state(SegmentState.ACTIVE)
+                .build();
+        String committedPath = segmentPath(committed.getTablespaceUuid(),
+                committed.getIndexUuid(), committed.getSegmentUuid());
+
+        List<Op> ops = new ArrayList<>(1 + inputsToDeprecate.size());
+        ops.add(Op.setData(committedPath, committed.serialize(), provisional.zkVersion()));
+        for (VersionedSegmentMetadata in : inputsToDeprecate) {
+            SegmentMetadata inMeta = in.metadata();
+            if (inMeta.getState() != SegmentState.ACTIVE) {
+                throw new IllegalStateException(
+                        "atomicSwap: expected input " + inMeta.getSegmentUuid()
+                                + " to be ACTIVE, was " + inMeta.getState());
+            }
+            SegmentMetadata deprecated = inMeta.toBuilder()
+                    .state(SegmentState.DEPRECATED)
+                    .replacedBy(Collections.singletonList(committed.getSegmentUuid()))
+                    .retentionUntilEpochMillis(retentionUntilEpochMillis)
+                    .build();
+            String inPath = segmentPath(inMeta.getTablespaceUuid(),
+                    inMeta.getIndexUuid(), inMeta.getSegmentUuid());
+            ops.add(Op.setData(inPath, deprecated.serialize(), in.zkVersion()));
+        }
+
+        try {
+            withConnectionLossRetry("atomicSwap(" + committed.getSegmentUuid() + ")",
+                    (ZkOperation<Void>) () -> {
+                        zk().multi(ops);
+                        return null;
+                    });
+        } catch (KeeperException.BadVersionException badVersion) {
+            throw new SegmentRegistryException.VersionMismatch(
+                    committed.getSegmentUuid(), provisional.zkVersion());
+        } catch (KeeperException.NoNodeException missing) {
+            throw new SegmentRegistryException.SegmentNotFound(committed.getSegmentUuid());
+        } catch (KeeperException e) {
+            // multi() collapses per-op failures into the first one's exception type.
+            // Other KeeperException subclasses (e.g. session expired, unsupported)
+            // bubble up here; surface as a generic registry failure.
+            throw new SegmentRegistryException(
+                    "atomicSwap(" + committed.getSegmentUuid() + ") failed", e);
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            throw new SegmentRegistryException(
+                    "atomicSwap(" + committed.getSegmentUuid() + ") interrupted", ie);
+        } catch (IOException io) {
+            // Comes from withConnectionLossRetry signature; not actually thrown by the lambda.
+            throw new SegmentRegistryException(
+                    "atomicSwap(" + committed.getSegmentUuid() + ") I/O", io);
+        }
+
+        // Re-read the committed znode to capture the new zkVersion bumped by setData.
+        Optional<VersionedSegmentMetadata> reread = getSegment(
+                committed.getTablespaceUuid(), committed.getIndexUuid(),
+                committed.getSegmentUuid());
+        return reread.orElseThrow(() -> new SegmentRegistryException(
+                "atomicSwap succeeded but committed znode for "
+                        + committed.getSegmentUuid() + " was deleted out from under us"));
+    }
+
+    /**
+     * Best-effort no-op-if-already-present create of the persistent parent
+     * for ack ephemeral children (issue #555). The optimizer calls this
+     * right after staging a {@code PROVISIONAL} output so that IS pods can
+     * subsequently create ephemeral children even if the optimizer pod that
+     * staged it dies before the first ack arrives.
+     */
+    public void createSwapAckParent(String segmentUuid) throws SegmentRegistryException {
+        Objects.requireNonNull(segmentUuid, "segmentUuid");
+        try {
+            createIfMissing(acksRootPath);
+            withConnectionLossRetry("createSwapAckParent(" + segmentUuid + ")", () -> {
+                try {
+                    zk().create(acksParentPath(segmentUuid), new byte[0],
+                            ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+                } catch (KeeperException.NodeExistsException ok) {
+                    // idempotent — orphan recovery may re-stage onto an existing parent
+                }
+                return null;
+            });
+        } catch (KeeperException | InterruptedException | IOException e) {
+            if (e instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+            throw new SegmentRegistryException(
+                    "failed to create swap-ack parent for " + segmentUuid, e);
+        }
+    }
+
+    /**
+     * Creates the ephemeral ack znode for the given (segmentUuid, serviceId)
+     * pair. Called by each interested IS pod after a successful
+     * {@code adoptExternalSegment} (issue #555). Idempotent on
+     * {@link KeeperException.NodeExistsException} so a watcher re-fire does
+     * not raise.
+     *
+     * <p>The znode payload is the {@code serviceId} as UTF-8 bytes so operators
+     * inspecting ZK can see which pod made the ack.
+     */
+    public void createSwapAckNode(String segmentUuid, String serviceId)
+            throws SegmentRegistryException {
+        Objects.requireNonNull(segmentUuid, "segmentUuid");
+        Objects.requireNonNull(serviceId, "serviceId");
+        String path = ackPath(segmentUuid, serviceId);
+        try {
+            withConnectionLossRetry("createSwapAckNode(" + segmentUuid + "/" + serviceId + ")", () -> {
+                try {
+                    zk().create(path, serviceId.getBytes(StandardCharsets.UTF_8),
+                            ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.EPHEMERAL);
+                } catch (KeeperException.NodeExistsException ok) {
+                    // Another adoption (or watcher refresh on the same pod) already
+                    // wrote the ack. Idempotent: the ack semantically asserts "this
+                    // pod has the segment loaded", so multiple writes converge.
+                }
+                return null;
+            });
+        } catch (KeeperException.NoNodeException missingParent) {
+            // The parent acks subtree was already torn down by the swap-completion
+            // path (multi-op already committed) or by the abort path. Either way,
+            // the IS pod's ack is no longer needed.
+        } catch (KeeperException | InterruptedException | IOException e) {
+            if (e instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+            throw new SegmentRegistryException(
+                    "failed to create swap-ack node for "
+                            + segmentUuid + "/" + serviceId, e);
+        }
+    }
+
+    /**
+     * Lists the {@code serviceId}s that currently have an ephemeral ack znode
+     * under the per-segment acks parent. Returns an empty list when the parent
+     * does not exist (e.g. acks already torn down, or never staged). Used by
+     * the consumer to decide whether to fire the multi-op or keep waiting.
+     */
+    public List<String> listSwapAcks(String segmentUuid, Watcher childrenWatcher)
+            throws SegmentRegistryException {
+        Objects.requireNonNull(segmentUuid, "segmentUuid");
+        String parent = acksParentPath(segmentUuid);
+        try {
+            return withConnectionLossRetry("listSwapAcks(" + segmentUuid + ")",
+                    () -> zk().getChildren(parent, childrenWatcher));
+        } catch (KeeperException.NoNodeException e) {
+            return Collections.emptyList();
+        } catch (KeeperException | InterruptedException | IOException e) {
+            if (e instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+            throw new SegmentRegistryException(
+                    "failed to list swap-acks for " + segmentUuid, e);
+        }
+    }
+
+    /**
+     * Recursively deletes the per-segment acks subtree. Called on multi-op
+     * success (the swap is committed; acks are no longer needed) and on the
+     * abort path. Idempotent: a missing subtree is a no-op.
+     */
+    public void deleteSwapAcksTree(String segmentUuid) throws SegmentRegistryException {
+        Objects.requireNonNull(segmentUuid, "segmentUuid");
+        String parent = acksParentPath(segmentUuid);
+        try {
+            withConnectionLossRetry("deleteSwapAcksTree(" + segmentUuid + ")", () -> {
+                List<String> children;
+                try {
+                    children = zk().getChildren(parent, false);
+                } catch (KeeperException.NoNodeException gone) {
+                    return null;
+                }
+                for (String c : children) {
+                    try {
+                        zk().delete(parent + "/" + c, -1);
+                    } catch (KeeperException.NoNodeException ok) {
+                        // ephemeral races: the IS pod's session just expired
+                    }
+                }
+                try {
+                    zk().delete(parent, -1);
+                } catch (KeeperException.NoNodeException ok) {
+                    // already gone — fine
+                } catch (KeeperException.NotEmptyException raceWithLateAck) {
+                    // A new ephemeral ack landed between getChildren and delete.
+                    // The optimizer treats the orphaned subtree as harmless; the
+                    // ephemeral will die with the IS pod's session and a future
+                    // call (e.g. next tick) cleans it up. Log at FINE.
+                    java.util.logging.Logger.getLogger(SegmentRegistryClient.class.getName())
+                            .log(java.util.logging.Level.FINE,
+                                    "deleteSwapAcksTree({0}): late ack landed during delete; will retry later",
+                                    segmentUuid);
+                }
+                return null;
+            });
+        } catch (KeeperException | InterruptedException | IOException e) {
+            if (e instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+            throw new SegmentRegistryException(
+                    "failed to delete swap-acks tree for " + segmentUuid, e);
         }
     }
 

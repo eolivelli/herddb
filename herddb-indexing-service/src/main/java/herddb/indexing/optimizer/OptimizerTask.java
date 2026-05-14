@@ -67,6 +67,25 @@ public final class OptimizerTask {
     private final String outputSegmentUuid;
     private final long createdAtEpochMillis;
     private final long leaderEpoch;
+    /**
+     * Issue #555. Wall-clock epoch millis at which the consumer staged the
+     * output segment as {@code PROVISIONAL} in ZK and flipped this task to
+     * {@link OptimizerTaskState#AWAITING_ACK}. Used by the consumer and the
+     * orphan scanner to enforce the
+     * {@code indexoptimizer.swap.ack.timeout.ms} deadline before aborting the
+     * swap. 0L while the task is still {@code PENDING} / {@code CLAIMED}.
+     */
+    private final long provisionalOutputCreatedAtEpochMillis;
+    /**
+     * Issue #555. Sorted list of {@code serviceId}s the consumer expects
+     * to receive ephemeral acknowledgements from before it will commit the
+     * atomic swap. Captured at {@link OptimizerTaskState#CLAIMED ➜ AWAITING_ACK}
+     * transition (from the live {@code IndexingServiceInstanceDirectory})
+     * so that a shadow being scaled up during the wait does NOT extend the
+     * expected-acks set forever. Empty for terminal states or for tasks
+     * that never reached {@code AWAITING_ACK}.
+     */
+    private final List<String> expectedAckServiceIds;
 
     @JsonCreator
     public OptimizerTask(
@@ -83,7 +102,9 @@ public final class OptimizerTask {
             @JsonProperty("claim") WorkerClaim claim,
             @JsonProperty("outputSegmentUuid") String outputSegmentUuid,
             @JsonProperty("createdAtEpochMillis") long createdAtEpochMillis,
-            @JsonProperty("leaderEpoch") long leaderEpoch) {
+            @JsonProperty("leaderEpoch") long leaderEpoch,
+            @JsonProperty("provisionalOutputCreatedAtEpochMillis") long provisionalOutputCreatedAtEpochMillis,
+            @JsonProperty("expectedAckServiceIds") List<String> expectedAckServiceIds) {
         this.schemaVersion = schemaVersionOrNull == null ? SCHEMA_VERSION : schemaVersionOrNull;
         this.taskId = Objects.requireNonNull(taskId, "taskId");
         this.tablespaceUuid = Objects.requireNonNull(tablespaceUuid, "tablespaceUuid");
@@ -105,6 +126,10 @@ public final class OptimizerTask {
         this.outputSegmentUuid = outputSegmentUuid;
         this.createdAtEpochMillis = createdAtEpochMillis;
         this.leaderEpoch = leaderEpoch;
+        this.provisionalOutputCreatedAtEpochMillis = provisionalOutputCreatedAtEpochMillis;
+        this.expectedAckServiceIds = expectedAckServiceIds == null
+                ? Collections.emptyList()
+                : List.copyOf(expectedAckServiceIds);
     }
 
     public int getSchemaVersion() {
@@ -163,6 +188,26 @@ public final class OptimizerTask {
         return leaderEpoch;
     }
 
+    /**
+     * Wall-clock epoch millis at which this task transitioned to
+     * {@link OptimizerTaskState#AWAITING_ACK} after staging its output as
+     * {@code PROVISIONAL}; 0L while still {@code PENDING}/{@code CLAIMED} or
+     * terminal without ever reaching {@code AWAITING_ACK} (issue #555).
+     */
+    public long getProvisionalOutputCreatedAtEpochMillis() {
+        return provisionalOutputCreatedAtEpochMillis;
+    }
+
+    /**
+     * Snapshot of the IS pod {@code serviceId}s the consumer expects to see
+     * acknowledge the staged output before the atomic swap can commit
+     * (issue #555). Empty for tasks that never reached
+     * {@link OptimizerTaskState#AWAITING_ACK}.
+     */
+    public List<String> getExpectedAckServiceIds() {
+        return expectedAckServiceIds;
+    }
+
     public byte[] serialize() {
         try {
             return MAPPER.writeValueAsBytes(this);
@@ -194,7 +239,9 @@ public final class OptimizerTask {
                 .claim(claim)
                 .outputSegmentUuid(outputSegmentUuid)
                 .createdAtEpochMillis(createdAtEpochMillis)
-                .leaderEpoch(leaderEpoch);
+                .leaderEpoch(leaderEpoch)
+                .provisionalOutputCreatedAtEpochMillis(provisionalOutputCreatedAtEpochMillis)
+                .expectedAckServiceIds(expectedAckServiceIds);
     }
 
     public static Builder builder() {
@@ -215,6 +262,7 @@ public final class OptimizerTask {
                 && attempts == that.attempts
                 && createdAtEpochMillis == that.createdAtEpochMillis
                 && leaderEpoch == that.leaderEpoch
+                && provisionalOutputCreatedAtEpochMillis == that.provisionalOutputCreatedAtEpochMillis
                 && Objects.equals(taskId, that.taskId)
                 && Objects.equals(tablespaceUuid, that.tablespaceUuid)
                 && Objects.equals(indexUuid, that.indexUuid)
@@ -223,7 +271,8 @@ public final class OptimizerTask {
                 && state == that.state
                 && Objects.equals(lastError, that.lastError)
                 && Objects.equals(claim, that.claim)
-                && Objects.equals(outputSegmentUuid, that.outputSegmentUuid);
+                && Objects.equals(outputSegmentUuid, that.outputSegmentUuid)
+                && Objects.equals(expectedAckServiceIds, that.expectedAckServiceIds);
     }
 
     @Override
@@ -231,7 +280,8 @@ public final class OptimizerTask {
         return Objects.hash(schemaVersion, taskId, tablespaceUuid, indexUuid,
                 inputSegmentUuids, inputSegmentExpectedVersions, targetOwnerInstanceId,
                 state, attempts, lastError, claim, outputSegmentUuid,
-                createdAtEpochMillis, leaderEpoch);
+                createdAtEpochMillis, leaderEpoch,
+                provisionalOutputCreatedAtEpochMillis, expectedAckServiceIds);
     }
 
     @Override
@@ -367,6 +417,8 @@ public final class OptimizerTask {
         private String outputSegmentUuid;
         private long createdAtEpochMillis;
         private long leaderEpoch;
+        private long provisionalOutputCreatedAtEpochMillis;
+        private List<String> expectedAckServiceIds = Collections.emptyList();
 
         public Builder taskId(String value) {
             this.taskId = value;
@@ -437,11 +489,24 @@ public final class OptimizerTask {
             return this;
         }
 
+        public Builder provisionalOutputCreatedAtEpochMillis(long value) {
+            this.provisionalOutputCreatedAtEpochMillis = value;
+            return this;
+        }
+
+        public Builder expectedAckServiceIds(List<String> value) {
+            this.expectedAckServiceIds = value == null
+                    ? Collections.emptyList()
+                    : List.copyOf(value);
+            return this;
+        }
+
         public OptimizerTask build() {
             return new OptimizerTask(SCHEMA_VERSION, taskId, tablespaceUuid, indexUuid,
                     inputSegmentUuids, inputSegmentExpectedVersions, targetOwnerInstanceId,
                     state, attempts, lastError, claim, outputSegmentUuid,
-                    createdAtEpochMillis, leaderEpoch);
+                    createdAtEpochMillis, leaderEpoch,
+                    provisionalOutputCreatedAtEpochMillis, expectedAckServiceIds);
         }
     }
 }

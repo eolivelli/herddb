@@ -190,13 +190,14 @@ public class OptimizerTransferRaceTest {
     }
 
     @Test
-    public void driftBetweenRevalidateAndDeprecateLeavesNoOrphanInputs() throws Exception {
-        // Review-item R2 (second pr-reviewer pass): the narrow window between
-        // revalidate (returning true) and the per-input deprecate-CAS allows drift
-        // (e.g. someone else flips an input to TRANSFERRING). Each per-input CAS
-        // fails individually with VersionMismatch; the engine still publishes the
-        // output but the drifted input remains ACTIVE. The next tick must fold it
-        // into a follow-up merge.
+    public void driftBetweenStageAndSwapAbortsAtomically() throws Exception {
+        // Issue #555: the legacy review-item-R2 race (drift between
+        // revalidate and per-input deprecate) is now closed by the atomic
+        // multi-op. The swap is all-or-nothing: if any input drifted between
+        // the PROVISIONAL stage and the multi-op, the BadVersionException
+        // rolls back the whole transaction. Inputs stay in their drifted /
+        // ACTIVE states; the staged PROVISIONAL output is deleted by the
+        // rollback path. No input is "half-deprecated".
         registry.createSegment(sampleSegment("seg-X", 100L));
         registry.createSegment(sampleSegment("seg-Y", 100L));
         registry.createSegment(sampleSegment("seg-Z", 100L));
@@ -206,7 +207,8 @@ public class OptimizerTransferRaceTest {
                 new MergePolicy.SmallestFirstPolicy(2, 2, Long.MAX_VALUE, Long.MAX_VALUE),
                 60_000L, () -> 0, fakeClock::get);
 
-        // Drift: flip seg-X to TRANSFERRING AFTER revalidate but BEFORE deprecate.
+        // Drift: flip seg-X to TRANSFERRING AFTER staging PROVISIONAL but
+        // BEFORE the atomic swap commits.
         engine.postRevalidatePreDeprecateHookForTests = () -> {
             try {
                 herddb.indexing.segment.VersionedSegmentMetadata segX =
@@ -219,32 +221,37 @@ public class OptimizerTransferRaceTest {
 
         engine.runOnce();
 
-        // The output IS published (revalidate succeeded).
-        assertEquals(1, engine.getSegmentsMerged());
+        // The atomic swap rolled back: NO input is DEPRECATED, the staged
+        // PROVISIONAL output is gone, no deprecations counted.
+        assertEquals("no inputs deprecated when the multi-op rolls back",
+                0, engine.getSegmentsDeprecated());
 
-        // seg-X drifted to TRANSFERRING and the per-input CAS failed → still ACTIVE-ish
-        // (currently TRANSFERRING from our hook); seg-Y and seg-Z deprecated normally.
         java.util.List<herddb.indexing.segment.VersionedSegmentMetadata> all =
                 registry.listSegments(TS_UUID, IDX_UUID);
         herddb.indexing.segment.SegmentState segXState = null;
         herddb.indexing.segment.SegmentState segYState = null;
         herddb.indexing.segment.SegmentState segZState = null;
+        boolean foundOrphanProvisional = false;
         for (herddb.indexing.segment.VersionedSegmentMetadata v : all) {
             switch (v.metadata().getSegmentUuid()) {
                 case "seg-X": segXState = v.metadata().getState(); break;
                 case "seg-Y": segYState = v.metadata().getState(); break;
                 case "seg-Z": segZState = v.metadata().getState(); break;
-                default: /* the merged output */ break;
+                default:
+                    // The merged-output znode: should NOT exist after rollback.
+                    foundOrphanProvisional = true;
+                    break;
             }
         }
         assertEquals("seg-X drifted to TRANSFERRING and stayed there",
                 herddb.indexing.segment.SegmentState.TRANSFERRING, segXState);
-        assertEquals("seg-Y deprecated normally",
-                herddb.indexing.segment.SegmentState.DEPRECATED, segYState);
-        assertEquals("seg-Z deprecated normally",
-                herddb.indexing.segment.SegmentState.DEPRECATED, segZState);
-        assertEquals("only 2 of 3 inputs deprecated this tick",
-                2, engine.getSegmentsDeprecated());
+        assertEquals("seg-Y remains ACTIVE — atomic multi-op rolled back",
+                herddb.indexing.segment.SegmentState.ACTIVE, segYState);
+        assertEquals("seg-Z remains ACTIVE — atomic multi-op rolled back",
+                herddb.indexing.segment.SegmentState.ACTIVE, segZState);
+        org.junit.Assert.assertFalse(
+                "no orphan PROVISIONAL output should be left in the registry",
+                foundOrphanProvisional);
     }
 
     @Test

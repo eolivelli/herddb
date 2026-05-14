@@ -33,7 +33,6 @@ import java.lang.management.ManagementFactory;
 import java.lang.management.MemoryMXBean;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.Deque;
 import java.util.List;
 import java.util.Objects;
@@ -734,60 +733,89 @@ public final class IndexOptimizerEngine {
             return observed;
         }
 
-        // 5. Publish the output and deprecate the inputs. We do this without a true
-        //    multi-op transaction — instead each step is a CAS. If we crash between
-        //    steps the next tick observes a partial state and recovers:
-        //    - if create succeeded but inputs not yet deprecated: re-run will see the
-        //      new segment; the inputs are still ACTIVE so they get re-merged with
-        //      the (now larger) output. We accept that re-merge cost.
-        //    - if create failed: nothing happens; inputs remain candidates.
+        // 5. Issue #555: stage the output as PROVISIONAL, then atomically
+        //    swap it to ACTIVE while marking every input as DEPRECATED in a
+        //    single ZooKeeper.multi(...) transaction. There is no
+        //    intermediate state observable to a watcher between "output not
+        //    yet ACTIVE" and "inputs not yet DEPRECATED"; the swap is
+        //    all-or-nothing.
         //
-        // Wrapped in a try/catch so any SegmentRegistryException or RuntimeException
-        // in the publish/deprecate phase (e.g. ZK session loss between merge completion
-        // and createSegment) still resets the live progress state and records a "failed"
-        // history entry before propagating.
+        //    The legacy inline path has no concept of IS-side ack
+        //    (the task-queue consumer is what waits on acks), so this path
+        //    is used only by tests / single-IS deployments where the engine
+        //    drives the merge directly. The atomicSwap call is fired
+        //    immediately after staging — the in-process IS will see both
+        //    transitions together in its next scan.
         long zkRegisterMs = 0L;
         long deprecateMs = 0L;
         try {
-            mergeProgress.updatePhase("registering-zk");
+            mergeProgress.updatePhase("staging-provisional");
             long zkRegisterStartMs = clock.getAsLong();
+            long retentionUntil = (retentionMillis == 0L)
+                    ? SegmentMetadata.NO_RETENTION
+                    : now + retentionMillis;
+            SegmentMetadata staged = output.toBuilder()
+                    .state(SegmentState.PROVISIONAL)
+                    .provisionalCreatedAtEpochMillis(now)
+                    .build();
             try {
-                registry.createSegment(output);
+                registry.createSegment(staged);
                 segmentsMerged.incrementAndGet();
             } catch (SegmentRegistryException.SegmentAlreadyExists ok) {
-                // Should not happen with random UUIDs, but if it ever did the merged file
-                // is already published; fall through to deprecate inputs.
-                LOGGER.log(Level.INFO, "merged segment {0} already registered (idempotent)",
-                        output.getSegmentUuid());
+                LOGGER.log(Level.INFO, "staged segment {0} already registered (idempotent)",
+                        staged.getSegmentUuid());
             }
             zkRegisterMs = Math.max(0L, clock.getAsLong() - zkRegisterStartMs);
             phaseZkRegisterMsTotal.addAndGet(zkRegisterMs);
 
-            // Test hook for review-item R2 (second pr-reviewer pass): inject drift in the
-            // narrow window between createSegment-of-output and deprecate-of-inputs.
+            // Test hook (preserved from the legacy publish/deprecate flow):
+            // injects drift between staging and the atomic swap.
             Runnable hook = postRevalidatePreDeprecateHookForTests;
             if (hook != null) {
                 hook.run();
             }
 
-            mergeProgress.updatePhase("deprecating-inputs");
+            mergeProgress.updatePhase("atomic-swap");
             long deprecateStartMs = clock.getAsLong();
-            long retentionUntil = (retentionMillis == 0L)
-                    ? SegmentMetadata.NO_RETENTION
-                    : now + retentionMillis;
-            for (VersionedSegmentMetadata v : candidates) {
+
+            // Re-read the staged output to capture its zkVersion for the multi-op.
+            VersionedSegmentMetadata provisional = registry.getSegment(
+                    tablespaceUuid, indexUuid, staged.getSegmentUuid())
+                    .orElseThrow(() -> new SegmentRegistryException(
+                            "staged segment " + staged.getSegmentUuid()
+                                    + " disappeared between createSegment and atomicSwap"));
+            try {
+                registry.atomicSwap(provisional, candidates, retentionUntil);
+                segmentsDeprecated.addAndGet(candidates.size());
+            } catch (SegmentRegistryException.VersionMismatch retry) {
+                // An input's zkVersion drifted between the revalidate above
+                // and the multi-op. Abort: delete the staged PROVISIONAL
+                // znode so a subsequent tick can retry without leaking an
+                // orphan output. Multipart files are cleaned by merger.abandon.
+                LOGGER.log(Level.WARNING,
+                        "atomicSwap CAS lost (input drift) for index {0} output {1}; "
+                                + "aborting and rolling back staged PROVISIONAL",
+                        new Object[]{indexUuid, staged.getSegmentUuid()});
                 try {
-                    deprecateInputSegment(v, output.getSegmentUuid(), retentionUntil);
-                    segmentsDeprecated.incrementAndGet();
-                } catch (SegmentRegistryException.VersionMismatch retry) {
-                    // Someone else (a transfer? another optimizer?) bumped the znode under us
-                    // BETWEEN the revalidation and the deprecate CAS. This is rare given how
-                    // close together the two reads are, but if it happens we've already
-                    // published the output — leave the input ACTIVE; the next tick will
-                    // notice the orphan output covering it and fold it in. Acceptable cost.
-                    LOGGER.log(Level.INFO, "input segment {0} CAS bumped; will retry next tick",
-                            v.metadata().getSegmentUuid());
+                    merger.abandon(staged);
+                } catch (RuntimeException abandonFailed) {
+                    LOGGER.log(Level.WARNING,
+                            "merger.abandon failed for {0}: {1}",
+                            new Object[]{staged.getSegmentUuid(), abandonFailed.getMessage()});
                 }
+                try {
+                    registry.casDeleteSegment(provisional);
+                } catch (SegmentRegistryException cleanup) {
+                    LOGGER.log(Level.WARNING,
+                            "failed to delete rolled-back PROVISIONAL znode for {0}: {1}",
+                            new Object[]{staged.getSegmentUuid(), cleanup.getMessage()});
+                }
+                mergeAbortsRevalidateFailedTotal.incrementAndGet();
+                long mergeEndMs2 = clock.getAsLong();
+                recordMergeHistory(mergeId, indexUuid, mergeStartMs, mergeEndMs2, "aborted",
+                        candidates.size(), totalInputVectors, 0L, peakHeapUsed, peakDirectUsed);
+                mergeProgress.enterIdle();
+                return observed;
             }
             deprecateMs = Math.max(0L, clock.getAsLong() - deprecateStartMs);
             phaseDeprecateMsTotal.addAndGet(deprecateMs);
@@ -858,16 +886,6 @@ public final class IndexOptimizerEngine {
                                                 List<VersionedSegmentMetadata> candidates) {
         return new SegmentRevalidator(registry, tablespaceUuid)
                 .revalidateInputsStillActive(indexUuid, candidates);
-    }
-
-    private void deprecateInputSegment(VersionedSegmentMetadata v, String replacementUuid,
-                                       long retentionUntilEpochMillis) throws SegmentRegistryException {
-        SegmentMetadata next = v.metadata().toBuilder()
-                .state(SegmentState.DEPRECATED)
-                .replacedBy(Collections.singletonList(replacementUuid))
-                .retentionUntilEpochMillis(retentionUntilEpochMillis)
-                .build();
-        registry.casUpdateSegment(v, next);
     }
 
     private void deleteRetainedSegment(VersionedSegmentMetadata v) {

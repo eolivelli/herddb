@@ -142,6 +142,16 @@ public final class SegmentMetadata {
     private final long retentionUntilEpochMillis;
     private final long createdAtEpochMillis;
     /**
+     * Wall-clock epoch millis at which the segment was first written to ZK
+     * as {@code PROVISIONAL} by the optimizer (issue #555). Used by the
+     * orphan-scanner and the consumer's own poll loop to decide that the
+     * acknowledgement wait has exceeded
+     * {@code indexoptimizer.swap.ack.timeout.ms} and the swap must be aborted.
+     * 0L when the segment was never published as {@code PROVISIONAL} by the
+     * optimizer (e.g. IS-side checkpoint staging or pre-#555 payloads).
+     */
+    private final long provisionalCreatedAtEpochMillis;
+    /**
      * Sorted list of jvector {@code FeatureId} names (e.g. {@code ["FUSED_PQ",
      * "INLINE_VECTORS"]}) recorded at the time the segment's graph file was
      * written. Used by the external optimizer's merge policy to group segments
@@ -182,6 +192,7 @@ public final class SegmentMetadata {
             @JsonProperty("replacedBy") List<String> replacedBy,
             @JsonProperty("retentionUntilEpochMillis") long retentionUntilEpochMillis,
             @JsonProperty("createdAtEpochMillis") long createdAtEpochMillis,
+            @JsonProperty("provisionalCreatedAtEpochMillis") long provisionalCreatedAtEpochMillis,
             @JsonProperty("jvectorFeatureIds") List<String> jvectorFeatureIds) {
         // Treat absent or zero schemaVersion as v1 so payloads written before the
         // field existed deserialize cleanly (review item D5).
@@ -213,6 +224,7 @@ public final class SegmentMetadata {
                 : Collections.unmodifiableList(new ArrayList<>(replacedBy));
         this.retentionUntilEpochMillis = retentionUntilEpochMillis;
         this.createdAtEpochMillis = createdAtEpochMillis;
+        this.provisionalCreatedAtEpochMillis = provisionalCreatedAtEpochMillis;
         this.jvectorFeatureIds = jvectorFeatureIds == null
                 ? null
                 : Collections.unmodifiableList(new ArrayList<>(jvectorFeatureIds));
@@ -319,6 +331,16 @@ public final class SegmentMetadata {
     }
 
     /**
+     * Wall-clock epoch millis at which the segment was first written to ZK
+     * as {@code PROVISIONAL} by the optimizer (issue #555); 0L when the
+     * segment was never published as {@code PROVISIONAL} by the optimizer
+     * (IS-side checkpoint staging or pre-#555 payloads).
+     */
+    public long getProvisionalCreatedAtEpochMillis() {
+        return provisionalCreatedAtEpochMillis;
+    }
+
+    /**
      * Returns the sorted list of jvector {@code FeatureId} names recorded when
      * this segment's graph file was written (e.g. {@code ["FUSED_PQ",
      * "INLINE_VECTORS"]}), or {@code null} if the field was absent from the
@@ -386,6 +408,7 @@ public final class SegmentMetadata {
                 .replacedBy(replacedBy)
                 .retentionUntilEpochMillis(retentionUntilEpochMillis)
                 .createdAtEpochMillis(createdAtEpochMillis)
+                .provisionalCreatedAtEpochMillis(provisionalCreatedAtEpochMillis)
                 .jvectorFeatureIds(jvectorFeatureIds);
     }
 
@@ -415,6 +438,7 @@ public final class SegmentMetadata {
                 && generation == that.generation
                 && retentionUntilEpochMillis == that.retentionUntilEpochMillis
                 && createdAtEpochMillis == that.createdAtEpochMillis
+                && provisionalCreatedAtEpochMillis == that.provisionalCreatedAtEpochMillis
                 && Objects.equals(segmentUuid, that.segmentUuid)
                 && Objects.equals(tablespaceUuid, that.tablespaceUuid)
                 && Objects.equals(tableName, that.tableName)
@@ -482,6 +506,7 @@ public final class SegmentMetadata {
         private List<String> replacedBy = Collections.emptyList();
         private long retentionUntilEpochMillis = NO_RETENTION;
         private long createdAtEpochMillis;
+        private long provisionalCreatedAtEpochMillis;
         private List<String> jvectorFeatureIds;
 
         public Builder segmentUuid(String value) {
@@ -618,6 +643,11 @@ public final class SegmentMetadata {
             return this;
         }
 
+        public Builder provisionalCreatedAtEpochMillis(long value) {
+            this.provisionalCreatedAtEpochMillis = value;
+            return this;
+        }
+
         public Builder jvectorFeatureIds(List<String> value) {
             this.jvectorFeatureIds = value;
             return this;
@@ -634,7 +664,7 @@ public final class SegmentMetadata {
                     tombstonePath, tombstoneLsnLedgerId, tombstoneLsnOffset, overlayGeneration,
                     baseLsnLedgerId, baseLsnOffset, sizeBytes, mapFileSize, vectorCount, generation,
                     replacedBy, retentionUntilEpochMillis, createdAtEpochMillis,
-                    jvectorFeatureIds);
+                    provisionalCreatedAtEpochMillis, jvectorFeatureIds);
         }
     }
 }
