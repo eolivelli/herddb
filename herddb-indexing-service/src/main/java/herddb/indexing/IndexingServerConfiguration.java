@@ -87,6 +87,16 @@ public final class IndexingServerConfiguration {
     public static final String PROPERTY_MEMORY_VECTOR_LIMIT = "indexing.memory.vector.limit";
     public static final long PROPERTY_MEMORY_VECTOR_LIMIT_DEFAULT = 0L;
 
+    /**
+     * Fraction of Netty direct memory ({@code -XX:MaxDirectMemorySize}) to use as the
+     * auto vector-budget when {@link #PROPERTY_MEMORY_VECTOR_LIMIT} is 0. Default is
+     * {@code 0.33} (33%), preserving the historical one-third ratio while switching the
+     * reference from JVM heap to the off-heap direct-memory pool that actually backs the
+     * index page allocations and remote-file I/O buffers.
+     */
+    public static final String PROPERTY_MEMORY_VECTOR_PERCENTAGE = "indexing.memory.vector.percentage";
+    public static final double PROPERTY_MEMORY_VECTOR_PERCENTAGE_DEFAULT = 0.33d;
+
     public static final String PROPERTY_MEMORY_PAGE_SIZE = "indexing.memory.page.size";
     public static final long PROPERTY_MEMORY_PAGE_SIZE_DEFAULT = 1048576L;
 
