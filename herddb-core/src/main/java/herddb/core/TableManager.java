@@ -248,6 +248,23 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
             new java.util.concurrent.atomic.AtomicLong();
 
     /**
+     * Issue #559: recovery-scoped batch that pipelines eviction-driven page
+     * flushes across commit boundaries during WAL replay. Created lazily on the
+     * first recovery apply and joined once by {@link #awaitRecoveryFlushes()}
+     * before the post-recovery checkpoint runs. {@code null} outside recovery.
+     *
+     * <p>Unlike the per-commit batch used by live {@link #onTransactionCommit}
+     * calls (issue #448), this batch is <em>not</em> awaited after every commit:
+     * recovery runs single-threaded with no concurrent Phase C checkpoint, so
+     * remote page writes of one commit can safely overlap the replay of the
+     * next, keeping slow remote storage flushes off the recovery critical path.
+     * The single recovery thread per tablespace is the only producer, so no
+     * extra synchronization is needed around the field itself; {@code volatile}
+     * gives the (possibly different) checkpoint thread a consistent view.</p>
+     */
+    private volatile CheckpointFlushBatch recoveryFlushBatch;
+
+    /**
      * Allow checkpoint
      */
     private final StampedLock checkpointLock = new StampedLock();
@@ -1090,9 +1107,20 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
         private final Semaphore permits;
         private final List<CompletableFuture<Void>> futures = new ArrayList<>();
 
+        /**
+         * Issue #559: a long-lived recovery-scoped batch would otherwise retain
+         * one {@link CompletableFuture} per flushed page for the whole WAL
+         * replay. {@link #submit(Runnable)} drops already-completed successful
+         * futures once the list grows past this bound, keeping the retained set
+         * roughly at the in-flight count. Futures that completed exceptionally
+         * are kept so {@link #awaitAll()} still surfaces their failure.
+         */
+        private final int pruneThreshold;
+
         CheckpointFlushBatch(ExecutorService executor, int parallelism) {
             this.executor = executor;
             this.permits = new Semaphore(Math.max(1, parallelism));
+            this.pruneThreshold = Math.max(64, Math.max(1, parallelism) * 8);
         }
 
         void submit(Runnable flushAction) throws DataStorageManagerException {
@@ -1112,6 +1140,12 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
             }, executor);
             synchronized (futures) {
                 futures.add(future);
+                if (futures.size() > pruneThreshold) {
+                    // Drop completed successful futures; keep pending and
+                    // exceptionally-completed ones so awaitAll() still reports
+                    // the first failure.
+                    futures.removeIf(f -> f.isDone() && !f.isCompletedExceptionally());
+                }
             }
         }
 
@@ -1317,6 +1351,42 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
      */
     public long getParallelUnloadsCount() {
         return parallelUnloadsCount.get();
+    }
+
+    /**
+     * Issue #559: returns the recovery-scoped {@link CheckpointFlushBatch},
+     * creating it on first use. Called only on the single recovery thread of
+     * the owning tablespace, so the lazy initialization needs no extra locking.
+     */
+    private CheckpointFlushBatch getOrCreateRecoveryFlushBatch() {
+        CheckpointFlushBatch batch = recoveryFlushBatch;
+        if (batch == null) {
+            batch = new CheckpointFlushBatch(
+                    tableSpaceManager.getCheckpointFlushExecutor(), checkpointFlushParallelism);
+            recoveryFlushBatch = batch;
+        }
+        return batch;
+    }
+
+    /**
+     * Issue #559: joins every in-flight recovery-scoped page flush and clears
+     * the batch. Invoked by {@code TableSpaceManager.recover()} before the
+     * post-recovery checkpoint and, defensively, at the start of
+     * {@link #checkpoint(boolean)} so a checkpoint never persists a
+     * {@code keyToPage} entry pointing at a page whose {@code writePage} is
+     * still running on the checkpoint-flush executor. A no-op when no recovery
+     * flush is pending.
+     */
+    @Override
+    public void awaitRecoveryFlushes() {
+        CheckpointFlushBatch batch = recoveryFlushBatch;
+        if (batch != null) {
+            try {
+                batch.awaitAll();
+            } finally {
+                recoveryFlushBatch = null;
+            }
+        }
     }
 
     /**
@@ -2449,9 +2519,21 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
          * keyToPage.put(...) and lastAppliedSequenceNumber.updateAndGet(...)
          * remain on this thread, in program order: only the I/O of pages that
          * are no longer being written to is parallelized.
+         *
+         * Issue #559: during recovery there is no concurrent Phase C checkpoint
+         * (recovery runs single-threaded and the post-recovery checkpoint only
+         * starts once replay is done), so the per-commit awaitAll() is not
+         * needed for correctness — it only serialises slow remote page writes
+         * onto the recovery critical path. In that case we reuse a single
+         * recovery-scoped batch across every commit so flushes of commit N
+         * overlap the replay of commit N+1, and join it once in
+         * awaitRecoveryFlushes() before the post-recovery checkpoint.
          */
-        final CheckpointFlushBatch unloadBatch = new CheckpointFlushBatch(
-                tableSpaceManager.getCheckpointFlushExecutor(), checkpointFlushParallelism);
+        final boolean pipelineRecoveryFlushes = recovery;
+        final CheckpointFlushBatch unloadBatch = pipelineRecoveryFlushes
+                ? getOrCreateRecoveryFlushBatch()
+                : new CheckpointFlushBatch(
+                        tableSpaceManager.getCheckpointFlushExecutor(), checkpointFlushParallelism);
         try {
             Map<Bytes, Record> changedRecords = transaction.changedRecords.get(table.name);
             // transaction is still holding locks on each record, so we can change records
@@ -2501,8 +2583,14 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
              * preserves the issue #157 invariant — Phase C, when it observes
              * activeCommitApplies == 0, must see both the LSN update and a
              * quiescent page state for every commit that already passed.
+             *
+             * Issue #559: skipped during recovery — the recovery-scoped batch
+             * is joined once by awaitRecoveryFlushes() before the post-recovery
+             * checkpoint, so consecutive commits do not block each other.
              */
-            unloadBatch.awaitAll();
+            if (!pipelineRecoveryFlushes) {
+                unloadBatch.awaitAll();
+            }
             /*
              * Publish the commit's LSN as "last fully applied" BEFORE releasing the
              * apply slot. Phase C drains activeCommitApplies to zero; the JMM
@@ -2531,11 +2619,19 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
              * separately in a multi-catch. Catching (RuntimeException | Error)
              * deliberately excludes checked exceptions that the apply path
              * does not declare.
+             *
+             * Issue #559: during recovery the batch is shared across commits
+             * and drained centrally — by awaitRecoveryFlushes() on the success
+             * path or by TableSpaceManager's abort-path best-effort drain — so
+             * it is not joined here, where doing so would block on flushes of
+             * unrelated commits.
              */
-            try {
-                unloadBatch.awaitAll();
-            } catch (DataStorageManagerException secondary) {
-                primary.addSuppressed(secondary);
+            if (!pipelineRecoveryFlushes) {
+                try {
+                    unloadBatch.awaitAll();
+                } catch (DataStorageManagerException secondary) {
+                    primary.addSuppressed(secondary);
+                }
             }
             throw primary;
         } finally {
@@ -2647,8 +2743,12 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
                         transaction.registerRecordUpdate(this.table.name, key, value, writeResult);
                     }
                 } else {
+                    // Issue #559: route eviction-driven flushes of non-transactional
+                    // recovery DML through the recovery-scoped batch so they pipeline
+                    // instead of blocking the replay thread on each remote write.
+                    CheckpointFlushBatch nonTxBatch = recovery ? getOrCreateRecoveryFlushBatch() : null;
                     try {
-                        applyUpdate(key, value);
+                        applyUpdate(key, value, nonTxBatch);
                     } catch (PageNotFoundException e) {
                         if (recovery) {
                             // During recovery, the key may have been updated during the table
@@ -2658,7 +2758,7 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
                                     "{0}.{1} recovery: re-applying update for key {2} as delete+insert",
                                     new Object[]{table.tablespace, table.name, key});
                             keyToPage.remove(key);
-                            applyInsert(key, value, false);
+                            applyInsert(key, value, false, nonTxBatch);
                         } else {
                             throw e;
                         }
@@ -2683,8 +2783,10 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
                         transaction.registerInsertOnTable(table.name, key, value, writeResult);
                     }
                 } else {
+                    // Issue #559: see the UPDATE branch above.
+                    CheckpointFlushBatch nonTxBatch = recovery ? getOrCreateRecoveryFlushBatch() : null;
                     try {
-                        applyInsert(key, value, false);
+                        applyInsert(key, value, false, nonTxBatch);
                     } catch (IllegalStateException e) {
                         if (recovery && e.getMessage() != null && e.getMessage().contains("already present")) {
                             // During recovery, a key may already be present in keyToPage if it was
@@ -2697,7 +2799,7 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
                                             + "(stale keyToPage entry from concurrent checkpoint)",
                                     new Object[]{table.tablespace, table.name, key});
                             keyToPage.remove(key);
-                            applyInsert(key, value, false);
+                            applyInsert(key, value, false, nonTxBatch);
                         } else {
                             throw e;
                         }
@@ -2867,10 +2969,6 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
         }
     }
 
-    private void applyUpdate(Bytes key, Bytes value) throws DataStorageManagerException {
-        applyUpdate(key, value, null);
-    }
-
     /**
      * Apply an UPDATE effect to the in-memory state.
      *
@@ -2879,6 +2977,8 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
      * does not fit and the record is re-inserted onto a fresh page) are
      * dispatched to the batch instead of running synchronously on the caller
      * thread. See {@link #applyInsert(Bytes, Bytes, boolean, CheckpointFlushBatch)}.
+     * Callers that do not want batched unloads (live non-transactional DML)
+     * pass {@code null}.
      */
     private void applyUpdate(Bytes key, Bytes value,
             CheckpointFlushBatch unloadBatch) throws DataStorageManagerException {
@@ -3924,6 +4024,13 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
             double dirtyThreshold, double fillThreshold,
             long checkpointTargetTime, long cleanupTargetTime, long compactionTargetTime, boolean pin
     ) throws DataStorageManagerException {
+        // Issue #559: defensively join any pending recovery-scoped page flushes
+        // before checkpointing. TableSpaceManager.recover() already does this
+        // before the post-recovery checkpoint, but recoverForLeadership() hands
+        // control back to a live server whose first checkpoint may be triggered
+        // from another path; joining here guarantees Phase C never persists a
+        // keyToPage entry pointing at a page whose writePage is still running.
+        awaitRecoveryFlushes();
         // Issue #403: serialize concurrent checkpoint(...) invocations on this
         // table. Without this lock the activator-thread-driven
         // runLocalTableCheckPoints could overlap with an admin-triggered
