@@ -22,6 +22,8 @@ package herddb.indexing.optimizer;
 import herddb.cluster.ZookeeperMetadataStorageManager;
 import herddb.metadata.IndexingServiceInstanceDescriptor;
 import herddb.metadata.MetadataStorageManagerException;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
 import java.util.TreeSet;
@@ -86,5 +88,28 @@ public final class ZkIndexingServiceInstanceDirectory implements IndexingService
             return new int[0];
         }
         return ordinals.stream().mapToInt(Integer::intValue).toArray();
+    }
+
+    @Override
+    public List<String> serviceIdsForEffectiveInstance(int effectiveInstanceId) {
+        List<IndexingServiceInstanceDescriptor> descriptors;
+        try {
+            descriptors = zkMeta.listIndexingServiceInstances();
+        } catch (MetadataStorageManagerException ze) {
+            LOGGER.log(Level.WARNING,
+                    "could not list indexing-service instances for ack snapshot of effectiveInstanceId={0}: {1}",
+                    new Object[]{effectiveInstanceId, ze.getMessage()});
+            return Collections.emptyList();
+        }
+        List<String> matching = new ArrayList<>();
+        for (IndexingServiceInstanceDescriptor d : descriptors) {
+            if (d.effectiveInstanceId() == effectiveInstanceId) {
+                matching.add(d.getServiceId());
+            }
+        }
+        // Stable order so the task znode payload is deterministic across
+        // leader-handover (helps debugging / diffing).
+        Collections.sort(matching);
+        return matching;
     }
 }

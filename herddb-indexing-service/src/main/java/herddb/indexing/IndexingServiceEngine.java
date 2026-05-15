@@ -1008,6 +1008,7 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                                                                 + "graphPath/mapPath");
                                                 return;
                                             }
+                                            boolean adoptedOk = false;
                                             try {
                                                 finalStore.adoptExternalSegment(
                                                         m.getSegmentUuid(),
@@ -1017,12 +1018,43 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                                                         m.getMapPath(),
                                                         m.getMapFileSize(),
                                                         m.getGeneration());
+                                                adoptedOk = true;
                                             } catch (java.io.IOException
                                                     | herddb.storage.DataStorageManagerException e) {
                                                 LOGGER.log(Level.WARNING,
                                                         "Failed to adopt external segment "
                                                                 + m.getSegmentUuid()
                                                                 + " into store " + finalIndexUUID, e);
+                                            }
+                                            // Issue #555: signal that this IS pod has loaded the
+                                            // segment (or has it loaded already). The optimizer
+                                            // waits for one of these ephemeral znodes from each
+                                            // interested pod before committing the atomic swap.
+                                            // Idempotent on NodeExists. Skipped when adoption
+                                            // failed because asserting "I have this segment"
+                                            // would be a lie.
+                                            if (adoptedOk) {
+                                                String serviceId = getInstanceIdLabel();
+                                                if (serviceId == null || serviceId.isEmpty()) {
+                                                    LOGGER.log(Level.WARNING,
+                                                            "issue #555: cannot create swap-ack znode "
+                                                                    + "for segment {0}: instanceIdLabel "
+                                                                    + "is not set",
+                                                            m.getSegmentUuid());
+                                                } else {
+                                                    try {
+                                                        watcherRegistry.createSwapAckNode(
+                                                                m.getSegmentUuid(), serviceId);
+                                                    } catch (herddb.indexing.segment.SegmentRegistryException ackFailed) {
+                                                        LOGGER.log(Level.WARNING,
+                                                                "issue #555: failed to write swap-ack "
+                                                                        + "for segment {0} from {1}: {2}",
+                                                                new Object[]{
+                                                                        m.getSegmentUuid(),
+                                                                        serviceId,
+                                                                        ackFailed.getMessage()});
+                                                    }
+                                                }
                                             }
                                         }
 

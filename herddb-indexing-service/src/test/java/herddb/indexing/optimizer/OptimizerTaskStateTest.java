@@ -47,15 +47,25 @@ public class OptimizerTaskStateTest {
     }
 
     @Test
-    public void blocksInputsCoversExactlyPendingClaimed() {
+    public void blocksInputsCoversExactlyPendingClaimedAndAwaitingAck() {
         Set<OptimizerTaskState> blockers = EnumSet.noneOf(OptimizerTaskState.class);
         for (OptimizerTaskState s : OptimizerTaskState.values()) {
             if (s.blocksInputs()) {
                 blockers.add(s);
             }
         }
-        assertEquals(EnumSet.of(OptimizerTaskState.PENDING, OptimizerTaskState.CLAIMED),
+        // Issue #555: AWAITING_ACK is a non-terminal state in which the inputs
+        // are still ACTIVE in ZK and the swap multi-op has not fired yet — a
+        // parallel producer must not assign those inputs to a different merge.
+        assertEquals(EnumSet.of(OptimizerTaskState.PENDING, OptimizerTaskState.CLAIMED,
+                        OptimizerTaskState.AWAITING_ACK),
                 blockers);
+    }
+
+    @Test
+    public void awaitingAckIsNotTerminalButBlocksInputs() {
+        assertFalse(OptimizerTaskState.AWAITING_ACK.isTerminal());
+        assertTrue(OptimizerTaskState.AWAITING_ACK.blocksInputs());
     }
 
     @Test

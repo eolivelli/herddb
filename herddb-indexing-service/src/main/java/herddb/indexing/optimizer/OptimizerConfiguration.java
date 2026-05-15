@@ -348,6 +348,46 @@ public final class OptimizerConfiguration {
             "indexoptimizer.consumer.max.tasks.per.tick";
     public static final int PROPERTY_CONSUMER_MAX_TASKS_PER_TICK_DEFAULT = 4;
 
+    // -------------------------------------------------------------------------
+    // Atomic swap protocol (issue #555)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Maximum time the consumer waits for every interested IS pod to write its
+     * ephemeral ack znode under
+     * {@code {basePath}/index-segments-acks/{outputSegmentUuid}/{serviceId}}
+     * before aborting the swap (issue #555). On timeout, the consumer deletes
+     * the staged output's multipart files + znode + acks subtree, leaves
+     * inputs ACTIVE, and transitions the task to FAILED (then POISON on
+     * {@code maxAttempts}).
+     *
+     * <p>Default 60 seconds. Should comfortably exceed the worst-case time
+     * for the new owner + every shadow replica to download the merged
+     * multipart files from remote storage and open them. Increase for very
+     * large segments or slow remote-storage backends.
+     */
+    public static final String PROPERTY_SWAP_ACK_TIMEOUT_MS =
+            "indexoptimizer.swap.ack.timeout.ms";
+    public static final long PROPERTY_SWAP_ACK_TIMEOUT_MS_DEFAULT = 60_000L;
+
+    /**
+     * Minimum age of a stale PROVISIONAL output znode before the orphan
+     * scanner considers it abandoned and triggers the abort path (multipart
+     * file deletion + znode delete + acks subtree delete) on behalf of a
+     * dead optimizer (issue #555). Used together with the AWAITING_ACK
+     * task scan: if the task is still AWAITING_ACK and its
+     * {@code provisionalOutputCreatedAtEpochMillis} is older than the
+     * configured swap-ack timeout, the orphan scanner aborts.
+     *
+     * <p>Default 600 seconds (10 × swap-ack timeout). Independent of the
+     * regular task retention so an operator inspecting a stuck task still
+     * has a chance to see the AWAITING_ACK state in {@code /status} for a
+     * reasonable window.
+     */
+    public static final String PROPERTY_PROVISIONAL_GC_MS =
+            "indexoptimizer.provisional.gc.ms";
+    public static final long PROPERTY_PROVISIONAL_GC_MS_DEFAULT = 600_000L;
+
     private final Properties properties;
 
     public OptimizerConfiguration(Properties properties) {

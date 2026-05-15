@@ -156,27 +156,68 @@ public class OptimizerTaskConsumerIntegrationTest {
     // -------------------------------------------------------------------------
 
     @Test
-    public void happyPathClaimsMergesPublishesAndCompletes() throws Exception {
+    public void happyPathClaimsMergesStagesAndCommitsAtomicSwap() throws Exception {
+        // Issue #555: the consumer now drives the task through PENDING →
+        // CLAIMED → AWAITING_ACK → DONE. Stage 1 is one consumeOneTask call
+        // (which lands AWAITING_ACK with a PROVISIONAL output and an
+        // empty expectedAckServiceIds list); stage 2 is a second call which
+        // commits the atomic swap via ZooKeeper.multi(). The test exercises
+        // the empty-expected-acks path (no IS pods discoverable).
         List<VersionedSegmentMetadata> inputs = activeInputs("seg-a", "seg-b");
         String taskId = UUID.randomUUID().toString();
         taskRegistry.createTask(pendingTask(taskId, inputs, /* owner */ 1));
-        assertTrue(consumer("w-1").consumeOneTask());
+        OptimizerTaskConsumer c = consumer("w-1");
 
-        OptimizerTask t = taskRegistry.getTask(TS_UUID, taskId).orElseThrow().task();
-        assertEquals(OptimizerTaskState.DONE, t.getState());
-        assertNotNull(t.getOutputSegmentUuid());
+        // First call: PENDING → AWAITING_ACK. Output is published as PROVISIONAL.
+        assertTrue(c.consumeOneTask());
 
-        // Inputs are deprecated, output is owned by instance 1.
+        OptimizerTask afterStage = taskRegistry.getTask(TS_UUID, taskId).orElseThrow().task();
+        assertEquals(OptimizerTaskState.AWAITING_ACK, afterStage.getState());
+        assertNotNull(afterStage.getOutputSegmentUuid());
+        assertTrue("provisional timestamp must be set after staging",
+                afterStage.getProvisionalOutputCreatedAtEpochMillis() > 0L);
+        // Inputs are still ACTIVE; the swap multi-op has not fired yet.
+        assertEquals(SegmentState.ACTIVE,
+                segmentRegistry.getSegment(TS_UUID, IDX, "seg-a").orElseThrow()
+                        .metadata().getState());
+        assertEquals(SegmentState.ACTIVE,
+                segmentRegistry.getSegment(TS_UUID, IDX, "seg-b").orElseThrow()
+                        .metadata().getState());
+        VersionedSegmentMetadata staged = segmentRegistry.getSegment(
+                TS_UUID, IDX, afterStage.getOutputSegmentUuid()).orElseThrow();
+        assertEquals(SegmentState.PROVISIONAL, staged.metadata().getState());
+        assertEquals(1, staged.metadata().getOwnerInstanceId());
+        // Lease is released at the CLAIMED → AWAITING_ACK transition so any
+        // pod can resume the wait.
+        assertFalse(taskRegistry.leaseExists(TS_UUID, taskId));
+
+        // Second call: empty expectedAckServiceIds → multi-op fires immediately.
+        // After commit: output is ACTIVE, inputs are DEPRECATED — both observed
+        // atomically by every subsequent watcher snapshot.
+        assertTrue(c.consumeOneTask());
+
+        OptimizerTask afterSwap = taskRegistry.getTask(TS_UUID, taskId).orElseThrow().task();
+        assertEquals(OptimizerTaskState.DONE, afterSwap.getState());
+        assertEquals(afterStage.getOutputSegmentUuid(), afterSwap.getOutputSegmentUuid());
+
         VersionedSegmentMetadata a = segmentRegistry.getSegment(TS_UUID, IDX, "seg-a").orElseThrow();
         VersionedSegmentMetadata b = segmentRegistry.getSegment(TS_UUID, IDX, "seg-b").orElseThrow();
         assertEquals(SegmentState.DEPRECATED, a.metadata().getState());
         assertEquals(SegmentState.DEPRECATED, b.metadata().getState());
         VersionedSegmentMetadata out = segmentRegistry.getSegment(
-                TS_UUID, IDX, t.getOutputSegmentUuid()).orElseThrow();
+                TS_UUID, IDX, afterSwap.getOutputSegmentUuid()).orElseThrow();
+        assertEquals(SegmentState.ACTIVE, out.metadata().getState());
         assertEquals(1, out.metadata().getOwnerInstanceId());
+        assertEquals(java.util.List.of(out.metadata().getSegmentUuid()),
+                a.metadata().getReplacedBy());
+        assertEquals(java.util.List.of(out.metadata().getSegmentUuid()),
+                b.metadata().getReplacedBy());
 
-        // Lease is gone.
+        // Lease is gone, observability counters reflect the atomic swap.
         assertFalse(taskRegistry.leaseExists(TS_UUID, taskId));
+        assertEquals(1, c.getTasksStagedProvisionalTotal());
+        assertEquals(1, c.getTasksSwapCommittedTotal());
+        assertEquals(1, c.getTasksCompletedSuccessfullyTotal());
     }
 
     @Test
@@ -358,24 +399,24 @@ public class OptimizerTaskConsumerIntegrationTest {
 
     @Test
     public void taskZnodeDeletedDuringMergeIsHandledGracefully() throws Exception {
-        // Race: the orphan scanner sees an input already DEPRECATED by us
-        // mid-loop and casDeleteTask's it just before we run the final
-        // CAS-to-DONE. The consumer must surface no exception and the
-        // scheduler tick must continue.
+        // Issue #555: race the orphan scanner against the consumer between
+        // merge completion and the CLAIMED → AWAITING_ACK transition. With
+        // the new atomic-swap flow the inputs remain ACTIVE in this race
+        // (the swap multi-op needs both task progression AND ack collection
+        // to fire — neither happens here). The orphan PROVISIONAL output
+        // is what is left over; the scanner's later sweep cleans it up.
+        // The consumer itself must not throw.
         List<VersionedSegmentMetadata> inputs = activeInputs("seg-race-a", "seg-race-b");
         String taskId = UUID.randomUUID().toString();
         OptimizerTask pending = pendingTask(taskId, inputs, 0);
         taskRegistry.createTask(pending);
 
-        // Wrap the merger so it deletes the task znode out-of-band AFTER the
-        // merge call (mimics the orphan scanner racing us between
-        // createSegment + per-input deprecate and the final DONE CAS).
         SegmentMerger racingMerger = new SegmentMerger() {
             @Override
             public SegmentMetadata merge(List<SegmentMetadata> in, int newOwnerInstance) throws Exception {
                 SegmentMetadata out = merger.merge(in, newOwnerInstance);
                 // Race the orphan scanner: delete the task znode (lease child
-                // first) right when the consumer is about to publish output.
+                // first) right when the consumer is about to stage PROVISIONAL.
                 String taskPath = taskRegistry.taskPath(TS_UUID, taskId);
                 try {
                     zk.delete(taskRegistry.leasePath(TS_UUID, taskId), -1);
@@ -387,17 +428,19 @@ public class OptimizerTaskConsumerIntegrationTest {
             }
         };
 
-        // Consume must not throw — the work landed (merge output published,
-        // inputs deprecated), only the final DONE CAS finds no znode and
-        // logs an INFO instead of escaping.
+        // Consume must not throw — the consumer logs the TaskNotFound and
+        // moves on. The PROVISIONAL output znode remains in ZK; a future
+        // orphan scanner sweep (or an operator) cleans it up.
         assertTrue(consumer("w-race", racingMerger).consumeOneTask());
 
-        // Task is gone (deleted by the race), inputs are DEPRECATED, output exists.
+        // Task is gone (deleted by the race), inputs are ACTIVE (no atomic
+        // swap fired — the task to drive the multi-op no longer exists),
+        // the merged output is left dangling in PROVISIONAL state.
         org.junit.Assert.assertFalse(taskRegistry.getTask(TS_UUID, taskId).isPresent());
         VersionedSegmentMetadata a = segmentRegistry.getSegment(TS_UUID, IDX, "seg-race-a").orElseThrow();
         VersionedSegmentMetadata b = segmentRegistry.getSegment(TS_UUID, IDX, "seg-race-b").orElseThrow();
-        assertEquals(SegmentState.DEPRECATED, a.metadata().getState());
-        assertEquals(SegmentState.DEPRECATED, b.metadata().getState());
+        assertEquals(SegmentState.ACTIVE, a.metadata().getState());
+        assertEquals(SegmentState.ACTIVE, b.metadata().getState());
     }
 
     @Test

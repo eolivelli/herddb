@@ -171,6 +171,47 @@ public class IndexOptimizerMainConfigTest {
     }
 
     @Test
+    public void startupRejectsProvisionalGcSmallerThanOrEqualToSwapAckTimeout() throws Exception {
+        // Issue #555: the orphan scanner's PROVISIONAL-GC threshold must be
+        // strictly greater than the consumer's swap-ack timeout, otherwise
+        // the orphan sweep could reclaim a staged output before its owning
+        // task has had a chance to time out the ack wait. IndexOptimizerMain
+        // enforces this at startup; this test pins the throw + diagnostic.
+        Properties p = baseProps();
+        p.setProperty(OptimizerConfiguration.PROPERTY_SWAP_ACK_TIMEOUT_MS, "60000");
+        p.setProperty(OptimizerConfiguration.PROPERTY_PROVISIONAL_GC_MS, "60000"); // == timeout
+        IndexOptimizerMain main = new IndexOptimizerMain(new OptimizerConfiguration(p),
+                new InMemorySegmentMerger());
+        try {
+            main.start();
+            org.junit.Assert.fail("expected IllegalStateException on bad provisional.gc.ms");
+        } catch (IllegalStateException ok) {
+            assertTrue("error must name both keys, got: " + ok.getMessage(),
+                    ok.getMessage().contains("provisional.gc.ms")
+                            && ok.getMessage().contains("swap.ack.timeout.ms"));
+        } finally {
+            main.shutdown();
+        }
+    }
+
+    @Test
+    public void startupAcceptsProvisionalGcGreaterThanSwapAckTimeout() throws Exception {
+        // The mirror of the rejection test: the default relationship
+        // (provisional.gc.ms 600 s >> swap.ack.timeout.ms 60 s) must start cleanly.
+        Properties p = baseProps();
+        p.setProperty(OptimizerConfiguration.PROPERTY_SWAP_ACK_TIMEOUT_MS, "60000");
+        p.setProperty(OptimizerConfiguration.PROPERTY_PROVISIONAL_GC_MS, "60001"); // > timeout
+        IndexOptimizerMain main = new IndexOptimizerMain(new OptimizerConfiguration(p),
+                new InMemorySegmentMerger());
+        try {
+            main.start();
+            assertNotNull(main.getMerger());
+        } finally {
+            main.shutdown();
+        }
+    }
+
+    @Test
     public void loadMergerSpiReturnsNoopFallback() {
         SegmentMerger m = IndexOptimizerMain.loadMergerSpi();
         assertNotNull(m);

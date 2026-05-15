@@ -178,6 +178,14 @@ public final class IndexOptimizerMain {
     private final AtomicLong orphansPoisonedTotal = new AtomicLong();
     private final AtomicLong orphansDeletedAfterDeprecateTotal = new AtomicLong();
     private final AtomicLong terminalGcTotal = new AtomicLong();
+    /**
+     * Issue #555: indexes for which the producer did NOT create a merge task
+     * because the {@code IndexingServiceInstanceDirectory} could not resolve
+     * any ack-target serviceId (ZK blip / no IS pod registered for the chosen
+     * owner). A non-zero value here is an operator-actionable signal that
+     * merges are being fail-closed-skipped — exposed via {@code /metrics}.
+     */
+    private final AtomicLong tasksSkippedNoAckTargetsTotal = new AtomicLong();
     /** Number of producer ticks that observed a stale-leader epoch and aborted. */
     private final AtomicLong producerTicksRejectedTotal = new AtomicLong();
     /** Current leader epoch bumped by the producer (-1 when never bumped on this pod). */
@@ -499,12 +507,39 @@ public final class IndexOptimizerMain {
         long poisonRetentionMs = configuration.getLong(
                 OptimizerConfiguration.PROPERTY_TASKS_POISON_RETENTION_MS,
                 OptimizerConfiguration.PROPERTY_TASKS_POISON_RETENTION_MS_DEFAULT);
+        // Issue #555: atomic-swap protocol knobs. swapAckTimeoutMs bounds how
+        // long the consumer waits for every interested IS pod to acknowledge
+        // before aborting the swap; provisionalGcMs is the orphan scanner's
+        // threshold for reclaiming stale PROVISIONAL znodes / AWAITING_ACK
+        // tasks left behind by a crashed optimizer pod.
+        long swapAckTimeoutMs = configuration.getLong(
+                OptimizerConfiguration.PROPERTY_SWAP_ACK_TIMEOUT_MS,
+                OptimizerConfiguration.PROPERTY_SWAP_ACK_TIMEOUT_MS_DEFAULT);
+        long provisionalGcMs = configuration.getLong(
+                OptimizerConfiguration.PROPERTY_PROVISIONAL_GC_MS,
+                OptimizerConfiguration.PROPERTY_PROVISIONAL_GC_MS_DEFAULT);
+        // Issue #555: the orphan scanner's PROVISIONAL-GC threshold MUST be
+        // strictly greater than the consumer's swap-ack timeout. Otherwise
+        // the orphan-PROVISIONAL sweep / handleAwaitingAck could reclaim a
+        // staged output whose owning task has not yet hit its own ack
+        // timeout — a still-live merge would lose its PROVISIONAL znode
+        // under it (degrades to a wasted merge). Mirrors the existing
+        // orphan.reset.ms >= 2 × session.timeout startup invariant above.
+        if (provisionalGcMs <= swapAckTimeoutMs) {
+            throw new IllegalStateException(
+                    OptimizerConfiguration.PROPERTY_PROVISIONAL_GC_MS
+                            + " (" + provisionalGcMs + " ms) must be > "
+                            + OptimizerConfiguration.PROPERTY_SWAP_ACK_TIMEOUT_MS
+                            + " (" + swapAckTimeoutMs + " ms) — the orphan scanner must"
+                            + " not reclaim a staged PROVISIONAL output before its"
+                            + " owning task has had a chance to time out the ack wait");
+        }
         this.taskRegistry = new OptimizerTaskRegistry(zkRef::get, basePath);
         taskRegistry.ensureRoot();
         LeaderEpoch leaderEpochClient = new LeaderEpoch(zkRef::get, basePath, tablespaceUuid);
         OptimizerOrphanScanner orphanScanner = new OptimizerOrphanScanner(taskRegistry, registry,
                 tablespaceUuid, maxAttempts, orphanResetMs, terminalRetentionMs, poisonRetentionMs,
-                System::currentTimeMillis);
+                provisionalGcMs, System::currentTimeMillis);
         LOGGER.log(Level.INFO,
                 "optimizer pod role: {0} (leaderExecutesTasks={1}, ownerSelector={2},"
                         + " workerUuid={3}, maxTasksPerTick={4})",
@@ -524,13 +559,21 @@ public final class IndexOptimizerMain {
         // Producer (leader only) + consumer (every pod). Production tick body uses
         // these instead of engine.runOnce — the engine.runOnce path is kept for
         // existing single-pod tests but is no longer invoked from production.
+        //
+        // Issue #555: the producer MUST be wired with the live
+        // instanceDirectory so every task carries the snapshot of IS pod
+        // serviceIds the consumer waits on before committing the atomic swap.
+        // Without it, tasks would carry an empty expected-acks list and the
+        // consumer would commit without any acknowledgement — re-opening the
+        // data-loss window this issue closes.
         if (role == OptimizerRole.LEADER) {
             this.taskProducer = new OptimizerTaskProducer(taskRegistry, registry,
                     tablespaceUuid, policy, ownerSelector, leaderLock, leaderEpochClient,
-                    orphanScanner, System::currentTimeMillis);
+                    orphanScanner, System::currentTimeMillis, instanceDirectory);
         }
         this.taskConsumer = new OptimizerTaskConsumer(taskRegistry, registry, merger,
-                tablespaceUuid, workerUuid, retentionMs, maxAttempts, System::currentTimeMillis);
+                tablespaceUuid, workerUuid, retentionMs, maxAttempts, swapAckTimeoutMs,
+                System::currentTimeMillis);
 
         this.scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
             FastThreadLocalThread t = new FastThreadLocalThread(r, "index-optimizer-engine");
@@ -603,6 +646,7 @@ public final class IndexOptimizerMain {
                 orphansPoisonedTotal.addAndGet(pr.orphansPoisoned);
                 orphansDeletedAfterDeprecateTotal.addAndGet(pr.orphansDeletedAfterDeprecate);
                 terminalGcTotal.addAndGet(pr.terminalGcCount);
+                tasksSkippedNoAckTargetsTotal.addAndGet(pr.tasksSkippedNoAckTargets);
                 if (pr.leaderEpoch != null) {
                     currentLeaderEpoch.set(pr.leaderEpoch);
                 } else if (!pr.ranAsLeader) {
@@ -667,6 +711,16 @@ public final class IndexOptimizerMain {
 
     public long getTerminalGcTotal() {
         return terminalGcTotal.get();
+    }
+
+    /**
+     * Issue #555: number of indexes for which the producer fail-closed-skipped
+     * task creation because no ack-target serviceId could be resolved. A
+     * non-zero, rising value means merges are not being scheduled because the
+     * IS pods are not visible in ZK — operator-actionable.
+     */
+    public long getTasksSkippedNoAckTargetsTotal() {
+        return tasksSkippedNoAckTargetsTotal.get();
     }
 
     public long getProducerTicksRejectedTotal() {
@@ -810,6 +864,7 @@ public final class IndexOptimizerMain {
         }
         armSegmentsWatch();
         armTasksWatch();
+        armAcksWatch();
     }
 
     private void armSegmentsWatch() {
@@ -898,6 +953,48 @@ public final class IndexOptimizerMain {
         } catch (OptimizerTaskRegistryException e) {
             LOGGER.log(Level.WARNING,
                     "failed to ensure task registry root before arming watch: {0}",
+                    e.getMessage());
+        }
+    }
+
+    /**
+     * Issue #555: arms a persistent-recursive watch on the swap-ack subtree
+     * so that an IS pod creating an ephemeral ack znode triggers an immediate
+     * (debounced) tick — the consumer then commits the atomic swap as soon as
+     * the last ack lands, instead of waiting up to {@code intervalMs} for the
+     * next periodic safety-net tick.
+     */
+    private void armAcksWatch() {
+        String path = registry.getAcksRootPath();
+        Watcher acksWatcher = (WatchedEvent event) -> {
+            if (event.getType() == Watcher.Event.EventType.None) {
+                if (event.getState() == Watcher.Event.KeeperState.SyncConnected) {
+                    scheduleEventDrivenTick();
+                }
+                return;
+            }
+            watcherEvents.incrementAndGet();
+            scheduleEventDrivenTick();
+        };
+        try {
+            registry.ensureRoot();
+            zooKeeper.addWatch(path, acksWatcher, AddWatchMode.PERSISTENT_RECURSIVE);
+            LOGGER.log(Level.INFO,
+                    "armed persistent-recursive watch on {0} (swap-ack event-driven scheduling)",
+                    path);
+        } catch (KeeperException | InterruptedException e) {
+            if (e instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+            // Don't fail startup — the periodic safety-net tick still drives
+            // AWAITING_ACK tasks forward, just with up-to-intervalMs latency.
+            LOGGER.log(Level.WARNING,
+                    "failed to arm swap-ack watch on {0}: {1}; AWAITING_ACK tasks will"
+                            + " commit at the next periodic tick instead",
+                    new Object[]{path, e.getMessage()});
+        } catch (herddb.indexing.segment.SegmentRegistryException e) {
+            LOGGER.log(Level.WARNING,
+                    "failed to ensure registry root before arming swap-ack watch: {0}",
                     e.getMessage());
         }
     }
