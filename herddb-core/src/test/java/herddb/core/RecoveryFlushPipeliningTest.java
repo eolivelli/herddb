@@ -28,25 +28,30 @@ import static herddb.core.TestUtils.newServerConfigurationWithAutoPort;
 import static herddb.core.TestUtils.scan;
 import static herddb.model.TransactionContext.NO_TRANSACTION;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 import herddb.file.FileCommitLogManager;
 import herddb.file.FileDataStorageManager;
 import herddb.file.FileMetadataStorageManager;
 import herddb.model.DataScanner;
+import herddb.model.Record;
 import herddb.model.StatementEvaluationContext;
 import herddb.model.TransactionContext;
 import herddb.model.commands.CreateTableSpaceStatement;
 import herddb.server.ServerConfiguration;
+import herddb.storage.DataStorageManagerException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
@@ -348,16 +353,183 @@ public class RecoveryFlushPipeliningTest {
         }
     }
 
+    /**
+     * Recovery under eviction pressure for a tablespace with several tables
+     * must join the recovery-scoped flush batch of <em>every</em> table before
+     * the post-recovery checkpoint. If any table's batch were skipped, that
+     * table's checkpoint could persist a {@code keyToPage} entry pointing at a
+     * page whose {@code writePage} had not completed, and a later restart from
+     * that checkpoint would lose rows. Two restarts assert exactly that.
+     */
+    @Test
+    public void multiTableRecoveryJoinsEveryTableBatch() throws Exception {
+        Path dataPath = folder.newFolder("data").toPath();
+        Path logsPath = folder.newFolder("logs").toPath();
+        Path metadataPath = folder.newFolder("metadata").toPath();
+        Path tmpDir = folder.newFolder("tmpDir").toPath();
+
+        int rowsPerTable = 400;
+        String[] tableNames = {"t1", "t2", "t3"};
+
+        // Phase 1: populate every table, NO checkpoint, close.
+        try (DBManager manager = new DBManager("localhost",
+                new FileMetadataStorageManager(metadataPath),
+                new FileDataStorageManager(dataPath),
+                new FileCommitLogManager(logsPath),
+                tmpDir, null, baseConfig(), null)) {
+            manager.start();
+            createTableSpace(manager);
+            for (String tableName : tableNames) {
+                createTable(manager, tableName);
+            }
+            for (String tableName : tableNames) {
+                for (int i = 0; i < rowsPerTable; i++) {
+                    executeUpdate(manager,
+                            "INSERT INTO tblspace1." + tableName + "(k1,v1) values(?,?)",
+                            Arrays.asList(String.format("k_%06d", i), PADDED_VALUE),
+                            NO_TRANSACTION);
+                }
+            }
+        }
+
+        // Phase 2: restart — recovery replays every table under eviction.
+        try (DBManager manager = new DBManager("localhost",
+                new FileMetadataStorageManager(metadataPath),
+                new FileDataStorageManager(dataPath),
+                new FileCommitLogManager(logsPath),
+                tmpDir, null, baseConfig(), null)) {
+            manager.start();
+            manager.waitForTablespace("tblspace1", 10_000);
+            for (String tableName : tableNames) {
+                TableManager tm = (TableManager) manager.getTableSpaceManager("tblspace1")
+                        .getTableManager(tableName);
+                assertTrue("recovery must have exercised the recovery-scoped batch for "
+                                + tableName + ": counter=" + tm.getParallelUnloadsCount(),
+                        tm.getParallelUnloadsCount() > 0);
+                assertTableRowCount(manager, tableName, rowsPerTable);
+            }
+        }
+
+        // Phase 3: second restart recovers from the post-recovery checkpoint
+        // written in phase 2 — every table must still be intact.
+        try (DBManager manager = new DBManager("localhost",
+                new FileMetadataStorageManager(metadataPath),
+                new FileDataStorageManager(dataPath),
+                new FileCommitLogManager(logsPath),
+                tmpDir, null, baseConfig(), null)) {
+            manager.start();
+            manager.waitForTablespace("tblspace1", 10_000);
+            for (String tableName : tableNames) {
+                assertTableRowCount(manager, tableName, rowsPerTable);
+            }
+        }
+    }
+
+    /**
+     * If a recovery-scoped page flush fails (e.g. the remote storage write
+     * throws), {@code awaitRecoveryFlushes()} must surface the failure and the
+     * tablespace boot must fail cleanly rather than silently completing with a
+     * lost page. The failure is injected for a multi-table tablespace, so the
+     * {@code awaitRecoveryFlushesOnAllTables()} loop is exercised with more
+     * than one table manager carrying a pending batch.
+     */
+    @Test
+    public void recoveryFlushFailureAbortsBoot() throws Exception {
+        Path dataPath = folder.newFolder("data").toPath();
+        Path logsPath = folder.newFolder("logs").toPath();
+        Path metadataPath = folder.newFolder("metadata").toPath();
+        Path tmpDir = folder.newFolder("tmpDir").toPath();
+
+        int rowsPerTable = 400;
+        String[] tableNames = {"t1", "t2"};
+
+        // Phase 1: populate two tables on a healthy data storage manager,
+        // NO checkpoint, close.
+        try (DBManager manager = new DBManager("localhost",
+                new FileMetadataStorageManager(metadataPath),
+                new FileDataStorageManager(dataPath),
+                new FileCommitLogManager(logsPath),
+                tmpDir, null, baseConfig(), null)) {
+            manager.start();
+            createTableSpace(manager);
+            for (String tableName : tableNames) {
+                createTable(manager, tableName);
+                for (int i = 0; i < rowsPerTable; i++) {
+                    executeUpdate(manager,
+                            "INSERT INTO tblspace1." + tableName + "(k1,v1) values(?,?)",
+                            Arrays.asList(String.format("k_%06d", i), PADDED_VALUE),
+                            NO_TRANSACTION);
+                }
+            }
+        }
+
+        // Phase 2: restart with a data storage manager whose writePage always
+        // fails. Recovery replay dispatches eviction-driven page flushes to the
+        // recovery-scoped batch; every one fails, so awaitRecoveryFlushes()
+        // throws and the tablespace must NOT come up.
+        FailingFileDataStorageManager failingDsm = new FailingFileDataStorageManager(dataPath);
+        failingDsm.armFailure();
+        try (DBManager manager = new DBManager("localhost",
+                new FileMetadataStorageManager(metadataPath),
+                failingDsm,
+                new FileCommitLogManager(logsPath),
+                tmpDir, null, baseConfig(), null)) {
+            manager.start();
+            boolean up = manager.waitForTablespace("tblspace1", 8_000);
+            assertFalse("tablespace must not boot when recovery page flushes fail", up);
+            assertTrue("the failing writePage path must have been exercised during recovery",
+                    failingDsm.failedCalls() > 0);
+        }
+
+        // Phase 3: restart again on a healthy data storage manager — recovery
+        // replays the same WAL (the failed boot persisted nothing) and every
+        // row of every table is reproduced. This proves the failed boot did
+        // not corrupt or partially commit any state.
+        try (DBManager manager = new DBManager("localhost",
+                new FileMetadataStorageManager(metadataPath),
+                new FileDataStorageManager(dataPath),
+                new FileCommitLogManager(logsPath),
+                tmpDir, null, baseConfig(), null)) {
+            manager.start();
+            manager.waitForTablespace("tblspace1", 10_000);
+            for (String tableName : tableNames) {
+                assertTableRowCount(manager, tableName, rowsPerTable);
+            }
+        }
+    }
+
     // ---------- helpers ----------
 
     private static void createTableSpaceAndTable(DBManager manager) throws Exception {
+        createTableSpace(manager);
+        createTable(manager, "t1");
+    }
+
+    private static void createTableSpace(DBManager manager) throws Exception {
         CreateTableSpaceStatement st1 = new CreateTableSpaceStatement("tblspace1",
                 Collections.singleton("localhost"), "localhost", 1, 0, 0);
         manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
                 NO_TRANSACTION);
         manager.waitForTablespace("tblspace1", 10_000);
-        execute(manager, "CREATE TABLE tblspace1.t1 (k1 string primary key, v1 string)",
-                Collections.emptyList());
+    }
+
+    private static void createTable(DBManager manager, String tableName) throws Exception {
+        execute(manager, "CREATE TABLE tblspace1." + tableName
+                + " (k1 string primary key, v1 string)", Collections.emptyList());
+    }
+
+    private static void assertTableRowCount(DBManager manager, String tableName,
+            int expectedRows) throws Exception {
+        try (DataScanner scanner = scan(manager,
+                "SELECT k1 FROM tblspace1." + tableName, Collections.emptyList())) {
+            int actual = 0;
+            while (scanner.hasNext()) {
+                scanner.next();
+                actual++;
+            }
+            assertEquals("table " + tableName + " returned wrong number of rows",
+                    expectedRows, actual);
+        }
     }
 
     private static TableManager tableManager(DBManager manager) {
@@ -426,5 +598,42 @@ public class RecoveryFlushPipeliningTest {
             sb.append(fragment);
         }
         return sb.toString();
+    }
+
+    /**
+     * A {@link FileDataStorageManager} that throws
+     * {@link DataStorageManagerException} from {@link #writePage} when armed.
+     * Used by {@link #recoveryFlushFailureAbortsBoot()} to verify that a
+     * recovery-scoped page-flush failure surfaces through
+     * {@code awaitRecoveryFlushes()} and aborts the tablespace boot.
+     */
+    private static final class FailingFileDataStorageManager extends FileDataStorageManager {
+
+        private final AtomicBoolean armed = new AtomicBoolean();
+        private final java.util.concurrent.atomic.AtomicInteger failedCalls =
+                new java.util.concurrent.atomic.AtomicInteger();
+
+        FailingFileDataStorageManager(Path baseDir) {
+            super(baseDir);
+        }
+
+        void armFailure() {
+            armed.set(true);
+        }
+
+        int failedCalls() {
+            return failedCalls.get();
+        }
+
+        @Override
+        public void writePage(String tableSpace, String uuid, long pageId,
+                Collection<Record> newPage) throws DataStorageManagerException {
+            if (armed.get()) {
+                failedCalls.incrementAndGet();
+                throw new DataStorageManagerException(
+                        "test-injected failure on writePage for page " + pageId);
+            }
+            super.writePage(tableSpace, uuid, pageId, newPage);
+        }
     }
 }

@@ -539,6 +539,11 @@ public class TableSpaceManager {
             }
             recoveryReplayCompleted = true;
         } finally {
+            // Issue #559: clearing recoveryInProgress here, before the
+            // recovery-flush join below, is intentional and safe — live
+            // commits use their own per-commit flush batch (not the
+            // recovery-scoped one), and any checkpoint that races in joins
+            // the recovery batch itself via TableManager.checkpoint().
             recoveryInProgress = false;
             if (!recoveryReplayCompleted) {
                 // Issue #559: recovery aborted — drain any in-flight recovery page
@@ -551,15 +556,39 @@ public class TableSpaceManager {
         // recovery-scoped batch (see TableManager). Wait for every in-flight remote page
         // write to finish before the post-recovery checkpoint, otherwise Phase C could
         // persist a keyToPage entry pointing at a page whose writePage has not completed.
-        for (AbstractTableManager tableManager : tables.values()) {
-            tableManager.awaitRecoveryFlushes();
-        }
+        awaitRecoveryFlushesOnAllTables();
         if (!dbmanager.getMode().equals(ServerConfiguration.PROPERTY_MODE_SHARED_STORAGE)
                 && !LogSequenceNumber.START_OF_TIME.equals(actualLogSequenceNumber)) {
             LOGGER.log(Level.INFO, "Recovery finished for {0} seqNum {1}", new Object[]{tableSpaceName, actualLogSequenceNumber});
             checkpoint(false, false, false);
         }
 
+    }
+
+    /**
+     * Issue #559: joins the pending recovery-scoped page flushes of every table
+     * manager. Every table manager is drained even if one throws, so a single
+     * failed flush cannot leave the other table managers' checkpoint-flush
+     * executor tasks running against a tablespace that is being torn down. The
+     * first failure (with the rest attached as suppressed) is rethrown only
+     * after every table manager has been drained.
+     */
+    private void awaitRecoveryFlushesOnAllTables() {
+        RuntimeException firstFailure = null;
+        for (AbstractTableManager tableManager : tables.values()) {
+            try {
+                tableManager.awaitRecoveryFlushes();
+            } catch (RuntimeException error) {
+                if (firstFailure == null) {
+                    firstFailure = error;
+                } else if (firstFailure != error) {
+                    firstFailure.addSuppressed(error);
+                }
+            }
+        }
+        if (firstFailure != null) {
+            throw firstFailure;
+        }
     }
 
     /**
@@ -592,6 +621,8 @@ public class TableSpaceManager {
             log.recovery(actualLogSequenceNumber, new ApplyEntryOnRecovery(), true);
             recoveryReplayCompleted = true;
         } finally {
+            // Issue #559: see recover(TableSpace) — clearing recoveryInProgress
+            // before the recovery-flush join below is intentional and safe.
             recoveryInProgress = false;
             if (!recoveryReplayCompleted) {
                 // Issue #559: see recover(TableSpace).
@@ -601,9 +632,7 @@ public class TableSpaceManager {
         // Issue #559: wait for in-flight recovery page flushes before declaring
         // recovery finished, so the first checkpoint after leadership recovery
         // sees a fully persisted page state.
-        for (AbstractTableManager tableManager : tables.values()) {
-            tableManager.awaitRecoveryFlushes();
-        }
+        awaitRecoveryFlushesOnAllTables();
         LOGGER.log(Level.INFO, "Recovery (with fencing) finished for {0}", tableSpaceName);
     }
 
