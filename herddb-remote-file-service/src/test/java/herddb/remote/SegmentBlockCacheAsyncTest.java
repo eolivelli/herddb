@@ -33,8 +33,10 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.After;
@@ -485,5 +487,135 @@ public class SegmentBlockCacheAsyncTest {
             ReferenceCountUtil.safeRelease(asyncResult);
         }
         // @After calls cache.clear() + cache.cleanUp() for leak detection
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #557: piggyback path must not hit IllegalReferenceCountException
+    // -----------------------------------------------------------------------
+
+    /**
+     * A piggybacker's slice must remain valid after the in-flight owner has
+     * released its own slice first. The two slices are independent retained
+     * views of the shared buffer (issue #557).
+     */
+    @Test
+    public void ownerSliceReleasedBeforePiggybackerReadsItsSlice() throws Exception {
+        testCache = new SegmentBlockCache(BLOCK * 10L);
+        SegmentBlockCache cache = testCache;
+        byte[] pattern = new byte[BLOCK];
+        for (int i = 0; i < BLOCK; i++) {
+            pattern[i] = (byte) (i & 0xFF);
+        }
+        CountDownLatch release = new CountDownLatch(1);
+        SegmentBlockCache.AsyncBlockLoader loader = (p, off, len) -> {
+            CompletableFuture<ByteBuf> fut = new CompletableFuture<>();
+            new Thread(() -> {
+                try {
+                    release.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                ByteBuf buf = PooledByteBufAllocator.DEFAULT.directBuffer(len);
+                buf.writeBytes(pattern);
+                fut.complete(buf);
+            }, "gated-loader").start();
+            return fut;
+        };
+
+        // First call becomes the in-flight owner (loader gated, still running).
+        CompletableFuture<ByteBuf> ownerFuture = cache.getBlockAsync("p", 0, BLOCK, loader);
+        // Second call piggybacks on the same in-flight load.
+        CompletableFuture<ByteBuf> piggyFuture = cache.getBlockAsync("p", 0, BLOCK, loader);
+        // Release the loader so both futures resolve.
+        release.countDown();
+
+        ByteBuf ownerBuf = ownerFuture.get(5, TimeUnit.SECONDS);
+        byte[] ownerBytes = new byte[BLOCK];
+        ownerBuf.getBytes(0, ownerBytes);
+        assertArrayEquals(pattern, ownerBytes);
+        // Owner releases its slice FIRST, before the piggybacker reads its own.
+        ReferenceCountUtil.safeRelease(ownerBuf);
+
+        ByteBuf piggyBuf = piggyFuture.get(5, TimeUnit.SECONDS);
+        try {
+            byte[] piggyBytes = new byte[BLOCK];
+            piggyBuf.getBytes(0, piggyBytes);
+            assertArrayEquals("piggybacker slice must survive owner release",
+                    pattern, piggyBytes);
+        } finally {
+            ReferenceCountUtil.safeRelease(piggyBuf);
+        }
+        cache.cleanUp();
+    }
+
+    /**
+     * Regression test for issue #557. When many threads piggyback on a single
+     * in-flight async load, a late-arriving piggybacker must still receive a
+     * valid, independent slice even though earlier callers may already have
+     * released theirs.
+     *
+     * <p>The pre-fix code completed the shared future with the owner's own
+     * slice and let each piggybacker derive its slice lazily via
+     * {@code thenApply()}; a piggybacker whose {@code thenApply} ran after the
+     * owner's slice was released hit
+     * {@code io.netty.util.IllegalReferenceCountException}. The fixed code has
+     * the owner slice the (still-alive) shared buffer for every waiter, so this
+     * test is structurally green on the fix and fails reliably on the bug.
+     */
+    @Test
+    public void concurrentPiggybackBurstIsRefCountSafe() throws Exception {
+        testCache = new SegmentBlockCache(BLOCK * 8L);
+        SegmentBlockCache cache = testCache;
+
+        final int threads = 24;
+        final int rounds = 300;
+        ExecutorService exec = Executors.newFixedThreadPool(threads);
+        ExecutorService loaderExec = Executors.newCachedThreadPool();
+        try {
+            for (int round = 0; round < rounds; round++) {
+                final String key = "seg-" + round;
+                final byte fill = (byte) round;
+                final CyclicBarrier barrier = new CyclicBarrier(threads);
+                SegmentBlockCache.AsyncBlockLoader loader = (p, off, len) -> {
+                    CompletableFuture<ByteBuf> fut = new CompletableFuture<>();
+                    // Resolve the load on a separate thread so the owner's
+                    // future completes while piggybackers are still registering.
+                    loaderExec.execute(() -> fut.complete(direct(len, fill)));
+                    return fut;
+                };
+                List<Future<?>> tasks = new ArrayList<>();
+                for (int t = 0; t < threads; t++) {
+                    tasks.add(exec.submit(() -> {
+                        barrier.await();
+                        ByteBuf buf = cache.getBlockAsync(key, 0, BLOCK, loader)
+                                .get(10, TimeUnit.SECONDS);
+                        // Touch every byte, then release immediately so the
+                        // shared buffer's refcount churns while peers are still
+                        // taking their slices.
+                        byte[] got = new byte[BLOCK];
+                        buf.getBytes(0, got);
+                        buf.release();
+                        for (byte b : got) {
+                            if (b != fill) {
+                                throw new AssertionError("corrupt block content");
+                            }
+                        }
+                        return null;
+                    }));
+                }
+                for (Future<?> task : tasks) {
+                    // Surfaces IllegalReferenceCountException / corruption as
+                    // an ExecutionException.
+                    task.get(15, TimeUnit.SECONDS);
+                }
+                cache.invalidatePath(key);
+                cache.cleanUp();
+            }
+        } finally {
+            exec.shutdownNow();
+            loaderExec.shutdownNow();
+            exec.awaitTermination(10, TimeUnit.SECONDS);
+            loaderExec.awaitTermination(10, TimeUnit.SECONDS);
+        }
     }
 }

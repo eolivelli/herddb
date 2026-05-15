@@ -27,7 +27,9 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.PooledByteBufAllocator;
 import io.netty.util.ReferenceCountUtil;
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -98,9 +100,11 @@ public final class SegmentBlockCache {
      * Tracks async loads currently in flight so that concurrent callers for the
      * same {@code (path, blockIndex)} share a single network read (single-flight
      * semantics). Non-null only when caching is enabled ({@code cache != null}).
-     * Entries are removed by the owning caller's {@code whenComplete} hook.
+     * Each {@link InFlightLoad} holds the result futures of every caller waiting
+     * on the load; the owning caller detaches the entry and fulfils all waiters
+     * when the load completes.
      */
-    private final ConcurrentHashMap<BlockKey, CompletableFuture<ByteBuf>> inFlightAsync;
+    private final ConcurrentHashMap<BlockKey, InFlightLoad> inFlightAsync;
     // We track hit/miss/load stats ourselves because the only way to do an
     // atomic retain-under-lock is via asMap().compute(), and Caffeine's
     // recordStats() does not count compute() invocations as gets. Keeping our
@@ -269,16 +273,18 @@ public final class SegmentBlockCache {
      *
      * <p><b>Single-flight</b>: concurrent callers for the same
      * {@code (path, blockIndex)} share a single in-flight loader call via
-     * {@link #inFlightAsync}. Piggybacking callers each receive an independent
-     * {@link ByteBuf#retainedSlice retained slice} of the winner's result,
-     * so they can release independently.
+     * {@link #inFlightAsync}. When the load completes, the owning caller hands
+     * every waiter (itself and all piggybackers) its own independent
+     * {@link ByteBuf#retainedSlice retained slice}, so they can release
+     * independently. All slices are created by the owner while the freshly
+     * loaded buffer is provably still alive, so a waiter can never observe a
+     * released buffer (issue #557).
      *
-     * <p><b>Stats</b>: hits and misses are recorded the same way as
-     * {@link #getBlock} — each piggybacking concurrent miss counts as a miss
-     * (unlike the sync path where concurrent callers serialise inside
-     * {@code compute()} and the later arrivals see a hit). This is a minor
-     * overcounting of misses that is documented here and accepted for
-     * simplicity.
+     * <p><b>Stats</b>: a concurrent burst of misses for the same key counts as
+     * a single miss — only the in-flight owner increments the miss counter,
+     * piggybacking callers do not. This mirrors the effective behaviour of the
+     * sync path, where concurrent callers serialise inside {@code compute()}
+     * and only the first records a miss.
      *
      * <p><b>Pass-through</b>: when the cache is disabled ({@code cache == null})
      * the loader is invoked directly; load-time and success/failure stats are
@@ -334,91 +340,149 @@ public final class SegmentBlockCache {
         }
 
         // --- Miss path: single-flight via inFlightAsync ---
-        // putIfAbsent is atomic; only the first thread for this key proceeds
-        // as the "owner" that fires the loader. All others piggyback on the
-        // winner's future, each receiving their own retained slice.
+        // Every caller for this key registers its own result future in a
+        // shared InFlightLoad. The first caller becomes the "owner" and fires
+        // the loader; when the load completes the owner detaches the entry and
+        // hands every registered waiter its own independent retained slice.
+        // Unlike a thenApply()-based piggyback, the owner creates all slices
+        // itself while the freshly loaded buffer is provably still alive, so a
+        // waiter can never observe a released buffer (issue #557).
         CompletableFuture<ByteBuf> ourFuture = new CompletableFuture<>();
-        CompletableFuture<ByteBuf> existing = inFlightAsync.putIfAbsent(key, ourFuture);
-        if (existing != null) {
-            // Piggyback: return an independent retained slice from the winner.
-            // We deliberately do NOT increment misses here — the in-flight
-            // owner already counted the miss.
-            return existing.thenApply(b -> b.retainedSlice(0, b.readableBytes()));
+        boolean[] isOwner = {false};
+        inFlightAsync.compute(key, (k, current) -> {
+            if (current == null || current.sealed) {
+                // No load in flight (or the previous one is already being
+                // delivered and no longer accepts waiters): start a new one.
+                InFlightLoad load = new InFlightLoad();
+                load.waiters.add(ourFuture);
+                isOwner[0] = true;
+                return load;
+            }
+            // Piggyback on the in-flight load: the owner will complete
+            // ourFuture with an independent slice once the load resolves.
+            current.waiters.add(ourFuture);
+            return current;
+        });
+        if (!isOwner[0]) {
+            // Piggybacker: nothing else to do — the owner already counted the
+            // miss and will fulfil ourFuture.
+            return ourFuture;
         }
 
         // We are the in-flight owner.
         misses.incrementAndGet();
         long startNanos = System.nanoTime();
-        // Guard against a loader whose synchronous portion throws before returning
-        // a future. Without this, ourFuture would linger in inFlightAsync forever
-        // and any piggybackers would deadlock waiting on it.
+        // Guard against a loader whose synchronous portion throws before
+        // returning a future. Without this, the InFlightLoad would linger in
+        // inFlightAsync forever and every waiter would deadlock.
         CompletableFuture<ByteBuf> loadFuture;
         try {
             loadFuture = loader.loadAsync(path, offset, length);
         } catch (RuntimeException t) {
             loadTimeNanos.addAndGet(System.nanoTime() - startNanos);
             loadFailure.incrementAndGet();
-            inFlightAsync.remove(key, ourFuture);
-            ourFuture.completeExceptionally(t);
+            failAllWaiters(detachWaiters(key), t);
             return ourFuture;
         }
         loadFuture.whenComplete((loaded, err) -> {
             loadTimeNanos.addAndGet(System.nanoTime() - startNanos);
-            inFlightAsync.remove(key, ourFuture);
+            // Detach the InFlightLoad and snapshot every waiter. The compute()
+            // call serialises with concurrent piggyback registrations on the
+            // same key, so after this returns no new waiter can attach.
+            List<CompletableFuture<ByteBuf>> waiters = detachWaiters(key);
 
             if (err != null) {
                 loadFailure.incrementAndGet();
-                ourFuture.completeExceptionally(err);
+                failAllWaiters(waiters, err);
                 return;
             }
             if (loaded == null) {
                 loadFailure.incrementAndGet();
-                ourFuture.completeExceptionally(new IOException(
+                failAllWaiters(waiters, new IOException(
                         "loader returned null for " + path + "@" + offset));
                 return;
             }
             loadSuccess.incrementAndGet();
 
-            // Adopt into Caffeine cache. retain() brings refCnt from 1 → 2
-            // (1 for the cache's eviction-listener release, 1 for the caller
-            // slice we are about to create).
+            // Adopt the freshly loaded buffer into the Caffeine cache.
+            // retain() brings refCnt 1 → 2: one reference for the cache
+            // (released by the eviction listener) and one "distribution"
+            // reference that we consume below by handing out per-waiter
+            // slices.
             loaded.retain();
 
             // compute() serialises with any concurrent sync getBlock() call on
             // the same key: if another thread raced and inserted first, we
-            // discard our 'loaded' and build the caller slice from what's
-            // already there.
-            ByteBuf[] inserted = new ByteBuf[1];
+            // keep that entry and discard our freshly loaded buffer.
+            ByteBuf[] shared = new ByteBuf[1];
             cache.asMap().compute(key, (k, prev) -> {
                 if (prev != null) {
-                    // Concurrent sync insert won the race. Retain prev so we
-                    // can build a caller slice outside compute().
+                    // Concurrent sync insert won the race. Retain prev once as
+                    // our distribution reference.
                     prev.retain();
-                    inserted[0] = prev;
+                    shared[0] = prev;
                     return prev;
                 }
-                inserted[0] = loaded;
+                shared[0] = loaded;
                 return loaded; // cache takes the extra retain we did above
             });
 
-            if (inserted[0] == loaded) {
-                // We inserted successfully.
-                // refCnt = 2: cache ref (released on eviction) + slice ref.
-                ByteBuf slice = loaded.retainedSlice(0, loaded.readableBytes());
-                // Drop the "original" ref the loader gave us; cache holds its ref.
-                loaded.release();
-                ourFuture.complete(slice);
-            } else {
-                // concurrent sync call already inserted an entry; discard ours.
-                // loaded: refCnt=2 (original + our retain) — release both.
+            ByteBuf sharedBuf = shared[0];
+            if (sharedBuf != loaded) {
+                // The concurrent sync insert won: our 'loaded' buffer is now
+                // redundant. refCnt = 2 (loader's original + our retain) —
+                // drop both. 'sharedBuf' carries the single distribution
+                // reference retained inside compute() above.
                 loaded.release(2);
-                // inserted[0] = prev, retained once inside compute().
-                ByteBuf slice = inserted[0].retainedSlice(0, inserted[0].readableBytes());
-                inserted[0].release();
-                ourFuture.complete(slice);
+            }
+            // Hand every waiter (owner + piggybackers) its own independent
+            // retained slice. Each retainedSlice() bumps sharedBuf's refCnt;
+            // the matching release happens when that caller releases its
+            // slice. Slicing happens here, on the owner thread, while
+            // sharedBuf is provably alive (we hold the distribution ref).
+            try {
+                for (CompletableFuture<ByteBuf> waiter : waiters) {
+                    ByteBuf slice = sharedBuf.retainedSlice(0, sharedBuf.readableBytes());
+                    if (!waiter.complete(slice)) {
+                        // The caller cancelled its future before delivery —
+                        // release the orphaned slice so it is not leaked.
+                        slice.release();
+                    }
+                }
+            } finally {
+                // Drop the distribution reference; sharedBuf now carries only
+                // the cache reference plus one reference per outstanding slice.
+                sharedBuf.release();
             }
         });
         return ourFuture;
+    }
+
+    /**
+     * Atomically removes the in-flight load for {@code key} and returns the
+     * list of waiter futures registered on it. Marks the entry {@code sealed}
+     * so that a piggyback registration racing this call starts a fresh load
+     * instead of attaching to one that is already being delivered. Returns an
+     * empty list when no entry is present.
+     */
+    private List<CompletableFuture<ByteBuf>> detachWaiters(BlockKey key) {
+        List<CompletableFuture<ByteBuf>> waiters = new ArrayList<>();
+        inFlightAsync.compute(key, (k, current) -> {
+            if (current != null) {
+                current.sealed = true;
+                waiters.addAll(current.waiters);
+            }
+            return null;
+        });
+        return waiters;
+    }
+
+    /** Completes every waiter future exceptionally with {@code error}. */
+    private static void failAllWaiters(List<CompletableFuture<ByteBuf>> waiters,
+                                       Throwable error) {
+        for (CompletableFuture<ByteBuf> waiter : waiters) {
+            waiter.completeExceptionally(error);
+        }
     }
 
     private ByteBuf invokeLoader(BlockLoader loader, String path, long offset, int length)
@@ -631,5 +695,24 @@ public final class SegmentBlockCache {
         CacheLoadException(IOException cause) {
             super(cause);
         }
+    }
+
+    /**
+     * Bookkeeping for a single in-flight async load. Holds the result futures
+     * of every caller waiting on the load: the first entry is the owner that
+     * fired the loader, the rest are piggybackers. All fields are mutated only
+     * inside an {@code inFlightAsync.compute()} callback, so the
+     * {@link ConcurrentHashMap} per-key lock provides the necessary mutual
+     * exclusion and visibility — no additional synchronization is required.
+     */
+    private static final class InFlightLoad {
+        /** Result futures of every caller awaiting this load. */
+        final List<CompletableFuture<ByteBuf>> waiters = new ArrayList<>();
+        /**
+         * Set once the owner has detached this entry to deliver results. A
+         * sealed entry never accepts new waiters: a racing piggyback starts a
+         * fresh load instead.
+         */
+        boolean sealed;
     }
 }
