@@ -61,6 +61,12 @@ public class MultiPodOptimizerHorizontalScaleTest {
     private ZookeeperMetadataStorageManager zkMeta;
     private SegmentRegistryClient registry;
     private org.apache.zookeeper.ZooKeeper rawZk;
+    /**
+     * Issue #555: stands in for the IS pods that would write swap-ack znodes
+     * after adopting a PROVISIONAL merge output, so the optimizer's atomic
+     * swap can commit in these no-real-IS integration tests.
+     */
+    private SwapAckSimulator ackSimulator;
 
     @Before
     public void setUp() throws Exception {
@@ -93,10 +99,14 @@ public class MultiPodOptimizerHorizontalScaleTest {
                 IndexingServiceInstanceDescriptor.primary("svc-0", "127.0.0.1:9000", 0));
         registry = new SegmentRegistryClient(() -> rawZk, BASE_PATH);
         registry.ensureRoot();
+        ackSimulator = new SwapAckSimulator(registry, zkMeta, TS_UUID);
     }
 
     @After
     public void tearDown() throws Exception {
+        if (ackSimulator != null) {
+            ackSimulator.close();
+        }
         if (zkMeta != null) {
             zkMeta.close();
         }

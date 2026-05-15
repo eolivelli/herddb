@@ -529,9 +529,12 @@ public final class SegmentRegistryClient {
                 return null;
             });
         } catch (KeeperException.NoNodeException missingParent) {
-            // The parent acks subtree was already torn down by the swap-completion
-            // path (multi-op already committed) or by the abort path. Either way,
-            // the IS pod's ack is no longer needed.
+            // The parent acks subtree does not exist. Three benign cases:
+            //  (1) the swap-completion path already tore it down (multi-op
+            //      committed), (2) the abort path tore it down, or (3) the
+            //      optimizer pod crashed between createSegment(PROVISIONAL)
+            //      and createSwapAckParent so the parent was never created.
+            // In all three the IS pod's ack is not (or no longer) needed.
         } catch (KeeperException | InterruptedException | IOException e) {
             if (e instanceof InterruptedException) {
                 Thread.currentThread().interrupt();
@@ -567,42 +570,66 @@ public final class SegmentRegistryClient {
     }
 
     /**
+     * Maximum re-list-and-retry passes {@link #deleteSwapAcksTree} performs
+     * when a late ephemeral ack lands between {@code getChildren} and the
+     * parent {@code delete} (raising {@code NotEmptyException}). Bounded so a
+     * pathologically chatty IS pod cannot loop the optimizer forever — after
+     * the bound the parent znode is left for the next caller / orphan sweep.
+     */
+    private static final int DELETE_ACKS_TREE_MAX_PASSES = 4;
+
+    /**
      * Recursively deletes the per-segment acks subtree. Called on multi-op
      * success (the swap is committed; acks are no longer needed) and on the
      * abort path. Idempotent: a missing subtree is a no-op.
+     *
+     * <p>If a late ephemeral ack lands between the {@code getChildren} read
+     * and the parent {@code delete}, the parent delete raises
+     * {@code NotEmptyException}; the method re-lists the children and retries,
+     * bounded by {@link #DELETE_ACKS_TREE_MAX_PASSES}. After the bound the
+     * parent znode is left in place — it is harmless (the segment is already
+     * committed or aborted, so the acks subtree is never read again) and the
+     * orphan-PROVISIONAL sweep / a future call reclaims it.
      */
     public void deleteSwapAcksTree(String segmentUuid) throws SegmentRegistryException {
         Objects.requireNonNull(segmentUuid, "segmentUuid");
         String parent = acksParentPath(segmentUuid);
         try {
             withConnectionLossRetry("deleteSwapAcksTree(" + segmentUuid + ")", () -> {
-                List<String> children;
-                try {
-                    children = zk().getChildren(parent, false);
-                } catch (KeeperException.NoNodeException gone) {
-                    return null;
-                }
-                for (String c : children) {
+                for (int pass = 0; pass < DELETE_ACKS_TREE_MAX_PASSES; pass++) {
+                    List<String> children;
                     try {
-                        zk().delete(parent + "/" + c, -1);
+                        children = zk().getChildren(parent, false);
+                    } catch (KeeperException.NoNodeException gone) {
+                        return null;
+                    }
+                    for (String c : children) {
+                        try {
+                            zk().delete(parent + "/" + c, -1);
+                        } catch (KeeperException.NoNodeException ok) {
+                            // ephemeral races: the IS pod's session just expired
+                        }
+                    }
+                    try {
+                        zk().delete(parent, -1);
+                        return null;
                     } catch (KeeperException.NoNodeException ok) {
-                        // ephemeral races: the IS pod's session just expired
+                        return null;
+                    } catch (KeeperException.NotEmptyException raceWithLateAck) {
+                        // A new ephemeral ack landed between getChildren and
+                        // delete. Re-list and retry up to the pass bound.
+                        java.util.logging.Logger.getLogger(SegmentRegistryClient.class.getName())
+                                .log(java.util.logging.Level.FINE,
+                                        "deleteSwapAcksTree({0}): late ack landed (pass {1}); re-listing",
+                                        new Object[]{segmentUuid, pass + 1});
                     }
                 }
-                try {
-                    zk().delete(parent, -1);
-                } catch (KeeperException.NoNodeException ok) {
-                    // already gone — fine
-                } catch (KeeperException.NotEmptyException raceWithLateAck) {
-                    // A new ephemeral ack landed between getChildren and delete.
-                    // The optimizer treats the orphaned subtree as harmless; the
-                    // ephemeral will die with the IS pod's session and a future
-                    // call (e.g. next tick) cleans it up. Log at FINE.
-                    java.util.logging.Logger.getLogger(SegmentRegistryClient.class.getName())
-                            .log(java.util.logging.Level.FINE,
-                                    "deleteSwapAcksTree({0}): late ack landed during delete; will retry later",
-                                    segmentUuid);
-                }
+                // Bound exhausted: leave the (harmless) parent znode behind.
+                java.util.logging.Logger.getLogger(SegmentRegistryClient.class.getName())
+                        .log(java.util.logging.Level.FINE,
+                                "deleteSwapAcksTree({0}): acks parent still non-empty after {1}"
+                                        + " passes; leaving it for a later sweep",
+                                new Object[]{segmentUuid, DELETE_ACKS_TREE_MAX_PASSES});
                 return null;
             });
         } catch (KeeperException | InterruptedException | IOException e) {

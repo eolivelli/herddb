@@ -208,6 +208,89 @@ public class OptimizerSwapAckTimeoutAbortTest {
     }
 
     @Test
+    public void acksCompleteAtTimeoutBoundaryStillCommits() throws Exception {
+        // Issue #555 review follow-up #4: the acks check runs BEFORE the
+        // timeout check, so a healthy merge whose acks land exactly at the
+        // timeout boundary must COMMIT, not abort. A GC pause / loaded CI
+        // runner must never spuriously roll back a swap whose acks are in.
+        List<VersionedSegmentMetadata> inputs = activeInputs("seg-b-1", "seg-b-2");
+        String taskId = UUID.randomUUID().toString();
+        taskRegistry.createTask(pendingTaskWithAcks(taskId, inputs, List.of("is-boundary")));
+        OptimizerTaskConsumer c = consumer("w-boundary", /* ackTimeoutMs */ 30_000L,
+                /* maxAttempts */ 3);
+
+        assertTrue(c.consumeOneTask()); // → AWAITING_ACK
+        String outputUuid = taskRegistry.getTask(TS_UUID, taskId)
+                .orElseThrow().task().getOutputSegmentUuid();
+        // Ack lands.
+        segmentRegistry.createSwapAckNode(outputUuid, "is-boundary");
+        // Advance the clock to exactly past the timeout boundary.
+        fakeClock.addAndGet(30_001L);
+
+        // The acks are complete → the swap commits despite the elapsed timeout.
+        assertTrue(c.consumeOneTask());
+        OptimizerTask afterSwap = taskRegistry.getTask(TS_UUID, taskId).orElseThrow().task();
+        assertEquals(OptimizerTaskState.DONE, afterSwap.getState());
+        assertEquals(SegmentState.ACTIVE,
+                segmentRegistry.getSegment(TS_UUID, IDX, outputUuid).orElseThrow()
+                        .metadata().getState());
+        assertEquals(SegmentState.DEPRECATED,
+                segmentRegistry.getSegment(TS_UUID, IDX, "seg-b-1").orElseThrow()
+                        .metadata().getState());
+        assertEquals(0, c.getTasksAckTimeoutTotal());
+        assertEquals(1, c.getTasksSwapCommittedTotal());
+    }
+
+    @Test
+    public void requiresAcksTaskWithEmptyExpectedListAbortsFailClosed() throws Exception {
+        // Issue #555 fail-closed: a requiresAcks task with an empty
+        // expectedAckServiceIds list is a fatal misconfiguration (a
+        // production producer would have skipped task creation). If such a
+        // task ever reaches the consumer it MUST abort the swap rather than
+        // commit it with zero acks.
+        List<VersionedSegmentMetadata> inputs = activeInputs("seg-fc-1", "seg-fc-2");
+        String taskId = UUID.randomUUID().toString();
+        List<String> uuids = new ArrayList<>();
+        Map<String, Integer> versions = new LinkedHashMap<>();
+        for (VersionedSegmentMetadata v : inputs) {
+            uuids.add(v.metadata().getSegmentUuid());
+            versions.put(v.metadata().getSegmentUuid(), v.zkVersion());
+        }
+        OptimizerTask pending = OptimizerTask.builder()
+                .taskId(taskId)
+                .tablespaceUuid(TS_UUID)
+                .indexUuid(IDX)
+                .inputSegmentUuids(uuids)
+                .inputSegmentExpectedVersions(versions)
+                .targetOwnerInstanceId(0)
+                .state(OptimizerTaskState.PENDING)
+                .createdAtEpochMillis(fakeClock.get())
+                .leaderEpoch(1L)
+                .expectedAckServiceIds(List.of())   // empty
+                .requiresAcks(true)                  // but requiresAcks
+                .build();
+        taskRegistry.createTask(pending);
+        OptimizerTaskConsumer c = consumer("w-failclosed", /* ackTimeoutMs */ 60_000L,
+                /* maxAttempts */ 3);
+
+        assertTrue(c.consumeOneTask()); // → AWAITING_ACK (output staged)
+        String outputUuid = taskRegistry.getTask(TS_UUID, taskId)
+                .orElseThrow().task().getOutputSegmentUuid();
+
+        // Next drain must ABORT (not commit) — fail-closed.
+        assertTrue(c.consumeOneTask());
+        OptimizerTask afterAbort = taskRegistry.getTask(TS_UUID, taskId).orElseThrow().task();
+        assertEquals(OptimizerTaskState.FAILED, afterAbort.getState());
+        assertTrue(afterAbort.getLastError().getMessage().contains("requiresAcks"));
+        // Inputs untouched, staged output deleted.
+        assertEquals(SegmentState.ACTIVE,
+                segmentRegistry.getSegment(TS_UUID, IDX, "seg-fc-1").orElseThrow()
+                        .metadata().getState());
+        assertFalse(segmentRegistry.getSegment(TS_UUID, IDX, outputUuid).isPresent());
+        assertEquals(0, c.getTasksSwapCommittedTotal());
+    }
+
+    @Test
     public void ackTimeoutAtMaxAttemptsTransitionsToPoison() throws Exception {
         List<VersionedSegmentMetadata> inputs = activeInputs("seg-p-1", "seg-p-2");
         String taskId = UUID.randomUUID().toString();

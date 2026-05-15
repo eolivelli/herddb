@@ -83,15 +83,24 @@ public final class OptimizerTaskProducer {
      */
     private final IndexingServiceInstanceDirectory instanceDirectory;
 
-    public OptimizerTaskProducer(OptimizerTaskRegistry taskRegistry,
-                                 SegmentRegistryClient segmentRegistry,
-                                 String tablespaceUuid,
-                                 MergePolicy mergePolicy,
-                                 OwnerSelector ownerSelector,
-                                 OptimizerLeaderLock leaderLock,
-                                 LeaderEpoch leaderEpoch,
-                                 OptimizerOrphanScanner orphanScanner,
-                                 LongSupplier clock) {
+    /**
+     * Directory-less constructor — package-private on purpose (issue #555):
+     * a producer built without an {@link IndexingServiceInstanceDirectory}
+     * emits tasks with {@code requiresAcks=false}, which lets the consumer
+     * commit the atomic swap WITHOUT waiting for any IS pod to acknowledge.
+     * That is acceptable for unit/integration tests in this package but
+     * MUST NOT be used by production wiring — {@link IndexOptimizerMain}
+     * uses the public 10-arg constructor with a live directory.
+     */
+    OptimizerTaskProducer(OptimizerTaskRegistry taskRegistry,
+                          SegmentRegistryClient segmentRegistry,
+                          String tablespaceUuid,
+                          MergePolicy mergePolicy,
+                          OwnerSelector ownerSelector,
+                          OptimizerLeaderLock leaderLock,
+                          LeaderEpoch leaderEpoch,
+                          OptimizerOrphanScanner orphanScanner,
+                          LongSupplier clock) {
         this(taskRegistry, segmentRegistry, tablespaceUuid, mergePolicy, ownerSelector,
                 leaderLock, leaderEpoch, orphanScanner, clock,
                 /* instanceDirectory */ null);
@@ -116,11 +125,11 @@ public final class OptimizerTaskProducer {
         this.leaderEpoch = Objects.requireNonNull(leaderEpoch, "leaderEpoch");
         this.orphanScanner = Objects.requireNonNull(orphanScanner, "orphanScanner");
         this.clock = Objects.requireNonNull(clock, "clock");
-        // Null acceptable: legacy tests that don't care about the issue #555
-        // ack list construct without the directory. In that case the task's
-        // expectedAckServiceIds is left empty and the consumer is expected
-        // to either resolve it lazily (production wiring will inject a real
-        // directory) or run in test mode where the ack-wait is bypassed.
+        // Null only for in-package unit/integration tests (see the
+        // package-private directory-less constructor above). When null,
+        // produced tasks carry requiresAcks=false and the consumer commits
+        // the swap without waiting for acks. Production (IndexOptimizerMain)
+        // always passes a live ZkIndexingServiceInstanceDirectory here.
         this.instanceDirectory = instanceDirectory;
     }
 
@@ -149,6 +158,7 @@ public final class OptimizerTaskProducer {
 
         ownerSelector.tickStart();
         long tasksCreated = 0;
+        long tasksSkippedNoAckTargets = 0;
         long indexesScanned = 0;
         for (String indexUuid : segmentRegistry.listIndexes(tablespaceUuid)) {
             indexesScanned++;
@@ -175,6 +185,16 @@ public final class OptimizerTaskProducer {
                 continue;
             }
             OptimizerTask task = buildTask(indexUuid, candidates, owner, epoch);
+            if (task == null) {
+                // Issue #555: a directory-backed producer could not resolve
+                // the ack-target service IDs for the chosen owner. Emitting
+                // a task here would let the consumer commit the atomic swap
+                // with zero acks — the exact data-loss window we are closing.
+                // Skip this index; the next tick retries once the IS pods
+                // are visible in ZK again.
+                tasksSkippedNoAckTargets++;
+                continue;
+            }
             try {
                 taskRegistry.createTask(task);
                 tasksCreated++;
@@ -188,9 +208,17 @@ public final class OptimizerTaskProducer {
         return new ProduceResult(true, indexesScanned, tasksCreated, epoch,
                 orphans.orphansReset, orphans.orphansPoisoned,
                 orphans.orphansDeletedAfterDeprecate,
-                orphans.awaitingAckAborted, orphans.terminalGcCount);
+                orphans.awaitingAckAborted, orphans.terminalGcCount,
+                tasksSkippedNoAckTargets);
     }
 
+    /**
+     * Builds a merge task for the chosen candidates / owner, or returns
+     * {@code null} when a directory-backed producer cannot resolve the
+     * ack-target service IDs for {@code owner} (issue #555 fail-closed:
+     * the caller skips this index instead of emitting a task whose atomic
+     * swap would commit without waiting for any IS pod to acknowledge).
+     */
     private OptimizerTask buildTask(String indexUuid,
                                     List<VersionedSegmentMetadata> candidates,
                                     int owner, long epoch) {
@@ -207,15 +235,24 @@ public final class OptimizerTaskProducer {
         // wait does not extend the expected-acks set forever; a shadow
         // scaled DOWN during the wait is handled by the swap-ack-timeout
         // abort path.
-        List<String> expectedAcks = instanceDirectory != null
+        //
+        // requiresAcks is true iff a live IndexingServiceInstanceDirectory
+        // is wired (production). When the directory cannot produce any
+        // ack target (ZK blip, no IS pod registered for `owner`) we MUST
+        // NOT emit the task — returning null makes the caller skip the
+        // index. A directory-less producer (test / legacy) sets
+        // requiresAcks=false and the consumer commits without acks.
+        boolean requiresAcks = instanceDirectory != null;
+        List<String> expectedAcks = requiresAcks
                 ? instanceDirectory.serviceIdsForEffectiveInstance(owner)
                 : java.util.Collections.<String>emptyList();
-        if (instanceDirectory != null && expectedAcks.isEmpty()) {
+        if (requiresAcks && expectedAcks.isEmpty()) {
             LOGGER.log(Level.WARNING,
                     "issue #555: no IS pod registered for effectiveInstanceId={0} at task-creation"
-                            + " time; the consumer will abort the swap on timeout."
-                            + " indexUuid={1}, ownerInstanceId={0}",
+                            + " time (ZK blip or scale-down race); skipping task creation for"
+                            + " index {1} — the next tick retries when the IS pods are visible.",
                     new Object[]{owner, indexUuid});
+            return null;
         }
         return OptimizerTask.builder()
                 .taskId(UUID.randomUUID().toString())
@@ -228,6 +265,7 @@ public final class OptimizerTaskProducer {
                 .createdAtEpochMillis(clock.getAsLong())
                 .leaderEpoch(epoch)
                 .expectedAckServiceIds(expectedAcks)
+                .requiresAcks(requiresAcks)
                 .build();
     }
 
@@ -243,11 +281,25 @@ public final class OptimizerTaskProducer {
         /** Issue #555: AWAITING_ACK tasks aborted by the orphan scanner. */
         public final long awaitingAckAborted;
         public final long terminalGcCount;
+        /**
+         * Issue #555: indexes for which a task was NOT created because the
+         * directory could not resolve the ack-target service IDs (fail-closed).
+         */
+        public final long tasksSkippedNoAckTargets;
 
         ProduceResult(boolean ranAsLeader, long indexesScanned, long tasksCreated,
                       Long leaderEpoch, long orphansReset, long orphansPoisoned,
                       long orphansDeletedAfterDeprecate, long awaitingAckAborted,
                       long terminalGcCount) {
+            this(ranAsLeader, indexesScanned, tasksCreated, leaderEpoch, orphansReset,
+                    orphansPoisoned, orphansDeletedAfterDeprecate, awaitingAckAborted,
+                    terminalGcCount, /* tasksSkippedNoAckTargets */ 0L);
+        }
+
+        ProduceResult(boolean ranAsLeader, long indexesScanned, long tasksCreated,
+                      Long leaderEpoch, long orphansReset, long orphansPoisoned,
+                      long orphansDeletedAfterDeprecate, long awaitingAckAborted,
+                      long terminalGcCount, long tasksSkippedNoAckTargets) {
             this.ranAsLeader = ranAsLeader;
             this.indexesScanned = indexesScanned;
             this.tasksCreated = tasksCreated;
@@ -257,6 +309,7 @@ public final class OptimizerTaskProducer {
             this.orphansDeletedAfterDeprecate = orphansDeletedAfterDeprecate;
             this.awaitingAckAborted = awaitingAckAborted;
             this.terminalGcCount = terminalGcCount;
+            this.tasksSkippedNoAckTargets = tasksSkippedNoAckTargets;
         }
     }
 }

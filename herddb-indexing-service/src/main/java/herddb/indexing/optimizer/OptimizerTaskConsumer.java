@@ -111,6 +111,17 @@ public final class OptimizerTaskConsumer {
     private final long swapAckTimeoutMillis;
     private final LongSupplier clock;
 
+    /**
+     * Test hook (package-private) — invoked AFTER {@code driveOneAwaitingAck}
+     * has observed every expected ack and re-read the inputs, but BEFORE the
+     * {@link SegmentRegistryClient#atomicSwap} multi-op. Used by
+     * {@code OptimizerSwapAtomicityTest} to delete an ack ephemeral in the
+     * window between the ack check and the commit, proving the swap still
+     * commits (the multi-op operates only on segment znodes, never on the
+     * acks subtree). Production code never sets this field.
+     */
+    volatile Runnable postAckCheckPreSwapHookForTests;
+
     // Observability counters wired into /metrics by OptimizerHttpServer.
     private final AtomicLong tasksClaimedTotal = new AtomicLong();
     private final AtomicLong tasksCompletedSuccessfullyTotal = new AtomicLong();
@@ -362,34 +373,56 @@ public final class OptimizerTaskConsumer {
             return true;
         }
 
-        // 2. Has the ack timeout elapsed?
-        long now = clock.getAsLong();
-        long stagedAt = t.getProvisionalOutputCreatedAtEpochMillis();
-        if (stagedAt > 0L && now - stagedAt > swapAckTimeoutMillis) {
-            LOGGER.log(Level.WARNING,
-                    "issue #555: AWAITING_ACK task {0} timed out after {1} ms "
-                            + "(expected {2}); aborting swap of {3}",
-                    new Object[]{t.getTaskId(), now - stagedAt,
-                            t.getExpectedAckServiceIds(), outputUuid});
-            tasksAckTimeoutTotal.incrementAndGet();
-            abortStagedSwap(vt, staged, "ack timeout (" + (now - stagedAt) + " ms)");
+        // 2. Issue #555 fail-closed: a production task (requiresAcks=true)
+        //    with an empty expected-acks list is a fatal misconfiguration —
+        //    the producer is supposed to skip task creation entirely when it
+        //    cannot resolve ack targets. If such a task ever reaches the
+        //    consumer, ABORT the swap rather than commit it with zero acks
+        //    (committing would re-open the issue #555 data-loss window).
+        List<String> expected = t.getExpectedAckServiceIds();
+        if (t.isRequiresAcks() && expected.isEmpty()) {
+            LOGGER.log(Level.SEVERE,
+                    "issue #555: AWAITING_ACK task {0} requiresAcks but has an empty"
+                            + " expectedAckServiceIds list — aborting swap of {1} (a"
+                            + " production producer must never emit such a task)",
+                    new Object[]{t.getTaskId(), outputUuid});
+            abortStagedSwap(vt, staged, "requiresAcks task with empty expectedAckServiceIds");
             return true;
         }
 
-        // 3. Are all expected acks present?
+        // 3. Are all expected acks present? Check the acks BEFORE the timeout
+        //    so that acks landing exactly at the timeout boundary still
+        //    commit the swap (a healthy merge must not be spuriously aborted
+        //    by a GC pause / loaded CI runner — review follow-up #4).
         Set<String> presentAcks = new HashSet<>(
                 segmentRegistry.listSwapAcks(outputUuid, /* watcher */ null));
-        List<String> expected = t.getExpectedAckServiceIds();
-        if (!expected.isEmpty() && !presentAcks.containsAll(expected)) {
-            // Still waiting. Not a progress event.
+        boolean allAcksPresent = expected.isEmpty() || presentAcks.containsAll(expected);
+
+        if (!allAcksPresent) {
+            // Not all acks in yet — only now do we consider the timeout.
+            long nowWaiting = clock.getAsLong();
+            long stagedAtWaiting = t.getProvisionalOutputCreatedAtEpochMillis();
+            if (stagedAtWaiting > 0L && nowWaiting - stagedAtWaiting > swapAckTimeoutMillis) {
+                LOGGER.log(Level.WARNING,
+                        "issue #555: AWAITING_ACK task {0} timed out after {1} ms with"
+                                + " acks {2}/{3} present; aborting swap of {4}",
+                        new Object[]{t.getTaskId(), nowWaiting - stagedAtWaiting,
+                                presentAcks.size(), expected.size(), outputUuid});
+                tasksAckTimeoutTotal.incrementAndGet();
+                abortStagedSwap(vt, staged, "ack timeout ("
+                        + (nowWaiting - stagedAtWaiting) + " ms, "
+                        + presentAcks.size() + "/" + expected.size() + " acks)");
+                return true;
+            }
+            // Still inside the ack window with acks incomplete — keep waiting.
             return false;
         }
         if (expected.isEmpty()) {
-            // Producer ran without a directory injection (legacy/test path).
+            // Directory-less producer (test / legacy path, requiresAcks=false).
             // Commit immediately: no expected parties.
             LOGGER.log(Level.FINE,
-                    "AWAITING_ACK task {0} has empty expectedAckServiceIds; "
-                            + "committing swap of {1} immediately",
+                    "AWAITING_ACK task {0} has empty expectedAckServiceIds (requiresAcks=false);"
+                            + " committing swap of {1} immediately",
                     new Object[]{t.getTaskId(), outputUuid});
         }
 
@@ -405,12 +438,22 @@ public final class OptimizerTaskConsumer {
             return true;
         }
 
+        // Test hook: inject a mutation (e.g. delete an ack ephemeral) in the
+        // window between the ack check and the multi-op. Production never
+        // sets this — the atomic swap below operates ONLY on segment znodes,
+        // so a vanishing ack here cannot stop a swap the consumer already
+        // decided to commit.
+        Runnable preSwapHook = postAckCheckPreSwapHookForTests;
+        if (preSwapHook != null) {
+            preSwapHook.run();
+        }
+
         // 5. Fire the atomic swap with bounded retries against
         //    BadVersionException — a CAS loss means an input got bumped
         //    between our re-read and the multi-op.
         long retentionUntil = retentionMillis == 0L
                 ? SegmentMetadata.NO_RETENTION
-                : now + retentionMillis;
+                : clock.getAsLong() + retentionMillis;
         boolean committed = false;
         SegmentRegistryException lastCasFailure = null;
         for (int attempt = 0; attempt < ATOMIC_SWAP_MAX_RETRIES; attempt++) {

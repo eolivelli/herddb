@@ -86,6 +86,20 @@ public final class OptimizerTask {
      * that never reached {@code AWAITING_ACK}.
      */
     private final List<String> expectedAckServiceIds;
+    /**
+     * Issue #555. {@code true} when the task was produced with a live
+     * {@link IndexingServiceInstanceDirectory} wired in — i.e. a production
+     * task whose atomic swap MUST wait for every interested IS pod to
+     * acknowledge before committing. When {@code true} the consumer
+     * fail-closes: an empty {@link #expectedAckServiceIds} is treated as a
+     * fatal misconfiguration and the swap is ABORTED rather than committed
+     * (a production producer skips task creation entirely when it cannot
+     * resolve the ack targets, so this combination should never occur — the
+     * consumer's abort is defence-in-depth). When {@code false} (test /
+     * directory-less path) an empty expected-acks list means "commit
+     * immediately, no acks required".
+     */
+    private final boolean requiresAcks;
 
     @JsonCreator
     public OptimizerTask(
@@ -104,7 +118,8 @@ public final class OptimizerTask {
             @JsonProperty("createdAtEpochMillis") long createdAtEpochMillis,
             @JsonProperty("leaderEpoch") long leaderEpoch,
             @JsonProperty("provisionalOutputCreatedAtEpochMillis") long provisionalOutputCreatedAtEpochMillis,
-            @JsonProperty("expectedAckServiceIds") List<String> expectedAckServiceIds) {
+            @JsonProperty("expectedAckServiceIds") List<String> expectedAckServiceIds,
+            @JsonProperty("requiresAcks") boolean requiresAcks) {
         this.schemaVersion = schemaVersionOrNull == null ? SCHEMA_VERSION : schemaVersionOrNull;
         this.taskId = Objects.requireNonNull(taskId, "taskId");
         this.tablespaceUuid = Objects.requireNonNull(tablespaceUuid, "tablespaceUuid");
@@ -130,6 +145,7 @@ public final class OptimizerTask {
         this.expectedAckServiceIds = expectedAckServiceIds == null
                 ? Collections.emptyList()
                 : List.copyOf(expectedAckServiceIds);
+        this.requiresAcks = requiresAcks;
     }
 
     public int getSchemaVersion() {
@@ -208,6 +224,17 @@ public final class OptimizerTask {
         return expectedAckServiceIds;
     }
 
+    /**
+     * {@code true} when the atomic swap MUST wait for every IS pod in
+     * {@link #getExpectedAckServiceIds()} to acknowledge before committing
+     * (issue #555). Production tasks are always created with this set; an
+     * empty expected-acks list on a {@code requiresAcks} task is a fatal
+     * misconfiguration the consumer aborts on.
+     */
+    public boolean isRequiresAcks() {
+        return requiresAcks;
+    }
+
     public byte[] serialize() {
         try {
             return MAPPER.writeValueAsBytes(this);
@@ -241,7 +268,8 @@ public final class OptimizerTask {
                 .createdAtEpochMillis(createdAtEpochMillis)
                 .leaderEpoch(leaderEpoch)
                 .provisionalOutputCreatedAtEpochMillis(provisionalOutputCreatedAtEpochMillis)
-                .expectedAckServiceIds(expectedAckServiceIds);
+                .expectedAckServiceIds(expectedAckServiceIds)
+                .requiresAcks(requiresAcks);
     }
 
     public static Builder builder() {
@@ -263,6 +291,7 @@ public final class OptimizerTask {
                 && createdAtEpochMillis == that.createdAtEpochMillis
                 && leaderEpoch == that.leaderEpoch
                 && provisionalOutputCreatedAtEpochMillis == that.provisionalOutputCreatedAtEpochMillis
+                && requiresAcks == that.requiresAcks
                 && Objects.equals(taskId, that.taskId)
                 && Objects.equals(tablespaceUuid, that.tablespaceUuid)
                 && Objects.equals(indexUuid, that.indexUuid)
@@ -281,7 +310,7 @@ public final class OptimizerTask {
                 inputSegmentUuids, inputSegmentExpectedVersions, targetOwnerInstanceId,
                 state, attempts, lastError, claim, outputSegmentUuid,
                 createdAtEpochMillis, leaderEpoch,
-                provisionalOutputCreatedAtEpochMillis, expectedAckServiceIds);
+                provisionalOutputCreatedAtEpochMillis, expectedAckServiceIds, requiresAcks);
     }
 
     @Override
@@ -419,6 +448,7 @@ public final class OptimizerTask {
         private long leaderEpoch;
         private long provisionalOutputCreatedAtEpochMillis;
         private List<String> expectedAckServiceIds = Collections.emptyList();
+        private boolean requiresAcks;
 
         public Builder taskId(String value) {
             this.taskId = value;
@@ -501,12 +531,17 @@ public final class OptimizerTask {
             return this;
         }
 
+        public Builder requiresAcks(boolean value) {
+            this.requiresAcks = value;
+            return this;
+        }
+
         public OptimizerTask build() {
             return new OptimizerTask(SCHEMA_VERSION, taskId, tablespaceUuid, indexUuid,
                     inputSegmentUuids, inputSegmentExpectedVersions, targetOwnerInstanceId,
                     state, attempts, lastError, claim, outputSegmentUuid,
                     createdAtEpochMillis, leaderEpoch,
-                    provisionalOutputCreatedAtEpochMillis, expectedAckServiceIds);
+                    provisionalOutputCreatedAtEpochMillis, expectedAckServiceIds, requiresAcks);
         }
     }
 }

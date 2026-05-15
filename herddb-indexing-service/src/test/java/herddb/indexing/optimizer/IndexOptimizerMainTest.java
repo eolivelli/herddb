@@ -133,6 +133,18 @@ public class IndexOptimizerMainTest {
         // Register the tablespace so the optimizer can resolve the UUID by name.
         registerTablespace(TS_NAME, TS_UUID);
 
+        // Issue #555: register one IS primary instance so the producer can
+        // resolve a non-empty expectedAckServiceIds list, and run a
+        // SwapAckSimulator so the optimizer's atomic swap actually commits
+        // (no real IS pod exists in this in-process test).
+        ZookeeperMetadataStorageManager zkMeta = new ZookeeperMetadataStorageManager(
+                zkServer.getConnectString(), 30000, BASE_PATH);
+        zkMeta.start(false);
+        zkMeta.registerIndexingServiceInstance(
+                herddb.metadata.IndexingServiceInstanceDescriptor.primary(
+                        "svc-0", "127.0.0.1:9000", 0));
+        SwapAckSimulator ackSimulator = new SwapAckSimulator(registry, zkMeta, TS_UUID);
+
         // Pre-seed three small segments. The AggressivePolicy fires whenever ≥2
         // sub-target segments exist; with maxCount=100 all three are merged
         // into a single output in one cycle.
@@ -191,6 +203,8 @@ public class IndexOptimizerMainTest {
             assertEquals(3, deprecated);
         } finally {
             main.shutdown();
+            ackSimulator.close();
+            zkMeta.close();
         }
     }
 

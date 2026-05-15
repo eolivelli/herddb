@@ -19,13 +19,16 @@
  */
 package herddb.indexing.optimizer;
 
+import herddb.indexing.segment.SegmentMetadata;
 import herddb.indexing.segment.SegmentRegistryClient;
 import herddb.indexing.segment.SegmentRegistryException;
 import herddb.indexing.segment.SegmentState;
 import herddb.indexing.segment.VersionedSegmentMetadata;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.function.LongSupplier;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -120,6 +123,7 @@ public final class OptimizerOrphanScanner {
         long terminalGcCount = 0;
 
         List<VersionedOptimizerTask> all = taskRegistry.listTasks(tablespaceUuid);
+        Set<String> awaitingAckOutputUuids = new HashSet<>();
         for (VersionedOptimizerTask vt : all) {
             OptimizerTask t = vt.task();
             OptimizerTaskState state = t.getState();
@@ -132,6 +136,9 @@ public final class OptimizerOrphanScanner {
                     default: break;
                 }
             } else if (state == OptimizerTaskState.AWAITING_ACK) {
+                if (t.getOutputSegmentUuid() != null) {
+                    awaitingAckOutputUuids.add(t.getOutputSegmentUuid());
+                }
                 if (handleAwaitingAck(vt, now)) {
                     awaitingAckAborted++;
                 }
@@ -141,8 +148,95 @@ public final class OptimizerOrphanScanner {
                 }
             }
         }
+        // Issue #555: sweep orphan PROVISIONAL segments left behind by an
+        // optimizer pod that crashed AFTER createSegment(PROVISIONAL) but
+        // BEFORE the CLAIMED → AWAITING_ACK CAS recorded the output UUID on
+        // the task. Such a znode is referenced by NO AWAITING_ACK task; it
+        // is never served (PROVISIONAL is excluded from search + merge
+        // candidates) but it must still be reclaimed so the registry does
+        // not accumulate orphan znodes over time.
+        long orphanProvisionalSwept = sweepOrphanProvisionalSegments(now, awaitingAckOutputUuids);
         return new ScanResult(orphansReset, orphansPoisoned,
-                orphansDeletedAfterDeprecate, awaitingAckAborted, terminalGcCount);
+                orphansDeletedAfterDeprecate, awaitingAckAborted, terminalGcCount,
+                orphanProvisionalSwept);
+    }
+
+    /**
+     * Issue #555: deletes PROVISIONAL segment znodes (+ acks subtree) that
+     * are older than {@link #provisionalGcMs} and not referenced by any
+     * AWAITING_ACK task's {@code outputSegmentUuid}. These are the staged
+     * outputs of an optimizer pod that died mid-{@code executeClaimedTask}.
+     * Best-effort: a CAS loss or read failure just means the next scan
+     * retries. Multipart files are NOT deleted here (the scanner has no
+     * {@code DataStorageManager}); the file-server-side GC / an operator
+     * sweep reclaims them — same best-effort posture as the retention
+     * reaper's {@code safeModeFileDeletion}.
+     *
+     * @return number of orphan PROVISIONAL znodes deleted this scan.
+     */
+    private long sweepOrphanProvisionalSegments(long now, Set<String> awaitingAckOutputUuids) {
+        if (provisionalGcMs == Long.MAX_VALUE) {
+            // GC disabled (legacy constructor) — skip the segment listing cost.
+            return 0L;
+        }
+        long swept = 0L;
+        List<String> indexes;
+        try {
+            indexes = segmentRegistry.listIndexes(tablespaceUuid);
+        } catch (SegmentRegistryException listIndexesFailed) {
+            LOGGER.log(Level.FINE,
+                    "orphan-PROVISIONAL sweep: listIndexes failed: {0}",
+                    listIndexesFailed.getMessage());
+            return 0L;
+        }
+        for (String indexUuid : indexes) {
+            List<VersionedSegmentMetadata> segments;
+            try {
+                segments = segmentRegistry.listSegments(tablespaceUuid, indexUuid);
+            } catch (SegmentRegistryException listSegmentsFailed) {
+                LOGGER.log(Level.FINE,
+                        "orphan-PROVISIONAL sweep: listSegments({0}) failed: {1}",
+                        new Object[]{indexUuid, listSegmentsFailed.getMessage()});
+                continue;
+            }
+            for (VersionedSegmentMetadata v : segments) {
+                SegmentMetadata m = v.metadata();
+                if (m.getState() != SegmentState.PROVISIONAL) {
+                    continue;
+                }
+                if (awaitingAckOutputUuids.contains(m.getSegmentUuid())) {
+                    // Tied to a live AWAITING_ACK task — handleAwaitingAck owns it.
+                    continue;
+                }
+                long stagedAt = m.getProvisionalCreatedAtEpochMillis();
+                if (stagedAt <= 0L || now - stagedAt < provisionalGcMs) {
+                    // Either no timestamp (defensive) or still inside the GC
+                    // window — a consumer may legitimately be mid-stage.
+                    continue;
+                }
+                try {
+                    segmentRegistry.casDeleteSegment(v);
+                    segmentRegistry.deleteSwapAcksTree(m.getSegmentUuid());
+                    swept++;
+                    LOGGER.log(Level.WARNING,
+                            "orphan-PROVISIONAL sweep: deleted dangling staged segment {0}"
+                                    + " (age {1} ms, no AWAITING_ACK task references it);"
+                                    + " its multipart files may need a file-server-side GC",
+                            new Object[]{m.getSegmentUuid(), now - stagedAt});
+                } catch (SegmentRegistryException.VersionMismatch raced) {
+                    // A consumer just progressed the znode (e.g. atomicSwap
+                    // committed it to ACTIVE) — leave it; next scan re-evaluates.
+                    LOGGER.log(Level.FINE,
+                            "orphan-PROVISIONAL sweep: CAS lost for {0}; skipping",
+                            m.getSegmentUuid());
+                } catch (SegmentRegistryException deleteFailed) {
+                    LOGGER.log(Level.FINE,
+                            "orphan-PROVISIONAL sweep: delete of {0} failed: {1}",
+                            new Object[]{m.getSegmentUuid(), deleteFailed.getMessage()});
+                }
+            }
+        }
+        return swept;
     }
 
     private Outcome handleClaimed(VersionedOptimizerTask vt, long now) throws OptimizerTaskRegistryException {
@@ -295,15 +389,29 @@ public final class OptimizerOrphanScanner {
         /** Issue #555: AWAITING_ACK tasks aborted by the scanner (age > provisionalGcMs). */
         public final long awaitingAckAborted;
         public final long terminalGcCount;
+        /**
+         * Issue #555: orphan PROVISIONAL znodes swept — staged outputs of an
+         * optimizer pod that crashed before recording the output UUID on its
+         * task. Not referenced by any AWAITING_ACK task.
+         */
+        public final long orphanProvisionalSwept;
 
         public ScanResult(long orphansReset, long orphansPoisoned,
                    long orphansDeletedAfterDeprecate, long awaitingAckAborted,
                    long terminalGcCount) {
+            this(orphansReset, orphansPoisoned, orphansDeletedAfterDeprecate,
+                    awaitingAckAborted, terminalGcCount, /* orphanProvisionalSwept */ 0L);
+        }
+
+        public ScanResult(long orphansReset, long orphansPoisoned,
+                   long orphansDeletedAfterDeprecate, long awaitingAckAborted,
+                   long terminalGcCount, long orphanProvisionalSwept) {
             this.orphansReset = orphansReset;
             this.orphansPoisoned = orphansPoisoned;
             this.orphansDeletedAfterDeprecate = orphansDeletedAfterDeprecate;
             this.awaitingAckAborted = awaitingAckAborted;
             this.terminalGcCount = terminalGcCount;
+            this.orphanProvisionalSwept = orphanProvisionalSwept;
         }
     }
 }

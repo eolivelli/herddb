@@ -205,6 +205,104 @@ public class OptimizerSwapCrashAfterProvisionalTest {
     }
 
     @Test
+    public void scannerSweepsOrphanProvisionalWithNoTaskReference() throws Exception {
+        // Issue #555: a pod that crashed BETWEEN createSegment(PROVISIONAL)
+        // and the CLAIMED → AWAITING_ACK CAS leaves a PROVISIONAL znode that
+        // NO task references (the task, still CLAIMED, never recorded the
+        // output UUID — and the orphan scanner reset it to PENDING). The
+        // orphan-PROVISIONAL sweep must reclaim that dangling znode.
+        seedActive("seg-keep-active");
+        String orphanUuid = UUID.randomUUID().toString();
+        seedProvisional(orphanUuid, /* stagedAt */ 10_000L);
+        // No task in the registry references orphanUuid at all.
+
+        OptimizerOrphanScanner scanner = new OptimizerOrphanScanner(
+                taskRegistry, segmentRegistry, TS_UUID,
+                /* maxAttempts */ 3,
+                /* orphanResetMs */ 1_000L,
+                /* terminalRetentionMs */ 60_000L,
+                /* poisonRetentionMs */ 60_000L,
+                /* provisionalGcMs */ 30_000L,
+                fakeClock::get);
+
+        // Within the GC window: the orphan PROVISIONAL znode is left alone.
+        fakeClock.set(20_000L);
+        OptimizerOrphanScanner.ScanResult early = scanner.scan();
+        assertEquals(0, early.orphanProvisionalSwept);
+        assertTrue(segmentRegistry.getSegment(TS_UUID, IDX, orphanUuid).isPresent());
+
+        // Past the GC window: the sweep deletes it.
+        fakeClock.set(60_000L);
+        OptimizerOrphanScanner.ScanResult late = scanner.scan();
+        assertEquals("orphan PROVISIONAL znode must be swept",
+                1, late.orphanProvisionalSwept);
+        assertFalse("orphan PROVISIONAL znode must be gone",
+                segmentRegistry.getSegment(TS_UUID, IDX, orphanUuid).isPresent());
+        assertTrue("acks subtree of the orphan must be gone",
+                segmentRegistry.listSwapAcks(orphanUuid, null).isEmpty());
+        // An unrelated ACTIVE segment is never touched by the sweep.
+        assertEquals(SegmentState.ACTIVE,
+                segmentRegistry.getSegment(TS_UUID, IDX, "seg-keep-active").orElseThrow()
+                        .metadata().getState());
+    }
+
+    @Test
+    public void scannerSweepDoesNotTouchProvisionalBackedByAwaitingAckTask() throws Exception {
+        // The sweep must NOT delete a PROVISIONAL znode that IS referenced
+        // by a live AWAITING_ACK task — handleAwaitingAck owns that one.
+        seedActive("seg-ref-1");
+        seedActive("seg-ref-2");
+        VersionedSegmentMetadata in1 = segmentRegistry.getSegment(TS_UUID, IDX, "seg-ref-1").orElseThrow();
+        VersionedSegmentMetadata in2 = segmentRegistry.getSegment(TS_UUID, IDX, "seg-ref-2").orElseThrow();
+        String stagedUuid = UUID.randomUUID().toString();
+        seedProvisional(stagedUuid, /* stagedAt */ 10_000L);
+
+        String taskId = UUID.randomUUID().toString();
+        Map<String, Integer> versions = new LinkedHashMap<>();
+        versions.put("seg-ref-1", in1.zkVersion());
+        versions.put("seg-ref-2", in2.zkVersion());
+        // AWAITING_ACK task referencing the staged output, but NOT yet stale
+        // (provisionalCreatedAt is recent relative to provisionalGcMs).
+        OptimizerTask awaiting = OptimizerTask.builder()
+                .taskId(taskId)
+                .tablespaceUuid(TS_UUID)
+                .indexUuid(IDX)
+                .inputSegmentUuids(List.of("seg-ref-1", "seg-ref-2"))
+                .inputSegmentExpectedVersions(versions)
+                .targetOwnerInstanceId(0)
+                .state(OptimizerTaskState.AWAITING_ACK)
+                .outputSegmentUuid(stagedUuid)
+                .provisionalOutputCreatedAtEpochMillis(10_000L)
+                .createdAtEpochMillis(10_000L)
+                .leaderEpoch(1L)
+                .expectedAckServiceIds(List.of("is-0"))
+                .requiresAcks(true)
+                .build();
+        taskRegistry.createTask(awaiting);
+
+        OptimizerOrphanScanner scanner = new OptimizerOrphanScanner(
+                taskRegistry, segmentRegistry, TS_UUID,
+                /* maxAttempts */ 3,
+                /* orphanResetMs */ 1_000L,
+                /* terminalRetentionMs */ 60_000L,
+                /* poisonRetentionMs */ 60_000L,
+                /* provisionalGcMs */ 30_000L,
+                fakeClock::get);
+
+        // Even well past provisionalGcMs, the sweep must not touch a
+        // PROVISIONAL znode referenced by an AWAITING_ACK task — the
+        // handleAwaitingAck branch is what aborts that one (and it also
+        // fires here, so the task ends FAILED, but the znode delete is
+        // done by handleAwaitingAck's abort, counted as awaitingAckAborted,
+        // NOT as an orphan sweep).
+        fakeClock.set(60_000L);
+        OptimizerOrphanScanner.ScanResult result = scanner.scan();
+        assertEquals("the staged znode is owned by handleAwaitingAck, not the orphan sweep",
+                0, result.orphanProvisionalSwept);
+        assertEquals(1, result.awaitingAckAborted);
+    }
+
+    @Test
     public void scannerHonorsProvisionalGcWindowForActiveTaskWithLease() throws Exception {
         // Sanity: a recently-staged AWAITING_ACK task that's still within the
         // window must NOT be touched by the scanner — only ack arrival, ack
