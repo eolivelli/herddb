@@ -202,9 +202,18 @@ public class IndexOptimizerMainTest {
             assertEquals(1, active);
             assertEquals(3, deprecated);
         } finally {
-            main.shutdown();
-            ackSimulator.close();
-            zkMeta.close();
+            // Nested finally so a main.shutdown() failure cannot leak the
+            // SwapAckSimulator's daemon poller / the zkMeta session into
+            // subsequent tests in the same JVM (review NIT).
+            try {
+                main.shutdown();
+            } finally {
+                try {
+                    ackSimulator.close();
+                } finally {
+                    zkMeta.close();
+                }
+            }
         }
     }
 
@@ -336,6 +345,10 @@ public class IndexOptimizerMainTest {
                     metrics.contains("herddb_optimizer_orphans_reset_total"));
             assertTrue("metrics must include current_leader_epoch gauge: " + metrics,
                     metrics.contains("herddb_optimizer_current_leader_epoch"));
+            // Issue #555: the fail-closed skip counter must be visible so an
+            // operator can diagnose "merges silently not happening".
+            assertTrue("metrics must include tasks_skipped_no_ack_targets_total: " + metrics,
+                    metrics.contains("herddb_optimizer_tasks_skipped_no_ack_targets_total"));
 
             String status = curl("http://127.0.0.1:" + port + "/status");
             assertTrue("/status must include role: " + status,

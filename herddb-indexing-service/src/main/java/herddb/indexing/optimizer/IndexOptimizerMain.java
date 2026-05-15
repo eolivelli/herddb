@@ -178,6 +178,14 @@ public final class IndexOptimizerMain {
     private final AtomicLong orphansPoisonedTotal = new AtomicLong();
     private final AtomicLong orphansDeletedAfterDeprecateTotal = new AtomicLong();
     private final AtomicLong terminalGcTotal = new AtomicLong();
+    /**
+     * Issue #555: indexes for which the producer did NOT create a merge task
+     * because the {@code IndexingServiceInstanceDirectory} could not resolve
+     * any ack-target serviceId (ZK blip / no IS pod registered for the chosen
+     * owner). A non-zero value here is an operator-actionable signal that
+     * merges are being fail-closed-skipped — exposed via {@code /metrics}.
+     */
+    private final AtomicLong tasksSkippedNoAckTargetsTotal = new AtomicLong();
     /** Number of producer ticks that observed a stale-leader epoch and aborted. */
     private final AtomicLong producerTicksRejectedTotal = new AtomicLong();
     /** Current leader epoch bumped by the producer (-1 when never bumped on this pod). */
@@ -510,6 +518,22 @@ public final class IndexOptimizerMain {
         long provisionalGcMs = configuration.getLong(
                 OptimizerConfiguration.PROPERTY_PROVISIONAL_GC_MS,
                 OptimizerConfiguration.PROPERTY_PROVISIONAL_GC_MS_DEFAULT);
+        // Issue #555: the orphan scanner's PROVISIONAL-GC threshold MUST be
+        // strictly greater than the consumer's swap-ack timeout. Otherwise
+        // the orphan-PROVISIONAL sweep / handleAwaitingAck could reclaim a
+        // staged output whose owning task has not yet hit its own ack
+        // timeout — a still-live merge would lose its PROVISIONAL znode
+        // under it (degrades to a wasted merge). Mirrors the existing
+        // orphan.reset.ms >= 2 × session.timeout startup invariant above.
+        if (provisionalGcMs <= swapAckTimeoutMs) {
+            throw new IllegalStateException(
+                    OptimizerConfiguration.PROPERTY_PROVISIONAL_GC_MS
+                            + " (" + provisionalGcMs + " ms) must be > "
+                            + OptimizerConfiguration.PROPERTY_SWAP_ACK_TIMEOUT_MS
+                            + " (" + swapAckTimeoutMs + " ms) — the orphan scanner must"
+                            + " not reclaim a staged PROVISIONAL output before its"
+                            + " owning task has had a chance to time out the ack wait");
+        }
         this.taskRegistry = new OptimizerTaskRegistry(zkRef::get, basePath);
         taskRegistry.ensureRoot();
         LeaderEpoch leaderEpochClient = new LeaderEpoch(zkRef::get, basePath, tablespaceUuid);
@@ -622,6 +646,7 @@ public final class IndexOptimizerMain {
                 orphansPoisonedTotal.addAndGet(pr.orphansPoisoned);
                 orphansDeletedAfterDeprecateTotal.addAndGet(pr.orphansDeletedAfterDeprecate);
                 terminalGcTotal.addAndGet(pr.terminalGcCount);
+                tasksSkippedNoAckTargetsTotal.addAndGet(pr.tasksSkippedNoAckTargets);
                 if (pr.leaderEpoch != null) {
                     currentLeaderEpoch.set(pr.leaderEpoch);
                 } else if (!pr.ranAsLeader) {
@@ -686,6 +711,16 @@ public final class IndexOptimizerMain {
 
     public long getTerminalGcTotal() {
         return terminalGcTotal.get();
+    }
+
+    /**
+     * Issue #555: number of indexes for which the producer fail-closed-skipped
+     * task creation because no ack-target serviceId could be resolved. A
+     * non-zero, rising value means merges are not being scheduled because the
+     * IS pods are not visible in ZK — operator-actionable.
+     */
+    public long getTasksSkippedNoAckTargetsTotal() {
+        return tasksSkippedNoAckTargetsTotal.get();
     }
 
     public long getProducerTicksRejectedTotal() {

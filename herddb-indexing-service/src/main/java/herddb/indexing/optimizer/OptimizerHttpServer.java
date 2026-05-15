@@ -389,6 +389,12 @@ public final class OptimizerHttpServer implements AutoCloseable {
                     "Producer ticks that aborted before enqueueing any task (lock"
                             + " not held OR stale leader-epoch lost the CAS bump).",
                     optimizerMain.getProducerTicksRejectedTotal());
+            appendCounter(sb, "herddb_optimizer_tasks_skipped_no_ack_targets_total",
+                    "Issue #555: indexes for which the producer fail-closed-skipped"
+                            + " task creation because no ack-target serviceId could be"
+                            + " resolved (IS pods not visible in ZK). A rising value"
+                            + " means merges are not being scheduled — operator-actionable.",
+                    optimizerMain.getTasksSkippedNoAckTargetsTotal());
 
             // Consumer-side counters (every pod).
             OptimizerTaskConsumer consumer = optimizerMain.getTaskConsumer();

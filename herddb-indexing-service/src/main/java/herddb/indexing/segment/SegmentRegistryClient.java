@@ -27,6 +27,8 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.function.Supplier;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 import org.apache.zookeeper.CreateMode;
 import org.apache.zookeeper.KeeperException;
 import org.apache.zookeeper.Op;
@@ -56,6 +58,8 @@ import org.apache.zookeeper.data.Stat;
  * <p>This class is thread-safe.
  */
 public final class SegmentRegistryClient {
+
+    private static final Logger LOGGER = Logger.getLogger(SegmentRegistryClient.class.getName());
 
     /**
      * Sub-path appended to the ZK base path for the segment registry root.
@@ -618,18 +622,16 @@ public final class SegmentRegistryClient {
                     } catch (KeeperException.NotEmptyException raceWithLateAck) {
                         // A new ephemeral ack landed between getChildren and
                         // delete. Re-list and retry up to the pass bound.
-                        java.util.logging.Logger.getLogger(SegmentRegistryClient.class.getName())
-                                .log(java.util.logging.Level.FINE,
-                                        "deleteSwapAcksTree({0}): late ack landed (pass {1}); re-listing",
-                                        new Object[]{segmentUuid, pass + 1});
+                        LOGGER.log(Level.FINE,
+                                "deleteSwapAcksTree({0}): late ack landed (pass {1}); re-listing",
+                                new Object[]{segmentUuid, pass + 1});
                     }
                 }
                 // Bound exhausted: leave the (harmless) parent znode behind.
-                java.util.logging.Logger.getLogger(SegmentRegistryClient.class.getName())
-                        .log(java.util.logging.Level.FINE,
-                                "deleteSwapAcksTree({0}): acks parent still non-empty after {1}"
-                                        + " passes; leaving it for a later sweep",
-                                new Object[]{segmentUuid, DELETE_ACKS_TREE_MAX_PASSES});
+                LOGGER.log(Level.FINE,
+                        "deleteSwapAcksTree({0}): acks parent still non-empty after {1}"
+                                + " passes; leaving it for a later sweep",
+                        new Object[]{segmentUuid, DELETE_ACKS_TREE_MAX_PASSES});
                 return null;
             });
         } catch (KeeperException | InterruptedException | IOException e) {
@@ -700,10 +702,9 @@ public final class SegmentRegistryClient {
                 return op.run();
             } catch (KeeperException.ConnectionLossException e) {
                 lastFailure = e;
-                java.util.logging.Logger.getLogger(SegmentRegistryClient.class.getName())
-                        .log(java.util.logging.Level.INFO,
-                                "ZK ConnectionLoss on {0} (attempt {1}/{2}); retrying",
-                                new Object[]{opName, attempt + 1, CONNECTION_LOSS_RETRIES});
+                LOGGER.log(Level.INFO,
+                        "ZK ConnectionLoss on {0} (attempt {1}/{2}); retrying",
+                        new Object[]{opName, attempt + 1, CONNECTION_LOSS_RETRIES});
                 Thread.sleep(RETRY_BACKOFF_MS);
             }
         }
