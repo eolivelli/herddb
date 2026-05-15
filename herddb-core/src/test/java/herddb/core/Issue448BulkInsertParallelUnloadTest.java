@@ -87,10 +87,10 @@ import org.junit.rules.TemporaryFolder;
  *       DML, which goes through {@code apply()} → {@code applyInsert(..., false)}
  *       (the no-batch overload), drives the legacy synchronous path under
  *       eviction without ever bumping the parallel-unloads counter;</li>
- *   <li>{@link #recoveryReplayUnderEvictionPressureUsesNoBatchOverload()} —
- *       recovery / log replay of autocommit entries goes through the
- *       no-batch overload, even under eviction pressure, and reproduces
- *       all rows after restart.</li>
+ *   <li>{@link #recoveryReplayUnderEvictionPressurePipelinesFlushes()} —
+ *       recovery / log replay of autocommit entries routes eviction-driven
+ *       unloads through the recovery-scoped batch (issue #559), even under
+ *       eviction pressure, and reproduces all rows after restart.</li>
  * </ul>
  */
 public class Issue448BulkInsertParallelUnloadTest {
@@ -522,22 +522,28 @@ public class Issue448BulkInsertParallelUnloadTest {
     }
 
     /**
-     * Recovery / log replay must use the no-batch
-     * {@code applyInsert(key, value, false)} overload, even under eviction
-     * pressure. This test produces a commit log with many autocommit-mode
-     * INSERT entries (which are NOT followed by a checkpoint, so they
-     * remain in the log), restarts, and asserts that:
+     * Recovery / log replay routes eviction-driven page unloads through a
+     * recovery-scoped {@code CheckpointFlushBatch} (issue #559), even under
+     * eviction pressure. This test produces a commit log with many
+     * autocommit-mode INSERT entries (which are NOT followed by a checkpoint,
+     * so they remain in the log), restarts, and asserts that:
      *
      * <ul>
      *   <li>recovery completes and every row is present;</li>
      *   <li>the parallel-unloads counter on the restarted
-     *       {@link TableManager} stays at zero throughout the replay —
-     *       proving the no-batch overload is on the recovery path
-     *       (issue #448 review follow-up #5).</li>
+     *       {@link TableManager} is greater than zero — proving the recovery
+     *       replay dispatched eviction-driven unloads through the
+     *       recovery-scoped batch instead of flushing them synchronously on
+     *       the recovery thread (issue #559).</li>
      * </ul>
+     *
+     * <p>This supersedes the issue #448 behaviour where recovery used the
+     * no-batch synchronous overload: recovery runs single-threaded with no
+     * concurrent Phase C checkpoint, so pipelining its page flushes is safe
+     * and keeps slow remote writes off the recovery critical path.
      */
     @Test
-    public void recoveryReplayUnderEvictionPressureUsesNoBatchOverload() throws Exception {
+    public void recoveryReplayUnderEvictionPressurePipelinesFlushes() throws Exception {
         Path dataPath = folder.newFolder("data").toPath();
         Path logsPath = folder.newFolder("logs").toPath();
         Path metadataPath = folder.newFolder("metadata").toPath();
@@ -564,8 +570,8 @@ public class Issue448BulkInsertParallelUnloadTest {
             // existing tests like CheckpointStaleLsnRecoveryTest).
         }
 
-        // Phase 2: restart; recovery replays the log via the no-batch
-        // overload. The parallel-unloads counter must stay at zero.
+        // Phase 2: restart; recovery replays the log through the
+        // recovery-scoped batch. The parallel-unloads counter must grow.
         try (DBManager manager = new DBManager("localhost",
                 new FileMetadataStorageManager(metadataPath),
                 new FileDataStorageManager(dataPath),
@@ -575,8 +581,9 @@ public class Issue448BulkInsertParallelUnloadTest {
             manager.waitForTablespace("tblspace1", 10_000);
             TableManager t1Manager = tableManager(manager);
 
-            assertEquals("recovery path must not bump the parallel-unloads counter",
-                    0L, t1Manager.getParallelUnloadsCount());
+            assertTrue("recovery replay must dispatch eviction-driven unloads through the "
+                            + "recovery-scoped batch: counter=" + t1Manager.getParallelUnloadsCount(),
+                    t1Manager.getParallelUnloadsCount() > 0);
             assertRowCount(manager, loggedRows);
         }
     }

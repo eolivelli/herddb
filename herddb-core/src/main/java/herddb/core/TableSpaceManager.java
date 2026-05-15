@@ -516,32 +516,97 @@ public class TableSpaceManager {
             }
         });
 
-        if (dbmanager.getMode().equals(ServerConfiguration.PROPERTY_MODE_SHARED_STORAGE)) {
-            // In shared-storage mode, replicas get their state from S3 checkpoints.
-            // No WAL replay needed — the CheckpointFollowerThread will handle updates.
-            LOGGER.log(Level.INFO, "{0} shared-storage mode: skipping WAL recovery for {1}, state loaded from checkpoint at {2}",
-                    new Object[]{nodeId, tableSpaceName, logSequenceNumber});
-        } else if (LogSequenceNumber.START_OF_TIME.equals(logSequenceNumber)
-                && dbmanager.getServerConfiguration().getBoolean(ServerConfiguration.PROPERTY_BOOT_FORCE_DOWNLOAD_SNAPSHOT, ServerConfiguration.PROPERTY_BOOT_FORCE_DOWNLOAD_SNAPSHOT_DEFAULT)) {
-            LOGGER.log(Level.SEVERE, nodeId + " full recovery of data is forced (" + ServerConfiguration.PROPERTY_BOOT_FORCE_DOWNLOAD_SNAPSHOT + "=true) for tableSpace " + tableSpaceName);
-            downloadTableSpaceData();
-            log.recovery(actualLogSequenceNumber, new ApplyEntryOnRecovery(), false);
-        } else {
-            try {
-                log.recovery(logSequenceNumber, new ApplyEntryOnRecovery(), false);
-            } catch (FullRecoveryNeededException fullRecoveryNeeded) {
-                LOGGER.log(Level.SEVERE, nodeId + " full recovery of data is needed for tableSpace " + tableSpaceName, fullRecoveryNeeded);
+        boolean recoveryReplayCompleted = false;
+        try {
+            if (dbmanager.getMode().equals(ServerConfiguration.PROPERTY_MODE_SHARED_STORAGE)) {
+                // In shared-storage mode, replicas get their state from S3 checkpoints.
+                // No WAL replay needed — the CheckpointFollowerThread will handle updates.
+                LOGGER.log(Level.INFO, "{0} shared-storage mode: skipping WAL recovery for {1}, state loaded from checkpoint at {2}",
+                        new Object[]{nodeId, tableSpaceName, logSequenceNumber});
+            } else if (LogSequenceNumber.START_OF_TIME.equals(logSequenceNumber)
+                    && dbmanager.getServerConfiguration().getBoolean(ServerConfiguration.PROPERTY_BOOT_FORCE_DOWNLOAD_SNAPSHOT, ServerConfiguration.PROPERTY_BOOT_FORCE_DOWNLOAD_SNAPSHOT_DEFAULT)) {
+                LOGGER.log(Level.SEVERE, nodeId + " full recovery of data is forced (" + ServerConfiguration.PROPERTY_BOOT_FORCE_DOWNLOAD_SNAPSHOT + "=true) for tableSpace " + tableSpaceName);
                 downloadTableSpaceData();
                 log.recovery(actualLogSequenceNumber, new ApplyEntryOnRecovery(), false);
+            } else {
+                try {
+                    log.recovery(logSequenceNumber, new ApplyEntryOnRecovery(), false);
+                } catch (FullRecoveryNeededException fullRecoveryNeeded) {
+                    LOGGER.log(Level.SEVERE, nodeId + " full recovery of data is needed for tableSpace " + tableSpaceName, fullRecoveryNeeded);
+                    downloadTableSpaceData();
+                    log.recovery(actualLogSequenceNumber, new ApplyEntryOnRecovery(), false);
+                }
+            }
+            recoveryReplayCompleted = true;
+        } finally {
+            // Issue #559: clearing recoveryInProgress here, before the
+            // recovery-flush join below, is intentional and safe — live
+            // commits use their own per-commit flush batch (not the
+            // recovery-scoped one), and any checkpoint that races in joins
+            // the recovery batch itself via TableManager.checkpoint().
+            recoveryInProgress = false;
+            if (!recoveryReplayCompleted) {
+                // Issue #559: recovery aborted — drain any in-flight recovery page
+                // flushes best-effort so checkpoint-flush executor tasks do not keep
+                // touching pages after we unwind.
+                drainRecoveryFlushesBestEffort();
             }
         }
-        recoveryInProgress = false;
+        // Issue #559: recovery replay pipelines eviction-driven page flushes through a
+        // recovery-scoped batch (see TableManager). Wait for every in-flight remote page
+        // write to finish before the post-recovery checkpoint, otherwise Phase C could
+        // persist a keyToPage entry pointing at a page whose writePage has not completed.
+        awaitRecoveryFlushesOnAllTables();
         if (!dbmanager.getMode().equals(ServerConfiguration.PROPERTY_MODE_SHARED_STORAGE)
                 && !LogSequenceNumber.START_OF_TIME.equals(actualLogSequenceNumber)) {
             LOGGER.log(Level.INFO, "Recovery finished for {0} seqNum {1}", new Object[]{tableSpaceName, actualLogSequenceNumber});
             checkpoint(false, false, false);
         }
 
+    }
+
+    /**
+     * Issue #559: joins the pending recovery-scoped page flushes of every table
+     * manager. Every table manager is drained even if one throws, so a single
+     * failed flush cannot leave the other table managers' checkpoint-flush
+     * executor tasks running against a tablespace that is being torn down. The
+     * first failure (with the rest attached as suppressed) is rethrown only
+     * after every table manager has been drained.
+     */
+    private void awaitRecoveryFlushesOnAllTables() {
+        RuntimeException firstFailure = null;
+        for (AbstractTableManager tableManager : tables.values()) {
+            try {
+                tableManager.awaitRecoveryFlushes();
+            } catch (RuntimeException error) {
+                if (firstFailure == null) {
+                    firstFailure = error;
+                } else if (firstFailure != error) {
+                    firstFailure.addSuppressed(error);
+                }
+            }
+        }
+        if (firstFailure != null) {
+            throw firstFailure;
+        }
+    }
+
+    /**
+     * Issue #559: drains pending recovery-scoped page flushes on every table
+     * manager without propagating failures. Used on the abort path of
+     * {@link #recover(TableSpace)} / {@link #recoverForLeadership()} where the
+     * boot is failing anyway — the goal is only to stop checkpoint-flush
+     * executor tasks from touching pages of a half-initialized table manager.
+     */
+    private void drainRecoveryFlushesBestEffort() {
+        for (AbstractTableManager tableManager : tables.values()) {
+            try {
+                tableManager.awaitRecoveryFlushes();
+            } catch (RuntimeException drainError) {
+                LOGGER.log(Level.WARNING, "error draining recovery page flushes during aborted recovery of "
+                        + tableSpaceName, drainError);
+            }
+        }
     }
 
     void recoverForLeadership() throws DataStorageManagerException, LogNotAvailableException {
@@ -551,9 +616,24 @@ public class TableSpaceManager {
         recoveryInProgress = true;
         actualLogSequenceNumber = log.getLastSequenceNumber();
         LOGGER.log(Level.INFO, "recovering tablespace {0} log from sequence number {1}, with fencing", new Object[]{tableSpaceName, actualLogSequenceNumber});
-        log.recovery(actualLogSequenceNumber, new ApplyEntryOnRecovery(), true);
+        boolean recoveryReplayCompleted = false;
+        try {
+            log.recovery(actualLogSequenceNumber, new ApplyEntryOnRecovery(), true);
+            recoveryReplayCompleted = true;
+        } finally {
+            // Issue #559: see recover(TableSpace) — clearing recoveryInProgress
+            // before the recovery-flush join below is intentional and safe.
+            recoveryInProgress = false;
+            if (!recoveryReplayCompleted) {
+                // Issue #559: see recover(TableSpace).
+                drainRecoveryFlushesBestEffort();
+            }
+        }
+        // Issue #559: wait for in-flight recovery page flushes before declaring
+        // recovery finished, so the first checkpoint after leadership recovery
+        // sees a fully persisted page state.
+        awaitRecoveryFlushesOnAllTables();
         LOGGER.log(Level.INFO, "Recovery (with fencing) finished for {0}", tableSpaceName);
-        recoveryInProgress = false;
     }
 
     void apply(CommitLogResult position, LogEntry entry, boolean recovery) throws DataStorageManagerException, DDLException {

@@ -71,6 +71,18 @@ public interface AbstractTableManager extends AutoCloseable {
     }
 
     /**
+     * Issue #559: waits for all in-flight recovery-scoped page flushes to
+     * complete. During WAL replay {@link TableManager} pipelines
+     * eviction-driven page writes through a recovery-scoped batch instead of
+     * blocking the recovery thread on every remote write; this method joins
+     * that batch so callers can guarantee a fully persisted page state before
+     * a checkpoint runs. It is a no-op for table managers that do not replay a
+     * WAL (e.g. system tables) or when no recovery flush is pending.
+     */
+    default void awaitRecoveryFlushes() {
+    }
+
+    /**
      * Check if the table manage has been fully started
      */
     boolean isStarted();
