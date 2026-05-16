@@ -19,8 +19,16 @@ data:
     server.zookeeper.address={{ include "herddb.zkAddress" . }}
     server.zookeeper.path=/herd
     server.zookeeper.session.timeout={{ .Values.indexingService.zkSessionTimeout }}
+    {{- if .Values.pushIndexingMode.enabled }}
+    # Push mode (testing only): commit-log entries are pushed straight in over
+    # the PushEntries gRPC RPC, so no HerdDB server, BookKeeper or commit log is
+    # used. ZooKeeper stays in the picture for file-server discovery and the
+    # index optimizer.
+    indexing.log.type=push
+    {{- else }}
     indexing.log.type=bookkeeper
     server.bookkeeper.ledgers.path=/ledgers
+    {{- end }}
     {{- end }}
     {{- if .Values.indexOptimizer.enabled }}
     # Issue #491: when the external index-optimizer service is enabled, the IS

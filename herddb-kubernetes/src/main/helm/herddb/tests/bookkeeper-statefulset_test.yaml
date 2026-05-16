@@ -14,3 +14,27 @@ tests:
       - matchRegex:
           path: spec.template.metadata.annotations["checksum/config"]
           pattern: ^[a-f0-9]{64}$
+
+  # Push-indexing mode uses no commit log, so BookKeeper scales to 0 replicas.
+  - it: should render 0 replicas when pushIndexingMode is enabled
+    template: templates/bookkeeper-statefulset.yaml
+    set:
+      server.mode: cluster
+      bookkeeper.enabled: true
+      bookkeeper.replicaCount: 3
+      pushIndexingMode.enabled: true
+    asserts:
+      - equal:
+          path: spec.replicas
+          value: 0
+
+  - it: should render the configured replicas when pushIndexingMode is disabled
+    template: templates/bookkeeper-statefulset.yaml
+    set:
+      server.mode: cluster
+      bookkeeper.enabled: true
+      bookkeeper.replicaCount: 3
+    asserts:
+      - equal:
+          path: spec.replicas
+          value: 3

@@ -160,3 +160,15 @@ tests:
       - notEqual:
           path: spec.template.metadata.annotations["checksum/config"]
           value: e03e1ab6bd1f6b88466ef23b2b312809927b3b628dd1ff9f59737e6e3a8cdfd0
+
+  # Push-indexing mode runs with no HerdDB server, so it scales to 0 replicas.
+  - it: should render 0 replicas when pushIndexingMode is enabled
+    template: templates/server-statefulset.yaml
+    set:
+      server.mode: cluster
+      server.replicaCount: 2
+      pushIndexingMode.enabled: true
+    asserts:
+      - equal:
+          path: spec.replicas
+          value: 0

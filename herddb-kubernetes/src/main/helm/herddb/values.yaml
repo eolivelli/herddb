@@ -16,6 +16,20 @@ serviceAccount:
   # Override the generated name
   name: ""
 
+# Push-based indexing mode (TESTING ONLY).
+#
+# When enabled the HerdDB server and BookKeeper StatefulSets are rendered with
+# 0 replicas, and the indexing service is configured with
+# indexing.log.type=push: a client (e.g. VectorBench --protocol grpc) pushes
+# commit-log entries straight into the indexing service over the PushEntries
+# gRPC RPC, so neither a HerdDB server nor a commit log is needed. ZooKeeper,
+# the file server, the index optimizer, MinIO and the tools pod are left
+# untouched and stay up.
+#
+# Requires server.mode=cluster and indexingService.enabled=true.
+pushIndexingMode:
+  enabled: false
+
 # HerdDB server (JDBC endpoint + metadata)
 server:
   # Server mode: "standalone" or "cluster"
