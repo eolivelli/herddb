@@ -690,6 +690,31 @@ public class PersistentVectorStore extends AbstractVectorStore {
     final AtomicLong pendingDeletesReapFailuresTotal = new AtomicLong();
 
     // -------------------------------------------------------------------------
+    // Block-cache warmup (issue #322 / #569)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Approximate per-segment byte budget for the BFS block-cache warmup
+     * (issue #322). A value of {@code 0} (the default) or negative disables
+     * warmup entirely. Set by {@code IndexingServiceEngine} from
+     * {@code vector.index.segmentCacheWarmupBytes} via
+     * {@link #setWarmupBytesPerSegment(long)} so the store can warm each new
+     * segment AT CREATION TIME — before it is published into the searchable
+     * {@link #segments} list (issue #569).
+     */
+    private volatile long warmupBytesPerSegment;
+
+    /**
+     * Counter: total number of segments actually BFS-warmed by this store
+     * since start (issue #569). With per-segment warm-at-creation in place,
+     * this rises by exactly one per checkpoint (the new segment) and one per
+     * compaction cycle (the merged output) in steady state; a jump equal to
+     * the running segment count would indicate the post-checkpoint warm-all
+     * is no longer idempotent — i.e. the death spiral has regressed.
+     */
+    final AtomicLong warmedSegmentsTotal = new AtomicLong();
+
+    // -------------------------------------------------------------------------
     // PQ codebook cache (issue #281)
     // -------------------------------------------------------------------------
 
@@ -2446,6 +2471,18 @@ public class PersistentVectorStore extends AbstractVectorStore {
                         lateDeletes.forEach(merged::deletePk);
                     }
 
+                    // Issue #569: warm the merged output's block cache BEFORE
+                    // the atomic swap publishes it into the searchable
+                    // `this.segments` list. The compaction cycle deliberately
+                    // WAITS for this warmup to complete — it runs synchronously
+                    // on the compaction thread — so the merged segment is hot
+                    // the instant it becomes searchable. The cost is bounded:
+                    // exactly one segment per cycle, capped by the per-segment
+                    // warmup byte budget regardless of the merged size.
+                    warmUpNewSegmentsBeforePublish(
+                            java.util.Collections.singletonList(rebuild.mergedSegment),
+                            "compaction merge output");
+
                     atomicSwapCompactionResult(candidates, rebuild.mergedSegment,
                             rebuild.bytesWritten, rebuild.vectorCount);
 
@@ -3552,6 +3589,17 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 dropSegmentBLinkStorage(tentative);
             }
         }
+
+        // Issue #569: warm the adopted segment's block cache BEFORE it is
+        // published into the searchable `this.segments` list under the write
+        // lock below — and deliberately OUTSIDE the write lock, since warmup
+        // is I/O. An adopted segment is just another freshly-loaded segment
+        // that must be hot before its first ANN query. If a concurrent
+        // adoption wins the idempotency race below the warmup is wasted, but
+        // that is rare and strictly cheaper than a cold first query.
+        warmUpNewSegmentsBeforePublish(
+                java.util.Collections.singletonList(tentative),
+                "adoptExternalSegment");
 
         // Under write lock: re-check idempotency, then publish.
         boolean alreadyAdopted = false;
@@ -4797,6 +4845,19 @@ public class PersistentVectorStore extends AbstractVectorStore {
      * failures are logged at WARNING and skipped; the warmup is best-effort
      * and never aborts the watermark save.
      *
+     * <p><b>Idempotency (issue #569).</b> Segments are warmed exactly once,
+     * AT CREATION TIME, before they are published into the searchable
+     * {@link #segments} list — checkpoint Phase C-prep and compaction both
+     * call {@link #warmUpSegment} on their freshly-built segment. This
+     * sweep therefore only does real I/O for segments that were never warmed
+     * at creation — i.e. segments loaded by {@code loadFromStatus} on
+     * restart. For an already-warmed segment {@link #warmUpSegment} returns
+     * immediately, so the post-checkpoint warm-all degenerates to a cheap
+     * no-op in steady state. This is what breaks the
+     * warmup→checkpoint→warmup death spiral: the old behaviour re-warmed
+     * <em>all</em> segments after <em>every</em> checkpoint, monopolising
+     * memory and I/O and starving compaction.
+     *
      * <p>In local-file or in-memory storage modes the reads route through the
      * in-memory buffer; they complete without error but have no block-cache
      * effect.
@@ -4813,37 +4874,145 @@ public class PersistentVectorStore extends AbstractVectorStore {
             return;
         }
         long startMs = System.currentTimeMillis();
-        LOGGER.log(Level.INFO,
-                "warmUpBlockCache {0}: warming {1} segments, ~{2} bytes each (BFS from entry node)",
-                new Object[]{indexName, currentSegments.size(), warmupBytesPerSegment});
         int warmedSegments = 0;
         long totalNodesVisited = 0;
         for (VectorSegment seg : currentSegments) {
-            OnDiskGraphIndex odg = seg.onDiskGraph;
-            if (odg == null || seg.graphFileSize <= 0) {
-                continue;
-            }
-            int idUpperBound = odg.getIdUpperBound();
-            if (idUpperBound <= 0) {
-                continue;
-            }
-            // Estimate bytes-per-node: Layer-0 data dominates file size.
-            long approxBytesPerNode = Math.max(1L, seg.graphFileSize / idUpperBound);
-            // Always warm at least the entry node regardless of budget.
-            int nodeLimit = (int) Math.min(
-                    idUpperBound,
-                    Math.max(1L, warmupBytesPerSegment / approxBytesPerNode));
-            int nodesVisited = warmUpSegmentBfs(seg, odg, nodeLimit);
+            // Already-warmed segments (the steady-state case once every
+            // segment is warmed at creation) return 0 here without any I/O.
+            int nodesVisited = warmUpSegment(seg, warmupBytesPerSegment);
             if (nodesVisited > 0) {
                 warmedSegments++;
                 totalNodesVisited += nodesVisited;
             }
         }
         long elapsedMs = System.currentTimeMillis() - startMs;
-        LOGGER.log(Level.INFO,
-                "warmUpBlockCache {0}: warmed {1}/{2} segments, {3} nodes total in {4} ms",
-                new Object[]{indexName, warmedSegments, currentSegments.size(),
-                        totalNodesVisited, elapsedMs});
+        if (warmedSegments > 0) {
+            LOGGER.log(Level.INFO,
+                    "warmUpBlockCache {0}: warmed {1}/{2} segments (others already warm), "
+                            + "{3} nodes total in {4} ms",
+                    new Object[]{indexName, warmedSegments, currentSegments.size(),
+                            totalNodesVisited, elapsedMs});
+        } else {
+            LOGGER.log(Level.FINE,
+                    "warmUpBlockCache {0}: all {1} segments already warm — no-op",
+                    new Object[]{indexName, currentSegments.size()});
+        }
+    }
+
+    /**
+     * Sets the per-segment block-cache warmup byte budget (issue #322 / #569).
+     * A value of {@code 0} or negative disables warmup. Called by
+     * {@code IndexingServiceEngine} before {@link #start()} so that segments
+     * created by subsequent checkpoints and compactions are warmed at
+     * creation time. See {@link #warmupBytesPerSegment}.
+     */
+    public void setWarmupBytesPerSegment(long warmupBytesPerSegment) {
+        this.warmupBytesPerSegment = warmupBytesPerSegment;
+    }
+
+    /**
+     * Total number of segments actually BFS-warmed by this store since start
+     * (issue #569). Exposed for tests and Prometheus exporters.
+     */
+    public long getWarmedSegmentsTotal() {
+        return warmedSegmentsTotal.get();
+    }
+
+    /**
+     * Warms a single segment's block cache (issue #569), idempotently.
+     *
+     * <p>This is the per-segment building block called both by the
+     * post-checkpoint warm-all sweep ({@link #warmUpBlockCache}) and — the
+     * point of issue #569 — directly by the checkpoint and compaction code
+     * paths on a freshly-built segment BEFORE it is published into the
+     * searchable {@link #segments} list. Warming before publish guarantees
+     * the first ANN query against a new segment finds hot cache blocks
+     * instead of issuing cold streaming reads, without the old behaviour of
+     * re-warming every loaded segment after every checkpoint.
+     *
+     * <p>The method is idempotent: once a segment has been warmed (or found
+     * to have nothing to warm) its {@link VectorSegment#warmedUp} flag is set
+     * and subsequent calls return {@code 0} immediately. A real I/O error
+     * leaves the flag unset so the next sweep retries.
+     *
+     * @param seg the segment to warm
+     * @param bytesPerSegment approximate byte budget for the BFS; {@code <= 0}
+     *     disables warmup (no-op, flag left unset so a later enable still works)
+     * @return number of graph nodes visited (0 if disabled, already warm,
+     *     nothing to warm, or an I/O error occurred)
+     */
+    int warmUpSegment(VectorSegment seg, long bytesPerSegment) {
+        if (bytesPerSegment <= 0 || seg == null) {
+            return 0;
+        }
+        if (seg.warmedUp) {
+            return 0;
+        }
+        OnDiskGraphIndex odg = seg.onDiskGraph;
+        if (odg == null || seg.graphFileSize <= 0) {
+            // Nothing to warm — mark warmed so the warm-all sweep skips it
+            // for good rather than re-checking it on every checkpoint.
+            seg.warmedUp = true;
+            return 0;
+        }
+        int idUpperBound = odg.getIdUpperBound();
+        if (idUpperBound <= 0) {
+            seg.warmedUp = true;
+            return 0;
+        }
+        // Estimate bytes-per-node: Layer-0 data dominates file size.
+        long approxBytesPerNode = Math.max(1L, seg.graphFileSize / idUpperBound);
+        // Always warm at least the entry node regardless of budget.
+        int nodeLimit = (int) Math.min(
+                idUpperBound,
+                Math.max(1L, bytesPerSegment / approxBytesPerNode));
+        int nodesVisited = warmUpSegmentBfs(seg, odg, nodeLimit);
+        if (nodesVisited > 0) {
+            seg.warmedUp = true;
+            warmedSegmentsTotal.incrementAndGet();
+            return nodesVisited;
+        }
+        // nodesVisited == 0 means warmUpSegmentBfs hit an I/O error (it
+        // always visits at least the entry node on success). Leave
+        // warmedUp == false so a later sweep retries this segment.
+        return 0;
+    }
+
+    /**
+     * Warms every segment in {@code newSegments} that has not yet been warmed
+     * (issue #569), using the configured {@link #warmupBytesPerSegment}
+     * budget. Called by the checkpoint and compaction paths on their
+     * freshly-built segments BEFORE the segments are published into the
+     * searchable {@link #segments} list.
+     *
+     * <p>No-op when warmup is disabled ({@code warmupBytesPerSegment <= 0}).
+     * Best-effort: per-segment I/O errors are swallowed inside
+     * {@link #warmUpSegment} / {@link #warmUpSegmentBfs} and never abort the
+     * checkpoint or compaction.
+     */
+    private void warmUpNewSegmentsBeforePublish(List<VectorSegment> newSegments,
+                                                String context) {
+        long budget = this.warmupBytesPerSegment;
+        if (budget <= 0 || newSegments == null || newSegments.isEmpty()) {
+            return;
+        }
+        long startMs = System.currentTimeMillis();
+        int warmed = 0;
+        long totalNodes = 0;
+        for (VectorSegment seg : newSegments) {
+            int nodes = warmUpSegment(seg, budget);
+            if (nodes > 0) {
+                warmed++;
+                totalNodes += nodes;
+            }
+        }
+        if (warmed > 0) {
+            LOGGER.log(Level.INFO,
+                    "warmUpBlockCache {0}: pre-publish warm of {1} new segment(s) ({2}), "
+                            + "{3} nodes in {4} ms",
+                    new Object[]{indexName, warmed, context, totalNodes,
+                            System.currentTimeMillis() - startMs});
+        }
     }
 
     /**
@@ -5296,6 +5465,15 @@ public class PersistentVectorStore extends AbstractVectorStore {
         this.provisionalPageIds = null;
         this.provisionalMultipartFiles = null;
         consecutiveCheckpointFailures.set(0);
+
+        // Issue #569: warm the block cache of the freshly-built segments NOW —
+        // while they are loaded but still NOT searchable (they join the
+        // visible `this.segments` list only at Phase C Stage 2 below). Warming
+        // here, on the checkpoint thread, means the first ANN query against a
+        // new segment finds hot cache blocks; it also makes the post-checkpoint
+        // warm-all sweep idempotent (each segment is warmed exactly once),
+        // which is what breaks the warmup→checkpoint→warmup death spiral.
+        warmUpNewSegmentsBeforePublish(preloadedSegments, "checkpoint Phase C-prep");
 
         // ---------- Phase C — two-stage protocol (issue #462). ----------
         //

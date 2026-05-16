@@ -337,7 +337,10 @@ public class BlockCacheWarmupTest {
             }
             store.checkpoint();
 
-            // Reset the counter so only warmup reads are measured.
+            // Reset the counter so only warmup reads are measured. The store
+            // never received a setWarmupBytesPerSegment() call, so the
+            // segments built by the checkpoint were NOT warmed at creation
+            // (issue #569) and the warm-all sweep below does the real work.
             dsm.totalBytesRead.set(0);
 
             // Warm with a generous limit — should read whatever is in each segment file.
@@ -345,6 +348,15 @@ public class BlockCacheWarmupTest {
 
             assertTrue("warmup must have issued at least one byte of reads",
                     dsm.totalBytesRead.get() > 0);
+
+            // Issue #569: the warm-all sweep is idempotent — once every
+            // segment is warm a second sweep finds nothing to do and issues
+            // no reads. This is what stops the warmup→checkpoint→warmup
+            // death spiral.
+            dsm.totalBytesRead.set(0);
+            store.warmUpBlockCache(Long.MAX_VALUE);
+            assertEquals("second warm-all sweep must be an idempotent no-op",
+                    0, dsm.totalBytesRead.get());
         } finally {
             store.close();
         }
@@ -359,7 +371,32 @@ public class BlockCacheWarmupTest {
      */
     @Test
     public void testWarmupRespectsLimit() throws Exception {
-        Path tmpDir = folder.newFolder("data").toPath();
+        // Two independent stores built from identical data: one warmed with a
+        // generous budget (full BFS), one with a 1-byte budget (entry node
+        // only). The limited warmup must read strictly less.
+        //
+        // Two stores are required because warmUpBlockCache is idempotent per
+        // segment (issue #569) — once a segment is warmed a second sweep on
+        // the same store does nothing, so the budget cannot be re-exercised
+        // on an already-warmed store.
+        long fullWarmupBytes = measureWarmupBytes(Long.MAX_VALUE);
+        long limitedBytes = measureWarmupBytes(1);
+
+        assertTrue("full warmup must read something", fullWarmupBytes > 0);
+        assertTrue("limited warmup (" + limitedBytes + " bytes) must read less than "
+                        + "full warmup (" + fullWarmupBytes + " bytes)",
+                limitedBytes < fullWarmupBytes);
+    }
+
+    /**
+     * Builds a fresh store, checkpoints 512 vectors into it, then runs a
+     * single {@code warmUpBlockCache(budget)} sweep and returns the number of
+     * bytes that sweep read. The store does not receive a
+     * {@code setWarmupBytesPerSegment()} call, so its segments are cold after
+     * the checkpoint and the sweep does the warming.
+     */
+    private long measureWarmupBytes(long budget) throws Exception {
+        Path tmpDir = folder.newFolder().toPath();
         TrackingMemoryDataStorageManager dsm = new TrackingMemoryDataStorageManager();
         MemoryManager mm = new MemoryManager(64 * 1024 * 1024, 0, 1024 * 1024, 1024 * 1024);
 
@@ -378,20 +415,11 @@ public class BlockCacheWarmupTest {
             }
             store.checkpoint();
 
-            // Full warmup (baseline — visits all nodes via BFS).
+            // 1-byte budget → nodeLimit = max(1, 1/approxBytesPerNode) = 1
+            // (entry node only); a generous budget visits every node via BFS.
             dsm.totalBytesRead.set(0);
-            store.warmUpBlockCache(Long.MAX_VALUE);
-            long fullWarmupBytes = dsm.totalBytesRead.get();
-            assertTrue("full warmup must read something", fullWarmupBytes > 0);
-
-            // 1-byte budget → nodeLimit = max(1, 1/approxBytesPerNode) = 1 (entry node only).
-            // Reads just readInt + neighbor-ID array: a few dozen bytes, strictly
-            // less than a full BFS over all nodes.
-            dsm.totalBytesRead.set(0);
-            store.warmUpBlockCache(1);
-            long limitedBytes = dsm.totalBytesRead.get();
-            assertTrue("limited warmup must read less than full warmup",
-                    limitedBytes < fullWarmupBytes);
+            store.warmUpBlockCache(budget);
+            return dsm.totalBytesRead.get();
         } finally {
             store.close();
         }
