@@ -903,7 +903,7 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                         vectorCompactionIntervalMs,
                         vectorCompactionMinBytes,
                         vectorCompactionMaxBytes,
-                        /*minCount*/ 4,
+                        /*minCount*/ PersistentVectorStore.DEFAULT_VECTOR_INDEX_COMPACTION_MIN_COUNT,
                         vectorCompactionMaxCount,
                         vectorCompactionRetentionMs);
                 store.setTieredCompactionEnabled(vectorCompactionTieredEnabled);
