@@ -543,6 +543,19 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         return table + "." + index;
     }
 
+    /**
+     * Derives a stable 32-hex-char tablespace UUID from the tablespace name.
+     * Used by push mode when no HerdDB server has registered the tablespace in
+     * the metadata store: a name-based UUID is identical across restarts and
+     * across sibling push-mode instances, so they all resolve the same storage
+     * namespace without any coordination.
+     */
+    private static String deterministicTableSpaceUuid(String tablespaceName) {
+        return java.util.UUID.nameUUIDFromBytes(
+                        tablespaceName.getBytes(java.nio.charset.StandardCharsets.UTF_8))
+                .toString().replace("-", "");
+    }
+
     public IndexingServiceEngine(Path logDirectory, Path dataDirectory, IndexingServerConfiguration config) {
         this.logDirectory = logDirectory;
         this.dataDirectory = dataDirectory;
@@ -1316,34 +1329,68 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             }
         }
 
-        // Resolve tablespace name to UUID, polling until available or interrupted
+        // Resolve the tablespace name to a UUID (the engine's storage namespace).
         String tablespaceName = config.getString(IndexingServerConfiguration.PROPERTY_TABLESPACE_NAME,
                 IndexingServerConfiguration.PROPERTY_TABLESPACE_NAME_DEFAULT);
-        long pollIntervalMs = config.getLong(IndexingServerConfiguration.PROPERTY_TABLESPACE_WAIT_POLL_INTERVAL_MS,
-                IndexingServerConfiguration.PROPERTY_TABLESPACE_WAIT_POLL_INTERVAL_MS_DEFAULT);
-        long tablespaceWaitTimeoutMs = config.getLong(
-                IndexingServerConfiguration.PROPERTY_TABLESPACE_WAIT_TIMEOUT_MS,
-                IndexingServerConfiguration.PROPERTY_TABLESPACE_WAIT_TIMEOUT_MS_DEFAULT);
-        long deadline = System.currentTimeMillis() + tablespaceWaitTimeoutMs;
-        LOGGER.log(Level.INFO, "Waiting up to {0}ms for tablespace ''{1}'' to become available...",
-                new Object[]{tablespaceWaitTimeoutMs, tablespaceName});
-        TableSpace tableSpace = null;
-        while (true) {
-            tableSpace = metadataStorageManager.describeTableSpace(tablespaceName);
+        String configuredTableSpaceUuid = config.getString(
+                IndexingServerConfiguration.PROPERTY_TABLESPACE_UUID,
+                IndexingServerConfiguration.PROPERTY_TABLESPACE_UUID_DEFAULT);
+        if (!configuredTableSpaceUuid.isEmpty()) {
+            // Explicit override — also lets push-mode siblings and the index
+            // optimizer be pinned to one storage namespace from config.
+            this.tableSpaceUUID = configuredTableSpaceUuid;
+            LOGGER.log(Level.INFO,
+                    "Using explicitly configured tablespace UUID ''{0}'' for tablespace ''{1}''",
+                    new Object[]{tableSpaceUUID, tablespaceName});
+        } else if (isPushModeConfigured()) {
+            // Push mode (testing only): there may be no HerdDB server to
+            // register the tablespace in the metadata store, so do NOT block
+            // for up to 30 minutes. Try a single lookup; if the tablespace is
+            // absent, derive a deterministic UUID from its name so restarts
+            // and sibling instances resolve the same storage namespace.
+            TableSpace tableSpace = metadataStorageManager.describeTableSpace(tablespaceName);
             if (tableSpace != null) {
-                break;
+                this.tableSpaceUUID = tableSpace.uuid;
+                LOGGER.log(Level.INFO,
+                        "Push mode: resolved tablespace ''{0}'' to UUID ''{1}'' from metadata",
+                        new Object[]{tablespaceName, tableSpaceUUID});
+            } else {
+                this.tableSpaceUUID = deterministicTableSpaceUuid(tablespaceName);
+                LOGGER.log(Level.INFO,
+                        "Push mode: tablespace ''{0}'' is not registered in the metadata store; "
+                                + "using UUID ''{1}'' derived from the tablespace name",
+                        new Object[]{tablespaceName, tableSpaceUUID});
             }
-            if (System.currentTimeMillis() > deadline) {
-                throw new RuntimeException("Timed out after " + tablespaceWaitTimeoutMs + "ms waiting for tablespace '"
-                        + tablespaceName + "' to become available");
+        } else {
+            // file / bookkeeper mode: a HerdDB server owns the tablespace.
+            // Poll until it becomes available or the timeout expires.
+            long pollIntervalMs = config.getLong(
+                    IndexingServerConfiguration.PROPERTY_TABLESPACE_WAIT_POLL_INTERVAL_MS,
+                    IndexingServerConfiguration.PROPERTY_TABLESPACE_WAIT_POLL_INTERVAL_MS_DEFAULT);
+            long tablespaceWaitTimeoutMs = config.getLong(
+                    IndexingServerConfiguration.PROPERTY_TABLESPACE_WAIT_TIMEOUT_MS,
+                    IndexingServerConfiguration.PROPERTY_TABLESPACE_WAIT_TIMEOUT_MS_DEFAULT);
+            long deadline = System.currentTimeMillis() + tablespaceWaitTimeoutMs;
+            LOGGER.log(Level.INFO, "Waiting up to {0}ms for tablespace ''{1}'' to become available...",
+                    new Object[]{tablespaceWaitTimeoutMs, tablespaceName});
+            TableSpace tableSpace = null;
+            while (true) {
+                tableSpace = metadataStorageManager.describeTableSpace(tablespaceName);
+                if (tableSpace != null) {
+                    break;
+                }
+                if (System.currentTimeMillis() > deadline) {
+                    throw new RuntimeException("Timed out after " + tablespaceWaitTimeoutMs
+                            + "ms waiting for tablespace '" + tablespaceName + "' to become available");
+                }
+                LOGGER.log(Level.INFO, "Tablespace ''{0}'' not yet available, retrying in {1}ms...",
+                        new Object[]{tablespaceName, pollIntervalMs});
+                Thread.sleep(pollIntervalMs);
             }
-            LOGGER.log(Level.INFO, "Tablespace ''{0}'' not yet available, retrying in {1}ms...",
-                    new Object[]{tablespaceName, pollIntervalMs});
-            Thread.sleep(pollIntervalMs);
+            this.tableSpaceUUID = tableSpace.uuid;
+            LOGGER.log(Level.INFO, "Resolved tablespace name ''{0}'' to UUID ''{1}''",
+                    new Object[]{tablespaceName, tableSpaceUUID});
         }
-        this.tableSpaceUUID = tableSpace.uuid;
-        LOGGER.log(Level.INFO, "Resolved tablespace name ''{0}'' to UUID ''{1}''",
-                new Object[]{tablespaceName, tableSpaceUUID});
 
         // Allow external components (IndexingServer) to bootstrap state from
         // remote storage now that we know the tablespace UUID — this is where

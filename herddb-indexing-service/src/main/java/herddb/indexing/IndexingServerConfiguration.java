@@ -657,6 +657,18 @@ public final class IndexingServerConfiguration {
     public static final String PROPERTY_TABLESPACE_NAME = "indexing.tablespace.name";
     public static final String PROPERTY_TABLESPACE_NAME_DEFAULT = TableSpace.DEFAULT;
 
+    /**
+     * Explicit tablespace UUID. Normally the indexing service resolves the
+     * UUID of {@link #PROPERTY_TABLESPACE_NAME} from the cluster metadata
+     * (registered by a HerdDB server). In push mode ({@code indexing.log.type=push})
+     * there may be no server at all, so this key lets an operator pin the
+     * storage namespace explicitly — and keep multiple push-mode instances
+     * plus the index optimizer on the same UUID. When empty, push mode derives
+     * a deterministic UUID from the tablespace name.
+     */
+    public static final String PROPERTY_TABLESPACE_UUID = "indexing.tablespace.uuid";
+    public static final String PROPERTY_TABLESPACE_UUID_DEFAULT = "";
+
     public static final String PROPERTY_TABLESPACE_WAIT_POLL_INTERVAL_MS = "indexing.tablespace.wait.poll.interval.ms";
     public static final int PROPERTY_TABLESPACE_WAIT_POLL_INTERVAL_MS_DEFAULT = 2_000;
 
