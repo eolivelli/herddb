@@ -50,3 +50,15 @@ tests:
       - equal:
           path: spec.minAvailable
           value: 2
+
+  # Push-indexing mode scales BookKeeper to 0 replicas, so its PDB (which
+  # would otherwise select an empty workload) must not be rendered.
+  - it: should not render in push-indexing mode even when bookkeeper.pdb.enabled is true
+    set:
+      server.mode: cluster
+      bookkeeper.enabled: true
+      bookkeeper.pdb.enabled: true
+      pushIndexingMode.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 0

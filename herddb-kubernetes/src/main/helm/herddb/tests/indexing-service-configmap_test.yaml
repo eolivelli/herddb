@@ -51,6 +51,10 @@ tests:
       - notMatchRegex:
           path: data["indexingservice.properties"]
           pattern: "indexing\\.log\\.type=bookkeeper"
+      # Push mode drops the bookkeeper ledgers path entirely.
+      - notMatchRegex:
+          path: data["indexingservice.properties"]
+          pattern: "server\\.bookkeeper\\.ledgers\\.path"
 
   - it: should emit indexing.log.type=bookkeeper in cluster mode when pushIndexingMode is disabled
     set:
@@ -61,3 +65,6 @@ tests:
       - matchRegex:
           path: data["indexingservice.properties"]
           pattern: "indexing\\.log\\.type=bookkeeper"
+      - notMatchRegex:
+          path: data["indexingservice.properties"]
+          pattern: "indexing\\.log\\.type=push"

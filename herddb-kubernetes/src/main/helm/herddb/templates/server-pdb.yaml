@@ -1,4 +1,6 @@
-{{- if .Values.server.pdb.enabled -}}
+{{- /* Push-indexing mode scales the server to 0 replicas; a PDB selecting an
+       empty workload would be unsatisfiable, so it is not rendered. */ -}}
+{{- if and .Values.server.pdb.enabled (not .Values.pushIndexingMode.enabled) -}}
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:

@@ -1,4 +1,6 @@
-{{- if and .Values.bookkeeper.enabled .Values.bookkeeper.pdb.enabled -}}
+{{- /* Push-indexing mode scales BookKeeper to 0 replicas; a PDB selecting an
+       empty workload would be unsatisfiable, so it is not rendered. */ -}}
+{{- if and .Values.bookkeeper.enabled .Values.bookkeeper.pdb.enabled (not .Values.pushIndexingMode.enabled) -}}
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:

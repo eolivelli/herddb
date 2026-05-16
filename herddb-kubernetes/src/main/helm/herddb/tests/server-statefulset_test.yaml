@@ -172,3 +172,14 @@ tests:
       - equal:
           path: spec.replicas
           value: 0
+
+  - it: should render the configured replicas in cluster mode when pushIndexingMode is disabled
+    template: templates/server-statefulset.yaml
+    set:
+      server.mode: cluster
+      server.replicaCount: 2
+      pushIndexingMode.enabled: false
+    asserts:
+      - equal:
+          path: spec.replicas
+          value: 2
