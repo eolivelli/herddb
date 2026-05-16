@@ -29,6 +29,10 @@ import herddb.utils.Bytes;
 import io.github.jbellis.jvector.vector.VectorSimilarityFunction;
 import java.nio.file.Path;
 import java.util.Random;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import org.junit.After;
+import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
@@ -60,6 +64,25 @@ public class MemoryPressureTriggerZeroLiveVectorsTest {
     public TemporaryFolder tmpFolder = new TemporaryFolder();
 
     private static final int DIM = 32;
+
+    private int savedMinLiveVectorsForCheckpoint;
+
+    /**
+     * Disable the min-live-vectors checkpoint gate so every explicit
+     * {@code checkpoint()} call in these tests runs immediately instead of
+     * being deferred (the gate would otherwise skip checkpoints whose live
+     * shard is below the threshold once at least one segment exists).
+     */
+    @Before
+    public void disableMinLiveVectorsGate() {
+        savedMinLiveVectorsForCheckpoint = PersistentVectorStore.minLiveVectorsForCheckpoint;
+        PersistentVectorStore.minLiveVectorsForCheckpoint = 0;
+    }
+
+    @After
+    public void restoreMinLiveVectorsGate() {
+        PersistentVectorStore.minLiveVectorsForCheckpoint = savedMinLiveVectorsForCheckpoint;
+    }
 
     private float[] randomVector(Random rng) {
         float[] v = new float[DIM];
@@ -208,6 +231,104 @@ public class MemoryPressureTriggerZeroLiveVectorsTest {
             assertEquals("estimatedMemoryUsageBytes must be live-shard memory plus"
                     + " the on-disk segment footprint",
                     live + onDisk, total);
+        }
+    }
+
+    private PersistentVectorStore createDeferralStore(Path tmpDir,
+            MemoryDataStorageManager dsm, MemoryManager mm) {
+        // maxLiveGraphSize=100 forces a fresh live shard every 100 vectors;
+        // maxLiveBytesPerCheckpoint=64 KiB forces Phase A to snapshot only the
+        // first shard and defer the rest into deferredShards.
+        PersistentVectorStore store = new PersistentVectorStore(
+                "vidx", "testtable", "tstblspace", "vector_col",
+                "vidx_uuid", tmpDir, dsm, mm,
+                16, 100, 1.2f, 1.4f, true /* fusedPQ */, 2_000_000_000L,
+                100 /* maxLiveGraphSize */,
+                Long.MAX_VALUE,
+                VectorSimilarityFunction.EUCLIDEAN,
+                Long.MAX_VALUE /* maxVectorMemoryBytes */, null /* budget */,
+                64 * 1024 /* maxLiveBytesPerCheckpoint */, 0);
+        store.configureCompaction(Long.MAX_VALUE, 1L, Long.MAX_VALUE, 4, Integer.MAX_VALUE, 0);
+        return store;
+    }
+
+    /**
+     * Issue #563 review follow-up: the zero-live-vectors guard counts live +
+     * frozen + <em>deferred</em> shards (via {@code liveFrozenDeferredNodeCount()}),
+     * matching {@link PersistentVectorStore#getLiveShardMemoryBytes()}. When a
+     * Phase A byte-cap deferral parks un-persisted vectors in
+     * {@code deferredShards}, those must be counted — otherwise a future caller
+     * could mistake a deferral window for an empty store. The test also
+     * verifies the deferral path loses no vectors, including across a restart.
+     */
+    @Test(timeout = 120_000)
+    public void guardCountsDeferredShardsAndDeferralLosesNoVectors() throws Exception {
+        Path tmpDir = tmpFolder.newFolder("deferred-shards").toPath();
+        MemoryDataStorageManager dsm = new MemoryDataStorageManager();
+        MemoryManager mm = new MemoryManager(64 * 1024 * 1024, 0, 1024 * 1024, 1024 * 1024);
+        final int totalVectors = 600;
+
+        // Captured inside the Phase B hook, which runs on the checkpoint thread
+        // while Phase A's deferredShards are still populated (Phase C rejoins
+        // them only after Phase B completes).
+        AtomicBoolean deferralObservedAtHook = new AtomicBoolean(false);
+        AtomicInteger hookLiveNodeCount = new AtomicInteger(-1);
+        AtomicInteger hookLiveFrozenDeferredCount = new AtomicInteger(-1);
+
+        try (PersistentVectorStore store = createDeferralStore(tmpDir, dsm, mm)) {
+            store.start();
+            store.setCheckpointPhaseBHook(() -> {
+                if (store.getCurrentDeferredVectors() > 0) {
+                    deferralObservedAtHook.set(true);
+                    hookLiveNodeCount.set(store.getLiveNodeCount());
+                    hookLiveFrozenDeferredCount.set(store.liveFrozenDeferredNodeCount());
+                }
+            });
+
+            Random rng = new Random(123);
+            for (int i = 0; i < totalVectors; i++) {
+                store.addVector(Bytes.from_int(i), randomVector(rng));
+            }
+
+            store.checkpoint();
+
+            // The 64 KiB per-checkpoint byte cap must have forced a deferral.
+            assertTrue("the small per-checkpoint byte cap must force a Phase A deferral",
+                    store.getDeferralEvents() > 0);
+            assertTrue("the Phase B hook must have observed populated deferred shards",
+                    deferralObservedAtHook.get());
+            // The decisive guard-consistency assertion: while deferredShards
+            // held un-persisted vectors, liveFrozenDeferredNodeCount() (used by
+            // the issue #563 guard) counted them — getLiveNodeCount(), which
+            // omits deferred shards, reported strictly fewer.
+            assertTrue("liveFrozenDeferredNodeCount must include the deferred"
+                    + " shards that getLiveNodeCount omits (live+frozen="
+                    + hookLiveNodeCount.get() + ", live+frozen+deferred="
+                    + hookLiveFrozenDeferredCount.get() + ")",
+                    hookLiveFrozenDeferredCount.get() > hookLiveNodeCount.get());
+
+            // No vector is lost across the deferral: the deferred shards were
+            // rejoined into liveShards, so the store still holds every vector.
+            assertEquals("a deferral must not drop any vector",
+                    totalVectors, store.size());
+
+            // Drain every remaining (previously deferred) live vector to disk.
+            int guard = 0;
+            while (store.getLiveNodeCount() > 0 && guard++ < 50) {
+                store.checkpoint();
+            }
+            assertEquals("repeated checkpoints must flush every deferred vector",
+                    0, store.getLiveNodeCount());
+            assertEquals("every vector must end up on disk", totalVectors,
+                    store.getOnDiskNodeCount());
+        }
+
+        // Restart against the same storage: every vector must survive the
+        // deferral + checkpoint cycle.
+        try (PersistentVectorStore reloaded = createDeferralStore(tmpDir, dsm, mm)) {
+            reloaded.start();
+            assertEquals("no vector may be lost across deferral + restart",
+                    totalVectors, reloaded.size());
         }
     }
 }

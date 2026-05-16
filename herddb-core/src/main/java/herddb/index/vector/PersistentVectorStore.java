@@ -3733,15 +3733,20 @@ public class PersistentVectorStore extends AbstractVectorStore {
     // Package-private (not private) so MemoryPressureTriggerZeroLiveVectorsTest
     // can exercise the issue #563 zero-live-vectors guard as a whitebox test.
     boolean shouldTriggerMemoryPressureCheckpoint() {
-        // Issue #563: skip the trigger entirely when there are no live vectors
-        // to checkpoint. A memory-pressure checkpoint only moves the live HNSW
-        // shard onto disk; it cannot reduce the on-disk segment pkData/BLink
-        // footprint that {@link #estimatedMemoryUsageBytes()} (and the global
-        // budget) also count. With many on-disk segments that footprint alone
-        // can permanently exceed the 70% threshold, so without this guard the
-        // compaction loop fires a spurious, no-op Phase A every cycle even
-        // though live_node_count is 0.
-        if (getLiveNodeCount() == 0) {
+        // Issue #563: skip the trigger entirely when there are no in-memory
+        // vectors to checkpoint. A memory-pressure checkpoint only moves the
+        // in-memory HNSW shards onto disk; it cannot reduce the on-disk segment
+        // pkData/BLink footprint that {@link #estimatedMemoryUsageBytes()} (and
+        // the global budget) also count. With many on-disk segments that
+        // footprint alone can permanently exceed the 70% threshold, so without
+        // this guard the compaction loop fires a spurious, no-op Phase A every
+        // cycle even though there are 0 live vectors.
+        //
+        // The count spans live + frozen + deferred shards — the same shard set
+        // {@link #getLiveShardMemoryBytes()} measures — so a checkpoint that
+        // defers shards (parking un-persisted vectors in deferredShards) is not
+        // mistaken for an empty store.
+        if (liveFrozenDeferredNodeCount() == 0) {
             return false;
         }
         // Check global budget first (covers all stores sharing the same heap)
@@ -7906,6 +7911,39 @@ public class PersistentVectorStore extends AbstractVectorStore {
             }
         }
         return totalLiveSize() + frozenCount;
+    }
+
+    /**
+     * Total number of in-memory vectors across the live, frozen, and deferred
+     * shards — every vector that a checkpoint could still flush to disk.
+     *
+     * <p>Differs from {@link #getLiveNodeCount()}, which omits
+     * {@code deferredShards} for historical diagnostic reasons. The
+     * memory-pressure checkpoint guard (issue #563) uses this fuller count so
+     * it stays consistent with {@link #getLiveShardMemoryBytes()}: a Phase A
+     * byte-cap deferral parks shards holding genuine un-persisted vectors in
+     * {@code deferredShards}, and those must not be mistaken for "nothing to
+     * checkpoint".
+     *
+     * <p>The three list reads are intentionally non-atomic — the value is a
+     * best-effort snapshot for the compaction loop, which re-evaluates the
+     * condition on every cycle.
+     */
+    int liveFrozenDeferredNodeCount() {
+        int count = totalLiveSize();
+        List<LiveGraphShard> frozen = frozenShards;
+        if (frozen != null) {
+            for (LiveGraphShard shard : frozen) {
+                count += shard.nodeToPk.size();
+            }
+        }
+        List<LiveGraphShard> deferred = deferredShards;
+        if (deferred != null) {
+            for (LiveGraphShard shard : deferred) {
+                count += shard.nodeToPk.size();
+            }
+        }
+        return count;
     }
 
     public int getOnDiskNodeCount() {
