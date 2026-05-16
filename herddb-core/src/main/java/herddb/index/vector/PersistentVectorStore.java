@@ -3590,16 +3590,15 @@ public class PersistentVectorStore extends AbstractVectorStore {
             }
         }
 
-        // Issue #569: warm the adopted segment's block cache BEFORE it is
-        // published into the searchable `this.segments` list under the write
-        // lock below — and deliberately OUTSIDE the write lock, since warmup
-        // is I/O. An adopted segment is just another freshly-loaded segment
-        // that must be hot before its first ANN query. If a concurrent
-        // adoption wins the idempotency race below the warmup is wasted, but
-        // that is rare and strictly cheaper than a cold first query.
-        warmUpNewSegmentsBeforePublish(
-                java.util.Collections.singletonList(tentative),
-                "adoptExternalSegment");
+        // Issue #569: an adopted segment is published with warmedUp == false
+        // (the VectorSegment default). It is therefore warmed by the next
+        // post-checkpoint warm-all sweep (warmUpBlockCache), which is
+        // idempotent and skips already-warmed segments. We deliberately do
+        // NOT warm inline here: adoption runs on a ZK-watcher dispatch thread
+        // and is rare, the checkpoint/compaction creation paths cover the
+        // warm-before-publish guarantee for IS-produced segments, and the
+        // sweep keeps adopted segments converging to "warm" without adding
+        // I/O to the watcher thread.
 
         // Under write lock: re-check idempotency, then publish.
         boolean alreadyAdopted = false;

@@ -44,6 +44,7 @@ import java.nio.ByteBuffer;
 import java.nio.file.Path;
 import java.util.Properties;
 import java.util.Random;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.After;
@@ -155,6 +156,12 @@ public class BlockCacheWarmupTest {
     private static final class TrackingMemoryDataStorageManager extends MemoryDataStorageManager {
 
         final AtomicLong totalBytesRead = new AtomicLong();
+        /**
+         * When {@code true}, every data-read on a reader handed out AFTER the
+         * flag is set throws {@link IOException} — used to inject a warmup I/O
+         * failure (issue #569) and verify the retry contract.
+         */
+        final AtomicBoolean failReads = new AtomicBoolean(false);
 
         @Override
         public ReaderSupplier multipartIndexReaderSupplier(
@@ -162,7 +169,7 @@ public class BlockCacheWarmupTest {
                 throws DataStorageManagerException {
             ReaderSupplier original = super.multipartIndexReaderSupplier(
                     tableSpace, uuid, fileType, fileSize);
-            return new CountingReaderSupplier(original, totalBytesRead);
+            return new CountingReaderSupplier(original, totalBytesRead, failReads);
         }
     }
 
@@ -170,15 +177,18 @@ public class BlockCacheWarmupTest {
 
         private final ReaderSupplier delegate;
         private final AtomicLong counter;
+        private final AtomicBoolean failReads;
 
-        CountingReaderSupplier(ReaderSupplier delegate, AtomicLong counter) {
+        CountingReaderSupplier(ReaderSupplier delegate, AtomicLong counter,
+                               AtomicBoolean failReads) {
             this.delegate = delegate;
             this.counter = counter;
+            this.failReads = failReads;
         }
 
         @Override
         public RandomAccessReader get() throws IOException {
-            return new CountingReader(delegate.get(), counter);
+            return new CountingReader(delegate.get(), counter, failReads);
         }
 
         @Override
@@ -191,20 +201,31 @@ public class BlockCacheWarmupTest {
 
         private final RandomAccessReader delegate;
         private final AtomicLong counter;
+        private final AtomicBoolean failReads;
 
-        CountingReader(RandomAccessReader delegate, AtomicLong counter) {
+        CountingReader(RandomAccessReader delegate, AtomicLong counter,
+                       AtomicBoolean failReads) {
             this.delegate = delegate;
             this.counter = counter;
+            this.failReads = failReads;
+        }
+
+        private void failIfRequested() throws IOException {
+            if (failReads.get()) {
+                throw new IOException("injected read failure");
+            }
         }
 
         @Override
         public void readFully(byte[] dest) throws IOException {
+            failIfRequested();
             delegate.readFully(dest);
             counter.addAndGet(dest.length);
         }
 
         @Override
         public void readFully(ByteBuffer buffer) throws IOException {
+            failIfRequested();
             int before = buffer.remaining();
             delegate.readFully(buffer);
             counter.addAndGet(before - buffer.remaining());
@@ -212,18 +233,21 @@ public class BlockCacheWarmupTest {
 
         @Override
         public void readFully(long[] longs) throws IOException {
+            failIfRequested();
             delegate.readFully(longs);
             counter.addAndGet((long) longs.length * Long.BYTES);
         }
 
         @Override
         public void read(int[] ints, int offset, int count) throws IOException {
+            failIfRequested();
             delegate.read(ints, offset, count);
             counter.addAndGet((long) count * Integer.BYTES);
         }
 
         @Override
         public void read(float[] floats, int offset, int count) throws IOException {
+            failIfRequested();
             delegate.read(floats, offset, count);
             counter.addAndGet((long) count * Float.BYTES);
         }
@@ -240,6 +264,7 @@ public class BlockCacheWarmupTest {
 
         @Override
         public int readInt() throws IOException {
+            failIfRequested();
             int v = delegate.readInt();
             counter.addAndGet(Integer.BYTES);
             return v;
@@ -247,6 +272,7 @@ public class BlockCacheWarmupTest {
 
         @Override
         public float readFloat() throws IOException {
+            failIfRequested();
             float v = delegate.readFloat();
             counter.addAndGet(Float.BYTES);
             return v;
@@ -254,6 +280,7 @@ public class BlockCacheWarmupTest {
 
         @Override
         public long readLong() throws IOException {
+            failIfRequested();
             long v = delegate.readLong();
             counter.addAndGet(Long.BYTES);
             return v;
@@ -420,6 +447,53 @@ public class BlockCacheWarmupTest {
             dsm.totalBytesRead.set(0);
             store.warmUpBlockCache(budget);
             return dsm.totalBytesRead.get();
+        } finally {
+            store.close();
+        }
+    }
+
+    /**
+     * Issue #569: a warmup that hits an I/O error must NOT mark the segment
+     * warmed — {@code warmUpSegmentBfs} returns 0 and {@code warmUpSegment}
+     * leaves {@code warmedUp == false} so a later sweep retries it. Verifies
+     * the retry contract end to end: a failing {@code warmUpBlockCache}
+     * sweep warms nothing, and a subsequent sweep (after the failure clears)
+     * warms the segment.
+     */
+    @Test
+    public void testWarmupRetriesAfterIoFailure() throws Exception {
+        Path tmpDir = folder.newFolder().toPath();
+        TrackingMemoryDataStorageManager dsm = new TrackingMemoryDataStorageManager();
+        MemoryManager mm = new MemoryManager(64 * 1024 * 1024, 0, 1024 * 1024, 1024 * 1024);
+
+        PersistentVectorStore store = new PersistentVectorStore(
+                "vidx", "vectable", "tstuuid", "vec",
+                tmpDir, dsm, mm,
+                16, 100, 1.2f, 1.4f, true, 2_000_000_000L, 0,
+                Long.MAX_VALUE, VectorSimilarityFunction.EUCLIDEAN);
+        store.start();
+        try {
+            Random rng = new Random(569);
+            int dim = 32;
+            for (int i = 0; i < 512; i++) {
+                store.addVector(herddb.utils.Bytes.from_string("pk" + i),
+                        randomVector(rng, dim));
+            }
+            // Checkpoint reads must succeed — only the warmup reads below fail.
+            store.checkpoint();
+
+            // Inject an I/O failure, then attempt the warm-all sweep.
+            dsm.failReads.set(true);
+            store.warmUpBlockCache(Long.MAX_VALUE);
+            assertEquals("a warmup that hits an I/O error must leave the segment "
+                            + "unwarmed (no segment counted as warmed)",
+                    0, store.getWarmedSegmentsTotal());
+
+            // Clear the failure: the next sweep must retry and warm the segment.
+            dsm.failReads.set(false);
+            store.warmUpBlockCache(Long.MAX_VALUE);
+            assertTrue("warmup must retry and succeed once the I/O error clears",
+                    store.getWarmedSegmentsTotal() > 0);
         } finally {
             store.close();
         }
