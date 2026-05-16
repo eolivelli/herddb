@@ -297,6 +297,50 @@ Rules that apply to every workload, including user-specified ones:
 
 ---
 
+## gRPC push mode (testing-only, no server)
+
+When the user asks to run the benchmark in **gRPC push mode** — also called
+"push-based indexing", "`--protocol grpc`", or "no-server bench" — the
+topology changes: there is **no HerdDB server and no BookKeeper**. VectorBench
+serializes commit-log entries itself and pushes them straight into the
+indexing service over the `PushEntries` gRPC RPC.
+
+Enable it by setting, in `values.yaml`, **before** `./install.sh`:
+
+```yaml
+pushIndexingMode:
+  enabled: true
+```
+
+`./install.sh` then renders the `herddb-server` and `herddb-bookkeeper`
+StatefulSets at **0 replicas**; ZooKeeper, the file server, the index
+optimizer, MinIO and the tools pod stay up, and the indexing service runs
+with `indexing.log.type=push`.
+
+Run the workload with `--protocol grpc`, pointed at one indexing-service pod:
+
+```
+./scripts/run-bench.sh --background --protocol grpc \
+    --grpc-endpoint herddb-indexing-service-0.herddb-indexing-service:9850 \
+    --dataset sift10k -n 10000 --ingest-threads 8 --batch-size 10000
+```
+
+Differences from the JDBC workflow — apply these whenever push mode is used:
+
+- **Ingestion only.** gRPC mode runs no query/recall phase. Do NOT pass
+  `--checkpoint` or `--wait-for-indexes` (there is no server to checkpoint;
+  pushed entries are applied directly). `--ingest-max-ops` is ignored.
+  VectorBench verifies the run itself by polling the indexed vector count
+  over gRPC (`GetIndexStatus`).
+- **Supervision.** There is no `herddb-server` or `herddb-bookkeeper` pod —
+  do not flag them missing/`fatal`. Supervise the indexing-service,
+  file-server and optimizer pods as usual; `indexing-admin describe-index`
+  (`vector_count`) is the authoritative progress signal.
+- **Single endpoint.** Push mode drives exactly one indexing-service pod,
+  even when `indexingService.replicaCount > 1`.
+
+---
+
 ## Workflow
 
 1. **Preflight.** Check that `docker`, `helm`, `kubectl`, and `gh` are on
