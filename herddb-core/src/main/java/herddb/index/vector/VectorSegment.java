@@ -90,6 +90,24 @@ class VectorSegment implements Closeable {
     volatile boolean dirty;
 
     /**
+     * Whether this segment's block cache has already been warmed (issue #569).
+     *
+     * <p>Set to {@code true} once {@link PersistentVectorStore#warmUpSegment}
+     * has BFS-warmed the segment's Layer-0 graph pages — or once it has
+     * determined there is nothing to warm (no {@code onDiskGraph}). Warming
+     * happens BEFORE the segment is published into the searchable
+     * {@code PersistentVectorStore.segments} list, so the field is always set
+     * before the volatile publish that makes the segment visible to readers.
+     *
+     * <p>Declared {@code volatile} so the post-checkpoint warm-all sweep,
+     * which may run on the dedicated warmup executor thread, observes the
+     * value written by the checkpoint / compaction thread and treats an
+     * already-warmed segment as a no-op (idempotent warm-all — the fix for
+     * the warmup→checkpoint→warmup death spiral).
+     */
+    volatile boolean warmedUp;
+
+    /**
      * Snapshot of {@link #estimatedInMemoryBytes()} captured by
      * {@link PersistentVectorStore}'s incremental on-disk-segment memory
      * counter (issue #455).  Written when the segment is registered with the

@@ -920,6 +920,16 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                 store.setLocalCompactionKickFraction(vectorCompactionLocalKickFraction);
                 store.setLocalCompactionEnabledWithOptimizer(
                         vectorCompactionLocalEnabledWithOptimizer);
+                // Issue #569: hand the warmup byte budget to the store so it can
+                // warm each new segment's block cache AT CREATION TIME (in the
+                // checkpoint Phase C-prep and compaction merge paths), before the
+                // segment becomes searchable. The post-checkpoint warm-all below
+                // (submitWarmupAsyncOrInline) then degenerates to an idempotent
+                // no-op in steady state, breaking the warmup→checkpoint→warmup
+                // death spiral. `warmupBytesPerSegment` is resolved earlier in
+                // start(); the factory lambda runs later (tailer-driven), so the
+                // field is always populated by the time this executes.
+                store.setWarmupBytesPerSegment(this.warmupBytesPerSegment);
                 // Issue #491: when the external index-optimizer is enabled cluster-wide
                 // (indexing.optimizer.enabled=true) AND the metadata storage manager is
                 // ZK-backed, attach a SegmentRegistryPublisher BEFORE start() so that:
