@@ -40,6 +40,15 @@ public final class IndexingServerConfiguration {
     public static final String PROPERTY_GRPC_PORT = "indexing.grpc.port";
     public static final int PROPERTY_GRPC_PORT_DEFAULT = 9850;
 
+    /**
+     * Maximum inbound gRPC message size (bytes) accepted by the indexing
+     * service server. gRPC's 4 MiB default is too small for batched
+     * {@code PushEntries} requests carrying many serialized INSERT entries;
+     * 64 MiB leaves ample head-room while still bounding memory.
+     */
+    public static final String PROPERTY_GRPC_MAX_MESSAGE_SIZE = "indexing.grpc.max.message.size";
+    public static final int PROPERTY_GRPC_MAX_MESSAGE_SIZE_DEFAULT = 64 * 1024 * 1024;
+
     // HTTP / metrics
     public static final String PROPERTY_HTTP_ENABLE = "indexing.http.enable";
     public static final boolean PROPERTY_HTTP_ENABLE_DEFAULT = false;
@@ -610,6 +619,26 @@ public final class IndexingServerConfiguration {
     // Log tailing mode
     public static final String PROPERTY_LOG_TYPE = "indexing.log.type";
     public static final String PROPERTY_LOG_TYPE_DEFAULT = "file";
+
+    /**
+     * Value of {@link #PROPERTY_LOG_TYPE} selecting the testing-only
+     * push-based tailer: commit-log entries are pushed in over the
+     * {@code PushEntries} gRPC RPC instead of being tailed from a file or a
+     * BookKeeper ledger. Mutually exclusive with {@code file} / {@code bookkeeper}.
+     * In this mode the indexing service needs neither a HerdDB server nor a
+     * materialised commit log.
+     */
+    public static final String PROPERTY_LOG_TYPE_PUSH = "push";
+
+    /**
+     * Capacity (number of entries) of the fixed-size in-memory buffer used by
+     * the push-based tailer ({@code indexing.log.type=push}). The
+     * {@code PushEntries} RPC blocks once the buffer is full — this is the
+     * ingestion back-pressure while the tailer is stalled in a
+     * checkpoint/compaction.
+     */
+    public static final String PROPERTY_LOG_PUSH_BUFFER_CAPACITY = "indexing.log.push.buffer.capacity";
+    public static final int PROPERTY_LOG_PUSH_BUFFER_CAPACITY_DEFAULT = 10_000;
 
     // BookKeeper/ZooKeeper settings (for log.type=bookkeeper)
     // Use SAME keys as ServerConfiguration so config can be copy/pasted

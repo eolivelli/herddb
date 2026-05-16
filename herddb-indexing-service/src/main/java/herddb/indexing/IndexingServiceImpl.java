@@ -41,16 +41,21 @@ import herddb.indexing.proto.ListPrimaryKeysRequest;
 import herddb.indexing.proto.MetricEntry;
 import herddb.indexing.proto.MetricValue;
 import herddb.indexing.proto.PrimaryKeysChunk;
+import herddb.indexing.proto.PushEntriesRequest;
+import herddb.indexing.proto.PushEntriesResponse;
+import herddb.indexing.proto.PushedLogEntry;
 import herddb.indexing.proto.SearchRequest;
 import herddb.indexing.proto.SearchResponse;
 import herddb.indexing.proto.SearchResult;
 import herddb.indexing.proto.WaitForCheckpointRequest;
 import herddb.indexing.proto.WaitForCheckpointResponse;
+import herddb.log.LogEntry;
 import herddb.log.LogSequenceNumber;
 import herddb.utils.Bytes;
 import herddb.utils.VectorSearchRequestContext;
 import io.grpc.Status;
 import io.grpc.stub.StreamObserver;
+import java.io.EOFException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -667,6 +672,68 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
             responseObserver.onCompleted();
         } catch (RuntimeException e) {
             LOGGER.log(Level.SEVERE, "DropIndex RPC failed for index " + indexName, e);
+            responseObserver.onError(Status.INTERNAL
+                    .withDescription(e.getMessage())
+                    .withCause(e)
+                    .asRuntimeException());
+        }
+    }
+
+    /**
+     * Push-based indexing (TESTING ONLY). Deserializes each pushed
+     * {@code LogEntry} and enqueues it into the {@link PushCommitLogTailer}'s
+     * bounded buffer; the call blocks until every entry has been accepted (the
+     * buffer fills during checkpoint/compaction back-pressure, so clients must
+     * use an infinite deadline).
+     *
+     * <p>Fails with {@code FAILED_PRECONDITION} when the engine is not running
+     * in push mode ({@code indexing.log.type=push}), and with
+     * {@code INVALID_ARGUMENT} when an entry blob cannot be deserialized.
+     */
+    @Override
+    public void pushEntries(PushEntriesRequest request,
+                            StreamObserver<PushEntriesResponse> responseObserver) {
+        PushCommitLogTailer pushTailer = engine.getPushTailer();
+        if (pushTailer == null) {
+            responseObserver.onError(Status.FAILED_PRECONDITION
+                    .withDescription("indexing service is not running in push mode "
+                            + "(indexing.log.type=push); PushEntries is not available")
+                    .asRuntimeException());
+            return;
+        }
+        try {
+            long accepted = 0;
+            for (PushedLogEntry pushed : request.getEntriesList()) {
+                LogEntry entry;
+                try {
+                    entry = LogEntry.deserialize(pushed.getEntry().toByteArray());
+                } catch (EOFException | RuntimeException e) {
+                    responseObserver.onError(Status.INVALID_ARGUMENT
+                            .withDescription("malformed LogEntry at batch index "
+                                    + accepted + ": " + e)
+                            .asRuntimeException());
+                    return;
+                }
+                LogSequenceNumber lsn = new LogSequenceNumber(
+                        pushed.getLsnLedger(), pushed.getLsnOffset());
+                // Blocks while the bounded buffer is full.
+                pushTailer.push(lsn, entry);
+                accepted++;
+            }
+            LogSequenceNumber watermark = pushTailer.getWatermark();
+            responseObserver.onNext(PushEntriesResponse.newBuilder()
+                    .setAcceptedCount(accepted)
+                    .setWatermarkLedger(watermark.ledgerId)
+                    .setWatermarkOffset(watermark.offset)
+                    .build());
+            responseObserver.onCompleted();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            responseObserver.onError(Status.CANCELLED
+                    .withDescription("interrupted while enqueueing pushed entries")
+                    .asRuntimeException());
+        } catch (RuntimeException e) {
+            LOGGER.log(Level.SEVERE, "PushEntries failed", e);
             responseObserver.onError(Status.INTERNAL
                     .withDescription(e.getMessage())
                     .withCause(e)

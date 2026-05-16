@@ -152,6 +152,14 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
     private CommitLogTailing tailer;
     private Thread tailerThread;
 
+    /**
+     * Non-null only when {@code indexing.log.type=push}: the testing-only
+     * tailer fed by the {@code PushEntries} gRPC RPC. Held with a typed
+     * reference (in addition to {@link #tailer}) so {@link IndexingServiceImpl}
+     * can enqueue client-pushed entries into its bounded buffer.
+     */
+    private volatile PushCommitLogTailer pushTailer;
+
     private volatile LogSequenceNumber lastProcessedLsn;
     /**
      * Wall-clock timestamp (epoch ms) of the {@link LogEntry} at
@@ -1476,6 +1484,25 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             java.util.Properties bkClientProps = config.asProperties();
             tailer = new BookKeeperCommitLogTailer(zkAddress, zkSessionTimeout, zkPath,
                     bkLedgersPath, tableSpaceUUID, tailerStart, this::processEntry, bkClientProps);
+        } else if (IndexingServerConfiguration.PROPERTY_LOG_TYPE_PUSH.equals(logType)) {
+            // Testing-only push mode: entries arrive over the PushEntries gRPC
+            // RPC instead of a file/BookKeeper log, so no HerdDB server and no
+            // materialised commit log are required. Recovery is otherwise
+            // unchanged — checkpointed segments and the schema snapshot are
+            // reloaded above, tailerStart is the durable watermark, and the
+            // push tailer simply resumes from there (skipping any re-pushed
+            // stale entries).
+            int pushBufferCapacity = config.getInt(
+                    IndexingServerConfiguration.PROPERTY_LOG_PUSH_BUFFER_CAPACITY,
+                    IndexingServerConfiguration.PROPERTY_LOG_PUSH_BUFFER_CAPACITY_DEFAULT);
+            LOGGER.log(Level.INFO,
+                    "Creating PushCommitLogTailer (testing-only push mode), "
+                            + "bufferCapacity={0}, tailerStart={1}",
+                    new Object[]{pushBufferCapacity, tailerStart});
+            PushCommitLogTailer push = new PushCommitLogTailer(
+                    pushBufferCapacity, tailerStart, this::processEntry);
+            this.pushTailer = push;
+            tailer = push;
         } else {
             tailer = new FileCommitLogTailer(logDirectory, tableSpaceUUID, tailerStart, this::processEntry);
         }
@@ -1508,6 +1535,16 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
 
     public String getTableSpaceUUID() {
         return tableSpaceUUID;
+    }
+
+    /**
+     * Returns the push-mode tailer when the engine is running with
+     * {@code indexing.log.type=push}, or {@code null} otherwise. Used by the
+     * {@code PushEntries} gRPC handler to enqueue client-pushed entries into
+     * the bounded buffer.
+     */
+    public PushCommitLogTailer getPushTailer() {
+        return pushTailer;
     }
 
     /**
