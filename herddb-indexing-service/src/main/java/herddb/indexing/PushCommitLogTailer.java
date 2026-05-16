@@ -77,8 +77,13 @@ public class PushCommitLogTailer implements CommitLogTailing {
 
     private volatile LogSequenceNumber watermark;
     private volatile boolean running = true;
-    /** Written only by the tailer thread; {@code volatile} for remote reads. */
-    private volatile long entriesProcessed;
+    /**
+     * Number of entries dispatched to the consumer. Written only by the single
+     * tailer thread; a plain {@code long} (not {@code volatile}) — matching
+     * {@code FileCommitLogTailer} and the {@link CommitLogTailing} counter
+     * contract, under which a cross-thread read may lag by one increment.
+     */
+    private long entriesProcessed;
 
     /** Immutable (LSN, entry) pair held in the bounded buffer. */
     private static final class PushedEntry {

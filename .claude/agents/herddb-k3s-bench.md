@@ -322,16 +322,17 @@ Run the workload with `--protocol grpc`, pointed at one indexing-service pod:
 ```
 ./scripts/run-bench.sh --background --protocol grpc \
     --grpc-endpoint herddb-indexing-service-0.herddb-indexing-service:9850 \
-    --dataset sift10k -n 10000 --ingest-threads 8 --batch-size 10000
+    --dataset sift10k -n 10000 --batch-size 10000
 ```
 
 Differences from the JDBC workflow — apply these whenever push mode is used:
 
 - **Ingestion only.** gRPC mode runs no query/recall phase. Do NOT pass
   `--checkpoint` or `--wait-for-indexes` (there is no server to checkpoint;
-  pushed entries are applied directly). `--ingest-max-ops` is ignored.
-  VectorBench verifies the run itself by polling the indexed vector count
-  over gRPC (`GetIndexStatus`).
+  pushed entries are applied directly). gRPC ingestion is single-threaded, so
+  `--ingest-threads` and `--ingest-max-ops` are ignored. VectorBench verifies
+  the run itself by polling the indexed vector count over gRPC
+  (`GetIndexStatus`).
 - **Supervision.** There is no `herddb-server` or `herddb-bookkeeper` pod —
   do not flag them missing/`fatal`. Supervise the indexing-service,
   file-server and optimizer pods as usual; `indexing-admin describe-index`

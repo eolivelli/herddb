@@ -262,16 +262,17 @@ service sharing a commit log on disk). Instead, from the repo root:
    every argument to VectorBench):
    ```
    vector-testings/run.sh --protocol grpc --grpc-endpoint localhost:9850 \
-       --dataset sift10k -n 10000 --ingest-threads 8 --batch-size 10000
+       --dataset sift10k -n 10000 --batch-size 10000
    ```
 
 Differences from the JDBC workflow — apply these whenever push mode is used:
 
 - **Ingestion only.** gRPC mode runs no query/recall phase. Do NOT pass
   `--checkpoint` or `--wait-for-indexes` (there is no server to checkpoint;
-  pushed entries are applied directly). `--ingest-max-ops` is ignored.
-  VectorBench verifies the run itself by polling the indexed vector count
-  over gRPC (`GetIndexStatus`).
+  pushed entries are applied directly). gRPC ingestion is single-threaded, so
+  `--ingest-threads` and `--ingest-max-ops` are ignored. VectorBench verifies
+  the run itself by polling the indexed vector count over gRPC
+  (`GetIndexStatus`).
 - **Supervision.** There is only one process — the indexing service. There
   is no `herddb-server` to poll; do not flag it missing. Watch the
   indexing-service log and `bin/indexing-admin.sh describe-index`
