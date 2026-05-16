@@ -38,6 +38,7 @@ import java.util.Arrays;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.function.Function;
 
 /**
  * The {@code --protocol grpc} ingestion path of VectorBench.
@@ -57,7 +58,7 @@ import java.util.List;
  */
 public final class GrpcBench {
 
-    /** Fixed ledger component of the synthetic LSN stream; offsets are monotonic. */
+    /** Name of the vector index this mode creates, populates and verifies. */
     private static final String INDEX_NAME = "vidx";
 
     private GrpcBench() {
@@ -70,6 +71,10 @@ public final class GrpcBench {
      */
     static void run(Config config, BenchOutput out, long benchmarkStartNs) throws Exception {
         out.header("=== gRPC PUSH MODE (indexing service " + config.grpcEndpoint + ") ===");
+        if (config.resumeFromAuto) {
+            out.info("WARNING: --resume-from auto is not supported with --protocol grpc; "
+                    + "ingestion starts at row " + config.resumeFrom + ".");
+        }
         out.info("Loading dataset...");
         DatasetLoader loader = new DatasetLoader(config.datasetDir, config.dataset, config.datasetUrl);
         loader.ensureDataset();
@@ -115,9 +120,13 @@ public final class GrpcBench {
 
         out.phaseStart("schema");
         out.info("Pushing CREATE TABLE " + config.tableName + " + CREATE VECTOR INDEX " + INDEX_NAME);
-        pushBatch(client, ledgerId, offset, Arrays.asList(
+        PushEntriesResponse schemaResp = pushBatch(client, ledgerId, offset, Arrays.asList(
                 LogEntryFactory.createTable(table, null),
                 LogEntryFactory.createIndex(index, null)));
+        if (schemaResp.getAcceptedCount() != 2) {
+            throw new IllegalStateException("indexing service accepted "
+                    + schemaResp.getAcceptedCount() + " of 2 schema entries");
+        }
         // Baseline so verification works even against a non-fresh service.
         long baseline = client.getIndexStatus(TableSpace.DEFAULT, config.tableName, INDEX_NAME)
                 .getVectorCount();
@@ -139,7 +148,7 @@ public final class GrpcBench {
             int n = 0;
             while (n < config.batchSize && vectors.hasNext()) {
                 float[] v = vectors.next();
-                Record record = RecordSerializer.makeRecord(table, "id", (int) rowId, "vec", v);
+                Record record = RecordSerializer.makeRecord(table, "id", rowId, "vec", v);
                 batch.add(new LogEntry(System.currentTimeMillis(), LogEntryType.INSERT,
                         txId, table.tableId, record.key, record.value));
                 rowId++;
@@ -218,19 +227,33 @@ public final class GrpcBench {
     }
 
     /**
-     * Serializes each entry into a pooled direct {@link ByteBuf}, assigns it
-     * the next LSN, pushes the batch, and releases the buffers once the
-     * (zero-copy) RPC has returned.
+     * Pushes a batch, serializing each entry with
+     * {@link LogEntry#serializeAsByteBuf()}.
      */
     private static PushEntriesResponse pushBatch(IndexingPushClient client, long ledgerId,
                                                  long[] offset, List<LogEntry> entries) {
+        return pushBatch(client, ledgerId, offset, entries, LogEntry::serializeAsByteBuf);
+    }
+
+    /**
+     * Serializes each entry into a pooled direct {@link ByteBuf} with
+     * {@code serializer}, assigns it the next LSN, pushes the batch, and
+     * releases <em>every</em> buffer once the (zero-copy) RPC has returned —
+     * including when serializing a later entry throws mid-batch.
+     *
+     * <p>The serializer is a parameter so tests can exercise that buffer
+     * lifecycle without a live indexing service.
+     */
+    static PushEntriesResponse pushBatch(IndexingPushClient client, long ledgerId, long[] offset,
+                                         List<LogEntry> entries,
+                                         Function<LogEntry, ByteBuf> serializer) {
         List<LogSequenceNumber> lsns = new ArrayList<>(entries.size());
         List<ByteBuf> bufs = new ArrayList<>(entries.size());
-        for (LogEntry entry : entries) {
-            lsns.add(new LogSequenceNumber(ledgerId, offset[0]++));
-            bufs.add(entry.serializeAsByteBuf());
-        }
         try {
+            for (LogEntry entry : entries) {
+                lsns.add(new LogSequenceNumber(ledgerId, offset[0]++));
+                bufs.add(serializer.apply(entry));
+            }
             return client.pushEntries(lsns, bufs);
         } finally {
             for (ByteBuf buf : bufs) {
@@ -243,7 +266,9 @@ public final class GrpcBench {
         return Table.builder()
                 .name(config.tableName)
                 .tablespace(TableSpace.DEFAULT)
-                .column("id", ColumnTypes.INTEGER)
+                // LONG, not INTEGER: a bench may ingest more than 2^31 rows and
+                // the primary key must stay unique.
+                .column("id", ColumnTypes.LONG)
                 .column("vec", ColumnTypes.FLOATARRAY)
                 .primaryKey("id")
                 .build();
