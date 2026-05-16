@@ -686,43 +686,58 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
      * buffer fills during checkpoint/compaction back-pressure, so clients must
      * use an infinite deadline).
      *
-     * <p>Fails with {@code FAILED_PRECONDITION} when the engine is not running
-     * in push mode ({@code indexing.log.type=push}), and with
-     * {@code INVALID_ARGUMENT} when an entry blob cannot be deserialized.
+     * <p>Fails with {@code FAILED_PRECONDITION} when the service is not
+     * configured for push mode ({@code indexing.log.type=push}), with
+     * {@code UNAVAILABLE} (retryable) when it is but the engine has not
+     * finished starting, and with {@code INVALID_ARGUMENT} when an entry blob
+     * cannot be deserialized — in which case the whole batch is rejected
+     * atomically, with no prefix of it enqueued.
      */
     @Override
     public void pushEntries(PushEntriesRequest request,
                             StreamObserver<PushEntriesResponse> responseObserver) {
         PushCommitLogTailer pushTailer = engine.getPushTailer();
         if (pushTailer == null) {
-            responseObserver.onError(Status.FAILED_PRECONDITION
-                    .withDescription("indexing service is not running in push mode "
-                            + "(indexing.log.type=push); PushEntries is not available")
-                    .asRuntimeException());
+            if (engine.isPushModeConfigured()) {
+                // Configured for push mode but the engine has not finished
+                // start() yet — the gRPC server binds before engine.start()
+                // assigns the tailer. Retryable; NOT a permanent mismatch.
+                responseObserver.onError(Status.UNAVAILABLE
+                        .withDescription("indexing engine is still starting; retry PushEntries")
+                        .asRuntimeException());
+            } else {
+                responseObserver.onError(Status.FAILED_PRECONDITION
+                        .withDescription("indexing service is not running in push mode "
+                                + "(indexing.log.type=push); PushEntries is not available")
+                        .asRuntimeException());
+            }
             return;
         }
+        // Deserialize the whole batch up-front so a malformed entry rejects the
+        // batch atomically — no prefix of it is enqueued.
+        List<LogEntry> entries = new ArrayList<>(request.getEntriesCount());
+        List<LogSequenceNumber> lsns = new ArrayList<>(request.getEntriesCount());
+        int index = 0;
+        for (PushedLogEntry pushed : request.getEntriesList()) {
+            try {
+                entries.add(LogEntry.deserialize(pushed.getEntry().toByteArray()));
+            } catch (EOFException | RuntimeException e) {
+                responseObserver.onError(Status.INVALID_ARGUMENT
+                        .withDescription("malformed LogEntry at batch index " + index + ": " + e)
+                        .asRuntimeException());
+                return;
+            }
+            lsns.add(new LogSequenceNumber(pushed.getLsnLedger(), pushed.getLsnOffset()));
+            index++;
+        }
         try {
-            long accepted = 0;
-            for (PushedLogEntry pushed : request.getEntriesList()) {
-                LogEntry entry;
-                try {
-                    entry = LogEntry.deserialize(pushed.getEntry().toByteArray());
-                } catch (EOFException | RuntimeException e) {
-                    responseObserver.onError(Status.INVALID_ARGUMENT
-                            .withDescription("malformed LogEntry at batch index "
-                                    + accepted + ": " + e)
-                            .asRuntimeException());
-                    return;
-                }
-                LogSequenceNumber lsn = new LogSequenceNumber(
-                        pushed.getLsnLedger(), pushed.getLsnOffset());
+            for (int i = 0; i < entries.size(); i++) {
                 // Blocks while the bounded buffer is full.
-                pushTailer.push(lsn, entry);
-                accepted++;
+                pushTailer.push(lsns.get(i), entries.get(i));
             }
             LogSequenceNumber watermark = pushTailer.getWatermark();
             responseObserver.onNext(PushEntriesResponse.newBuilder()
-                    .setAcceptedCount(accepted)
+                    .setAcceptedCount(entries.size())
                     .setWatermarkLedger(watermark.ledgerId)
                     .setWatermarkOffset(watermark.offset)
                     .build());

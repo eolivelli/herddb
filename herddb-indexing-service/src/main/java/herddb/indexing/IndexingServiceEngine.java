@@ -1548,6 +1548,20 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
     }
 
     /**
+     * Returns {@code true} when this engine is configured for push mode
+     * ({@code indexing.log.type=push}), regardless of whether {@link #start()}
+     * has completed. Lets the {@code PushEntries} gRPC handler distinguish
+     * "still starting" (retryable) from "not a push-mode service" (permanent):
+     * the gRPC server binds before {@link #start()} assigns {@link #pushTailer},
+     * so {@link #getPushTailer()} can be {@code null} during a normal boot.
+     */
+    public boolean isPushModeConfigured() {
+        return IndexingServerConfiguration.PROPERTY_LOG_TYPE_PUSH.equals(
+                config.getString(IndexingServerConfiguration.PROPERTY_LOG_TYPE,
+                        IndexingServerConfiguration.PROPERTY_LOG_TYPE_DEFAULT));
+    }
+
+    /**
      * Issue #491: returns the segmented-v2 ZK registry handle wired during
      * {@link #start()}, or {@code null} when {@link IndexingServerConfiguration#PROPERTY_INDEX_OPTIMIZER_ENABLED}
      * was unset / false at startup OR when the metadata storage manager was

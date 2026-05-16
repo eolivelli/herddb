@@ -165,6 +165,9 @@ public class PushCommitLogTailer implements CommitLogTailing {
                 // keeps a pathological consumer error from killing the tailer.
                 LOGGER.log(Level.SEVERE, "Error dispatching pushed entry at " + pushed.lsn, e);
             }
+            // Advance the watermark unconditionally after dispatch — mirrors
+            // FileCommitLogTailer.drainReader(); a dispatched entry is always
+            // treated as consumed.
             watermark = pushed.lsn;
             entriesProcessed++;
         }
@@ -200,5 +203,16 @@ public class PushCommitLogTailer implements CommitLogTailing {
     @Override
     public void close() {
         running = false;
+        // Entries still buffered when the tailer stops are dropped (the engine
+        // does not drain on shutdown). They were already acknowledged to the
+        // client, so surface the loss — a restart resumes at the durable
+        // watermark and the client is expected to re-push from there.
+        int undispatched = buffer.size();
+        if (undispatched > 0) {
+            LOGGER.log(Level.WARNING,
+                    "PushCommitLogTailer closed with ~{0} undispatched buffered "
+                            + "entr(ies); they are dropped and must be re-pushed after restart",
+                    undispatched);
+        }
     }
 }

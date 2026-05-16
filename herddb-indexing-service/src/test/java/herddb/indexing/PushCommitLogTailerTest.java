@@ -34,14 +34,16 @@ import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.Timeout;
 
 /**
  * Unit tests for {@link PushCommitLogTailer}: in-order dispatch, the bounded
- * buffer's blocking back-pressure, idempotent skipping of stale (re-pushed)
- * entries on restart, and lifecycle.
+ * buffer's blocking back-pressure, idempotent skipping of stale or
+ * out-of-order (re-pushed) entries, and lifecycle including the drop of
+ * still-buffered entries on {@code close()}.
  */
 public class PushCommitLogTailerTest {
 
@@ -54,9 +56,14 @@ public class PushCommitLogTailerTest {
     }
 
     private static void awaitSize(List<?> list, int target, long timeoutMs) throws InterruptedException {
+        awaitCondition(() -> list.size() >= target, timeoutMs);
+    }
+
+    private static void awaitCondition(BooleanSupplier condition, long timeoutMs)
+            throws InterruptedException {
         long deadline = System.currentTimeMillis() + timeoutMs;
-        while (list.size() < target && System.currentTimeMillis() < deadline) {
-            Thread.sleep(20);
+        while (!condition.getAsBoolean() && System.currentTimeMillis() < deadline) {
+            Thread.sleep(10);
         }
     }
 
@@ -120,13 +127,13 @@ public class PushCommitLogTailerTest {
         }, "test-pusher");
         pusher.start();
         try {
-            // Give the pusher time to fill the buffer and block.
-            Thread.sleep(500);
+            // Wait until the buffer is full and the pusher is parked on it.
+            awaitCondition(() -> tailer.getBufferedCount() == tailer.getBufferCapacity(), 5000);
+            assertEquals("buffer must be full", tailer.getBufferCapacity(),
+                    tailer.getBufferedCount());
             assertTrue("pusher must still be blocked on a full buffer", pusher.isAlive());
             assertTrue("no entry can be dispatched while the consumer is gated",
                     consumed.isEmpty());
-            assertEquals("buffer must be full", tailer.getBufferCapacity(),
-                    tailer.getBufferedCount());
 
             // Release the consumer: the buffer drains and the pusher completes.
             release.countDown();
@@ -170,6 +177,78 @@ public class PushCommitLogTailerTest {
         assertEquals(new LogSequenceNumber(6, 1), consumed.get(1));
         assertEquals(2L, tailer.getEntriesProcessed());
         assertEquals(new LogSequenceNumber(6, 1), tailer.getWatermark());
+    }
+
+    @Test
+    public void outOfOrderPushAfterAdvanceIsSkipped() throws Exception {
+        // A client that violates the strictly-increasing-LSN contract by
+        // pushing a regressing LSN gets that entry silently skipped (it is at
+        // or before the already-advanced watermark) — the watermark and the
+        // processed count, which the PushEntries response relies on, do not
+        // move backwards.
+        List<LogSequenceNumber> consumed = Collections.synchronizedList(new ArrayList<>());
+        PushCommitLogTailer tailer = new PushCommitLogTailer(128, LogSequenceNumber.START_OF_TIME,
+                (lsn, entry) -> consumed.add(lsn));
+        Thread t = new Thread(tailer, "test-push-tailer");
+        t.start();
+        try {
+            tailer.push(new LogSequenceNumber(1, 1), anEntry());
+            tailer.push(new LogSequenceNumber(1, 2), anEntry());
+            tailer.push(new LogSequenceNumber(1, 3), anEntry());
+            awaitSize(consumed, 3, 5000);
+            assertEquals(new LogSequenceNumber(1, 3), tailer.getWatermark());
+
+            // Regressing LSN — must be skipped.
+            tailer.push(new LogSequenceNumber(1, 2), anEntry());
+            Thread.sleep(300);
+        } finally {
+            tailer.close();
+            t.join(5000);
+        }
+        assertEquals("the out-of-order entry must not be dispatched", 3, consumed.size());
+        assertEquals(3L, tailer.getEntriesProcessed());
+        assertEquals(new LogSequenceNumber(1, 3), tailer.getWatermark());
+    }
+
+    @Test
+    public void closeWithBufferedEntriesDropsThem() throws Exception {
+        // close() drops entries still in the buffer (the engine does not drain
+        // on shutdown). Only the entry already in-flight in the consumer when
+        // close() is called is dispatched.
+        CountDownLatch gate = new CountDownLatch(1);
+        List<LogSequenceNumber> consumed = Collections.synchronizedList(new ArrayList<>());
+        PushCommitLogTailer tailer = new PushCommitLogTailer(8, LogSequenceNumber.START_OF_TIME,
+                (lsn, entry) -> {
+                    try {
+                        gate.await();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                    consumed.add(lsn);
+                });
+        Thread t = new Thread(tailer, "test-push-tailer");
+        t.start();
+        try {
+            // Entry 1 is taken and parks the tailer in the gated consumer;
+            // entries 2 and 3 sit undispatched in the buffer.
+            tailer.push(new LogSequenceNumber(1, 1), anEntry());
+            tailer.push(new LogSequenceNumber(1, 2), anEntry());
+            tailer.push(new LogSequenceNumber(1, 3), anEntry());
+            awaitCondition(() -> tailer.getBufferedCount() == 2, 5000);
+            assertEquals("two entries must be buffered before close()", 2,
+                    tailer.getBufferedCount());
+
+            tailer.close();
+        } finally {
+            gate.countDown();
+            t.join(5000);
+        }
+        // Only entry 1 (already in-flight at close) was dispatched; 2 and 3 dropped.
+        assertEquals(1L, tailer.getEntriesProcessed());
+        assertEquals(1, consumed.size());
+        assertEquals("dropped entries are left undispatched in the buffer",
+                2, tailer.getBufferedCount());
     }
 
     @Test
