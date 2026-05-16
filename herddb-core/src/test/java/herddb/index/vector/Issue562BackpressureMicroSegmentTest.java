@@ -25,8 +25,10 @@ import static org.junit.Assert.assertTrue;
 import herddb.core.MemoryManager;
 import herddb.mem.MemoryDataStorageManager;
 import herddb.utils.Bytes;
+import io.github.jbellis.jvector.vector.VectorSimilarityFunction;
 import java.nio.file.Path;
 import java.util.Random;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Rule;
@@ -212,6 +214,83 @@ public class Issue562BackpressureMicroSegmentTest {
             assertTrue("checkpoint must run once back-pressure is relieved", ran);
             assertEquals("the pending trickle must now be sealed into one segment",
                     segs + 1, store.getSegmentCount());
+        }
+    }
+
+    /**
+     * Escape-hatch regression guard: the new back-pressure deferral gate must
+     * NOT swallow a checkpoint that {@code shouldTriggerMemoryPressureCheckpoint()}
+     * demands. Even while the segment count exceeds the back-pressure threshold
+     * and the live shard is tiny, an active memory-pressure signal must still
+     * force the checkpoint through — deferring it then would let heap grow
+     * unbounded, a worse failure than a micro-segment.
+     */
+    @Test(timeout = 120_000)
+    public void memoryPressureForcesCheckpointAboveBackpressureThreshold() throws Exception {
+        Path tmpDir = tmpFolder.newFolder("issue562-mempressure").toPath();
+        int threshold = 5;
+
+        // Budget whose memory-pressure signal is flipped on only for the final
+        // checkpoint. While off it reports zero usage, so the background
+        // compaction loop stays parked during setup; while on it reports
+        // above-the-0.7-threshold-but-not-pressure-active, so
+        // shouldTriggerMemoryPressureCheckpoint() is true yet addVector never
+        // blocks on memory back-pressure.
+        AtomicBoolean memoryPressure = new AtomicBoolean(false);
+        VectorMemoryBudget budget = new VectorMemoryBudget() {
+            @Override
+            public long totalEstimatedMemoryUsageBytes() {
+                return memoryPressure.get() ? 80L : 0L;
+            }
+
+            @Override
+            public long maxMemoryBytes() {
+                return 100L;
+            }
+        };
+
+        MemoryDataStorageManager dsm = new MemoryDataStorageManager();
+        MemoryManager mm = new MemoryManager(64 * 1024 * 1024, 0, 1024 * 1024, 1024 * 1024);
+        try (PersistentVectorStore store = new PersistentVectorStore(
+                "issue562d", "testtable", "tstblspace", "vec", "issue562d_uuid",
+                tmpDir, dsm, mm,
+                8, 32, 1.2f, 1.4f, true, 2_000_000_000L, 0,
+                /*compactionIntervalMs*/ Long.MAX_VALUE,
+                VectorSimilarityFunction.EUCLIDEAN,
+                /*maxVectorMemoryBytes*/ Long.MAX_VALUE,
+                budget,
+                /*maxLiveBytesPerCheckpoint*/ 0,
+                /*segmentPageCacheMaxBytes*/ 0)) {
+            store.configureCompaction(
+                    /*intervalMs*/ Long.MAX_VALUE,
+                    /*minBytes*/ Long.MAX_VALUE,
+                    /*maxBytes*/ Long.MAX_VALUE,
+                    /*minCount*/ Integer.MAX_VALUE,
+                    /*maxCount*/ Integer.MAX_VALUE,
+                    /*retentionMs*/ 0);
+            store.setTieredCompactionEnabled(false);
+            store.start();
+            Random rng = new Random(562_4);
+
+            store.setCompactionBackpressureThreshold(Integer.MAX_VALUE);
+            int segs = buildSegmentsAboveThreshold(store, threshold, rng);
+
+            PersistentVectorStore.minLiveVectorsForCheckpoint = 1_000;
+            for (int i = 0; i < 3; i++) {
+                store.addVector(Bytes.from_int(900_000 + i), randomVector(rng));
+            }
+
+            // Above the back-pressure threshold AND under memory pressure: the
+            // escape hatch must win — the checkpoint runs despite the tiny shard.
+            store.setCompactionBackpressureThreshold(threshold);
+            memoryPressure.set(true);
+
+            boolean ran = store.checkpoint();
+
+            assertTrue("memory pressure must force the checkpoint through the "
+                    + "back-pressure deferral gate", ran);
+            assertEquals("the trickle must be sealed when memory pressure overrides "
+                    + "the back-pressure gate", segs + 1, store.getSegmentCount());
         }
     }
 
