@@ -186,13 +186,17 @@ public class PersistentVectorStore extends AbstractVectorStore {
      * ingest has stopped mid-shard (issue #90).
      *
      * <p>Initialized from system property
-     * {@code herddb.vectorindex.maxCheckpointDeferralMs}. Default: 60 s.
+     * {@code herddb.vectorindex.maxCheckpointDeferralMs}. Default: 10 min
+     * (600 s) — wide enough to cover one full segment-count back-pressure
+     * safety-timeout cycle ({@code compactionBackpressureMaxWaitMs}, default
+     * 5 min) so a single timeout no longer forces a micro-segment checkpoint
+     * (issue #562).
      * Non-final to let unit tests override after class load; production
      * code should only read, never write.
      */
     public static volatile long maxCheckpointDeferralMs =
             Math.max(0L, Long.getLong(
-                    "herddb.vectorindex.maxCheckpointDeferralMs", 60_000L));
+                    "herddb.vectorindex.maxCheckpointDeferralMs", 600_000L));
 
     /**
      * How many Phase B segment builds may run concurrently. Each parallel
@@ -554,11 +558,23 @@ public class PersistentVectorStore extends AbstractVectorStore {
     private final Object vectorIndexCompactionWakeup = new Object();
     private volatile boolean vectorIndexCompactionWakeupPending;
 
+    /**
+     * Default minimum number of candidate segments a compaction run must be
+     * able to pick before the byte-threshold trigger fires. Configurable via
+     * system property {@code herddb.vectorindex.compactionMinCount} (issue
+     * #562); clamped to a minimum of 1. {@link herddb.indexing.IndexingServiceEngine}
+     * passes this constant to {@link #configureCompaction} so the property
+     * takes effect in production deployments.
+     */
+    public static final int DEFAULT_VECTOR_INDEX_COMPACTION_MIN_COUNT =
+            Math.max(1, Integer.getInteger(
+                    "herddb.vectorindex.compactionMinCount", 4));
+
     /** Compaction policy knobs — defaults match IndexingServerConfiguration. */
     private volatile long vectorIndexCompactionIntervalMs = 5L * 60_000L;
     private volatile long vectorIndexCompactionMinBytes = 256L * 1024 * 1024;
     private volatile long vectorIndexCompactionMaxBytes = 1024L * 1024 * 1024;
-    private volatile int vectorIndexCompactionMinCount = 4;
+    private volatile int vectorIndexCompactionMinCount = DEFAULT_VECTOR_INDEX_COMPACTION_MIN_COUNT;
     /**
      * Count-based compaction trigger (issue #285): fire compaction when the
      * segment count reaches this ceiling, even if the total-byte threshold
@@ -4909,6 +4925,41 @@ public class PersistentVectorStore extends AbstractVectorStore {
             // left behind by stopped ingest is guaranteed to flush.
             int minLiveGate = minLiveVectorsForCheckpoint;
             long deferralBoundMs = maxCheckpointDeferralMs;
+
+            // Segment-count back-pressure deferral gate (issue #562).
+            //
+            // When the segment count already exceeds the back-pressure
+            // threshold, checkpointing a tiny live shard would seal those few
+            // vectors into a new on-disk micro-segment (e.g. 3 nodes),
+            // incrementing the segment count and making back-pressure WORSE.
+            // Such micro-segments are far below vectorIndexCompactionMinBytes
+            // so tiered compaction never selects them and they accumulate
+            // unboundedly throughout a long compaction cycle.
+            //
+            // While above the threshold we therefore defer UNCONDITIONALLY
+            // (ignoring the time-bounded deferralBoundMs): the trickle of
+            // vectors released by the back-pressure safety timeout can safely
+            // wait in the live shard until compaction drains the segment count
+            // back below the threshold, at which point the time-bounded gate
+            // below resumes governing the flush. The live shard stays bounded
+            // by maxLiveGraphSize rotation, and the memory-pressure escape
+            // hatch still forces a checkpoint if heap is genuinely tight.
+            if (minLiveGate > 0
+                    && totalLiveVectors < minLiveGate
+                    && !anySegmentDirty
+                    && !segments.isEmpty()
+                    && !shouldTriggerMemoryPressureCheckpoint()
+                    && segments.size() > compactionBackpressureThreshold) {
+                LOGGER.log(Level.INFO,
+                        "checkpoint {0}: deferred during segment-count back-pressure "
+                                + "({1} live vectors < {2} threshold, {3} segments > "
+                                + "back-pressure threshold {4}) — avoiding micro-segment creation",
+                        new Object[]{indexName, totalLiveVectors, minLiveGate,
+                                segments.size(), compactionBackpressureThreshold});
+                totalCheckpointsDeferred.incrementAndGet();
+                return false;
+            }
+
             if (minLiveGate > 0
                     && totalLiveVectors < minLiveGate
                     && !anySegmentDirty
@@ -7925,6 +7976,15 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
     public long getMaxSegmentSize() {
         return maxSegmentSize;
+    }
+
+    /**
+     * Returns the current minimum candidate-segment count for the byte-threshold
+     * compaction trigger. Defaults to {@link #DEFAULT_VECTOR_INDEX_COMPACTION_MIN_COUNT}
+     * unless overridden by {@link #configureCompaction} (issue #562).
+     */
+    public int getVectorIndexCompactionMinCount() {
+        return vectorIndexCompactionMinCount;
     }
 
     public long getEstimatedSizeBytes() {
