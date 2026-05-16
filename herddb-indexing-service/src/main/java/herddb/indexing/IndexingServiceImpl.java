@@ -347,6 +347,7 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
                     .setLiveShardCount(details.liveShardCount)
                     .setEstimatedMemoryBytes(details.estimatedMemoryBytes)
                     .setLiveVectorsMemoryBytes(details.liveVectorsMemoryBytes)
+                    .setOndiskSegmentMemoryBytes(details.ondiskSegmentMemoryBytes)
                     .setOndiskSizeBytes(details.onDiskSizeBytes)
                     .setDirty(details.dirty)
                     .setTailerLsnLedger(details.tailerLsnLedger)

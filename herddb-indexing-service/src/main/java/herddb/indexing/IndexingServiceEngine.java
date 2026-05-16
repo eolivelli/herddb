@@ -3827,6 +3827,7 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             d.segmentCount = pvs.getSegmentCount();
             d.liveShardCount = pvs.getLiveShardCount();
             d.liveVectorsMemoryBytes = pvs.getLiveVectorsMemoryBytes();
+            d.ondiskSegmentMemoryBytes = pvs.getOnDiskSegmentsEstimatedMemoryBytes();
             d.onDiskSizeBytes = pvs.getEstimatedSizeBytes();
             d.dirty = pvs.isDirty();
             d.fusedPQEnabled = pvs.isFusedPQEnabled();
@@ -5272,6 +5273,11 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         public int liveShardCount;
         public long estimatedMemoryBytes;
         public long liveVectorsMemoryBytes;
+        // Issue #563: in-memory footprint of the on-disk VectorSegment objects
+        // (pkData/pkOffsets/pkLengths arrays + BLink pk-to-ordinal trees).
+        // Reported separately from liveVectorsMemoryBytes so operators can tell
+        // genuine live-vector memory apart from on-disk segment overhead.
+        public long ondiskSegmentMemoryBytes;
         public long onDiskSizeBytes;
         public boolean dirty;
         // In-memory tailer position; diagnostic only. See IndexStatusInfo.
