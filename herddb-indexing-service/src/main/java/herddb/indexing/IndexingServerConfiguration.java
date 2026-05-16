@@ -243,6 +243,21 @@ public final class IndexingServerConfiguration {
     public static final int PROPERTY_VECTOR_INDEX_COMPACTION_MAX_COUNT_DEFAULT = 200;
 
     /**
+     * Micro-segment fast-path threshold (issue #570): live-node count below
+     * which an on-disk segment is treated as a micro-segment. When at least
+     * two micro-segments are present, the compaction scheduler merges only
+     * those — a trivial, fast cycle that reclaims segment-count slots and
+     * relieves back-pressure quickly, instead of being stuck behind a
+     * multi-minute large merge. Micro-segments are produced by
+     * memory-pressure checkpoints flushing a near-empty live shard.
+     * Default is {@code 1000}. Set to {@code 0} to disable the fast path.
+     */
+    public static final String PROPERTY_VECTOR_INDEX_COMPACTION_MICROSEGMENT_MAX_NODES =
+            "vector.index.compaction.microsegment.max.nodes";
+    public static final long PROPERTY_VECTOR_INDEX_COMPACTION_MICROSEGMENT_MAX_NODES_DEFAULT =
+            1000L;
+
+    /**
      * How long old segment files remain on-disk after a compaction swap
      * before the reaper may physically delete them. Also gated by
      * {@code shadowAckedGeneration}: reclaim waits for the later of the

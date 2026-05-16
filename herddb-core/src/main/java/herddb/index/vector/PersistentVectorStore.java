@@ -572,6 +572,18 @@ public class PersistentVectorStore extends AbstractVectorStore {
             Math.max(1, Integer.getInteger(
                     "herddb.vectorindex.compactionMinCount", 4));
 
+    /**
+     * Default live-node count below which a segment is treated as a
+     * micro-segment by the compaction scheduler's micro-segment fast path
+     * (issue #570). Micro-segments are produced by memory-pressure
+     * checkpoints flushing a near-empty live shard; merging them is
+     * essentially free and reclaims segment-count slots immediately.
+     * Configurable in production via
+     * {@code vector.index.compaction.microsegment.max.nodes}; {@code 0}
+     * disables the fast path.
+     */
+    public static final long DEFAULT_VECTOR_INDEX_COMPACTION_MICROSEGMENT_MAX_NODES = 1000L;
+
     /** Compaction policy knobs — defaults match IndexingServerConfiguration. */
     private volatile long vectorIndexCompactionIntervalMs = 5L * 60_000L;
     private volatile long vectorIndexCompactionMinBytes = 256L * 1024 * 1024;
@@ -584,6 +596,14 @@ public class PersistentVectorStore extends AbstractVectorStore {
      * tailing catch-up when each checkpoint produces many small segments.
      */
     private volatile int vectorIndexCompactionMaxCount = 200;
+    /**
+     * Micro-segment fast-path threshold (issue #570): when at least two
+     * on-disk segments have a live-node count strictly below this value the
+     * compaction cycle merges only those micro-segments, relieving
+     * segment-count back-pressure quickly. {@code 0} disables the fast path.
+     */
+    private volatile long vectorIndexCompactionMicroSegmentMaxNodes =
+            DEFAULT_VECTOR_INDEX_COMPACTION_MICROSEGMENT_MAX_NODES;
     private volatile long vectorIndexCompactionRetentionMs = 10L * 60_000L;
     /**
      * When {@code true} (the default), the per-cycle byte cap and segment
@@ -1885,6 +1905,25 @@ public class PersistentVectorStore extends AbstractVectorStore {
     }
 
     /**
+     * Sets the micro-segment fast-path threshold (issue #570). When at least
+     * two on-disk segments have a live-node count strictly below
+     * {@code microSegmentMaxNodes}, the next compaction cycle merges only
+     * those micro-segments — a cheap, fast cycle that reclaims segment-count
+     * slots and relieves back-pressure quickly. A value of {@code 0} (or
+     * negative) disables the fast path, restoring the pre-#570 behaviour.
+     * Can be called at any time to re-tune a running store.
+     */
+    public void setCompactionMicroSegmentMaxNodes(long microSegmentMaxNodes) {
+        this.vectorIndexCompactionMicroSegmentMaxNodes =
+                Math.max(0L, microSegmentMaxNodes);
+    }
+
+    /** Returns the current micro-segment fast-path threshold (issue #570). */
+    public long getCompactionMicroSegmentMaxNodes() {
+        return vectorIndexCompactionMicroSegmentMaxNodes;
+    }
+
+    /**
      * Sets the segment-count back-pressure threshold (issue #354).
      * {@link #addVectorInternal} will block when {@code segments.size()}
      * exceeds this value, waking the compaction thread first.
@@ -2343,7 +2382,8 @@ public class PersistentVectorStore extends AbstractVectorStore {
                     vectorIndexCompactionMinCount,
                     vectorIndexCompactionMinBytes,
                     effectiveMaxBytes,
-                    effectiveMaxCount);
+                    effectiveMaxCount,
+                    vectorIndexCompactionMicroSegmentMaxNodes);
             if (candidates.isEmpty()) {
                 if (snapshot.size() >= COMPACTION_SEGMENT_COUNT_WARN_THRESHOLD) {
                     LOGGER.log(Level.WARNING,

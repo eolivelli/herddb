@@ -208,6 +208,24 @@ final class VectorIndexCompactor {
     }
 
     /**
+     * Backward-compatible 5-arg entry point: equivalent to the 6-arg
+     * {@link #chooseSegmentsToMerge(List, int, long, long, int, long)}
+     * with the micro-segment fast path disabled
+     * ({@code microSegmentMaxNodes == 0}).
+     *
+     * <p>Package-private for unit tests.
+     */
+    static List<VectorSegment> chooseSegmentsToMerge(
+            List<VectorSegment> candidates,
+            int minCount,
+            long minTotalBytes,
+            long maxTotalBytes,
+            int maxCount) {
+        return chooseSegmentsToMerge(candidates, minCount, minTotalBytes,
+                maxTotalBytes, maxCount, /*microSegmentMaxNodes*/ 0L);
+    }
+
+    /**
      * Picks the subset of {@code candidates} to merge in this compaction
      * run, applying:
      * <ul>
@@ -224,17 +242,45 @@ final class VectorIndexCompactor {
      *       and avoid rewriting already-large segments.</li>
      * </ul>
      *
+     * <p><b>Micro-segment fast path (issue #570).</b> When this method has
+     * already decided that the cycle <em>will</em> compact (one of the
+     * triggers above fired) and {@code microSegmentMaxNodes > 0}, the picked
+     * set is re-prioritised: if at least two candidates are micro-segments
+     * — segments whose live-node count is strictly below
+     * {@code microSegmentMaxNodes} — the cycle merges <em>only</em> the
+     * micro-segments instead of the byte-capped selection. Micro-segments
+     * (typically a handful of nodes, produced by memory-pressure checkpoints
+     * flushing a near-empty live shard) each consume a full slot in the
+     * segment count yet contribute negligibly to search quality; merging
+     * them is essentially free and reclaims slots immediately, relieving
+     * segment-count back-pressure in seconds instead of waiting for a
+     * multi-minute large merge. Larger segments are deferred to a subsequent
+     * cycle (which, once no micro-segments remain, runs the normal policy).
+     * The fast path never makes the cycle compact when it otherwise would
+     * not — it only changes <em>which</em> segments are merged.
+     *
+     * <p>The micro-segment classification uses {@link VectorSegment#size()}
+     * (the live-node count), not {@code estimatedSizeBytes}: a freshly
+     * checkpointed micro-segment has a tiny node count, and a large segment
+     * whose PKs have mostly been tombstoned is also cheap to re-merge since
+     * the rebuild only re-inserts the authoritative live vectors.
+     *
      * <p>Returns an empty list when neither the byte threshold nor the
      * count trigger is satisfied.
      *
      * <p>Package-private for unit tests.
+     *
+     * @param microSegmentMaxNodes live-node count below which a segment is
+     *     treated as a micro-segment; {@code 0} (or negative) disables the
+     *     micro-segment fast path.
      */
     static List<VectorSegment> chooseSegmentsToMerge(
             List<VectorSegment> candidates,
             int minCount,
             long minTotalBytes,
             long maxTotalBytes,
-            int maxCount) {
+            int maxCount,
+            long microSegmentMaxNodes) {
         if (candidates == null || candidates.size() < minCount) {
             return new ArrayList<>();
         }
@@ -252,19 +298,48 @@ final class VectorIndexCompactor {
             total += seg.estimatedSizeBytes;
         }
 
-        // Standard byte-threshold trigger.
-        if (picked.size() >= minCount && total >= minTotalBytes) {
-            return picked;
+        // Decide whether this cycle compacts at all:
+        //  - the standard byte-threshold trigger, or
+        //  - the count-based trigger (issue #285): fire even if the byte
+        //    threshold is not met when too many segments have accumulated.
+        //    This guards against the scenario where every segment is
+        //    individually small (e.g. catch-up with tiny shards) and the
+        //    sum never reaches minTotalBytes despite hundreds of segments
+        //    building up.
+        boolean byteTrigger = picked.size() >= minCount && total >= minTotalBytes;
+        boolean countTrigger = picked.size() >= maxCount;
+        if (!byteTrigger && !countTrigger) {
+            return new ArrayList<>();
         }
-        // Count-based trigger (issue #285): fire even if the byte threshold
-        // is not met when too many segments have accumulated.  This guards
-        // against the scenario where every segment is individually small
-        // (e.g. catch-up with tiny shards) and the sum never reaches
-        // minTotalBytes despite hundreds of segments building up.
-        if (picked.size() >= maxCount) {
-            return picked;
+
+        // Micro-segment fast path (issue #570): the cycle is going to compact
+        // anyway — if at least two candidates are micro-segments, merge ONLY
+        // those instead of the byte-capped `picked` set above. This is a far
+        // cheaper cycle that reclaims segment-count slots quickly; larger
+        // segments are deferred to a later cycle. `sorted` is already
+        // smallest-bytes-first, so the micro-segment sub-list inherits that
+        // ordering. The same maxTotalBytes write-amplification cap is applied
+        // (it never bites for genuine micro-segments, but keeps the bound
+        // honest for low / mostly-tombstoned large segments).
+        if (microSegmentMaxNodes > 0L) {
+            List<VectorSegment> microPicked = new ArrayList<>();
+            long microTotal = 0L;
+            for (VectorSegment seg : sorted) {
+                if (seg.size() >= microSegmentMaxNodes) {
+                    continue;
+                }
+                if (!microPicked.isEmpty()
+                        && microTotal + seg.estimatedSizeBytes > maxTotalBytes) {
+                    break;
+                }
+                microPicked.add(seg);
+                microTotal += seg.estimatedSizeBytes;
+            }
+            if (microPicked.size() >= 2) {
+                return microPicked;
+            }
         }
-        return new ArrayList<>();
+        return picked;
     }
 
     // -------------------------------------------------------------------------
