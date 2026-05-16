@@ -43,6 +43,8 @@ import io.github.jbellis.jvector.graph.RandomAccessVectorValues;
 import io.github.jbellis.jvector.graph.SearchResult;
 import io.github.jbellis.jvector.graph.disk.OnDiskGraphIndex;
 import io.github.jbellis.jvector.graph.disk.OnDiskGraphIndexWriter;
+import io.github.jbellis.jvector.graph.disk.RandomAccessOnDiskGraphIndexWriter;
+import io.github.jbellis.jvector.graph.disk.feature.Feature;
 import io.github.jbellis.jvector.graph.disk.feature.FeatureId;
 import io.github.jbellis.jvector.graph.disk.feature.FusedPQ;
 import io.github.jbellis.jvector.graph.disk.feature.InlineVectors;
@@ -7017,10 +7019,11 @@ public class PersistentVectorStore extends AbstractVectorStore {
             Path tempFile = Files.createTempFile(tmpDirectory, "herddb-vector-", ".idx");
             boolean success = false;
             try {
-                try (OnDiskGraphIndexWriter writer = new OnDiskGraphIndexWriter.Builder(mergedGraph, tempFile)
-                        .with(new FusedPQ(mergedGraph.maxDegree(), pq))
-                        .with(new InlineVectors(dim))
-                        .build()) {
+                List<Feature> features = List.of(
+                        new FusedPQ(mergedGraph.maxDegree(), pq),
+                        new InlineVectors(dim));
+                try (RandomAccessOnDiskGraphIndexWriter writer =
+                        GraphWriterFactory.openWriter(mergedGraph, tempFile, totalVectors, features)) {
                     ImmutableGraphIndex.View view = mergedGraph.getView();
                     EnumMap<FeatureId, IntFunction<io.github.jbellis.jvector.graph.disk.feature.Feature.State>> suppliers =
                             new EnumMap<>(FeatureId.class);

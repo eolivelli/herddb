@@ -32,8 +32,8 @@ import io.github.jbellis.jvector.graph.OnHeapGraphIndex;
 import io.github.jbellis.jvector.graph.disk.CompactionProgressListener;
 import io.github.jbellis.jvector.graph.disk.OnDiskGraphIndex;
 import io.github.jbellis.jvector.graph.disk.OnDiskGraphIndexCompactor;
-import io.github.jbellis.jvector.graph.disk.OnDiskGraphIndexWriter;
 import io.github.jbellis.jvector.graph.disk.OrdinalMapper;
+import io.github.jbellis.jvector.graph.disk.RandomAccessOnDiskGraphIndexWriter;
 import io.github.jbellis.jvector.graph.disk.feature.Feature;
 import io.github.jbellis.jvector.graph.disk.feature.FeatureId;
 import io.github.jbellis.jvector.graph.disk.feature.FusedPQ;
@@ -1594,14 +1594,13 @@ public final class RemoteSegmentGraphMerger {
         }
         PQVectors pqv = (pq != null) ? pq.encodeAll(art.ravv, ForkJoinPool.commonPool()) : null;
 
-        OnDiskGraphIndexWriter.Builder writerBuilder = new OnDiskGraphIndexWriter.Builder(
-                graph, graphTempFile);
+        List<Feature> features = new ArrayList<>(2);
         if (useFusedPQ) {
-            writerBuilder.with(new FusedPQ(graph.maxDegree(), pq));
+            features.add(new FusedPQ(graph.maxDegree(), pq));
         }
-        try (OnDiskGraphIndexWriter writer = writerBuilder
-                .with(new InlineVectors(dim))
-                .build()) {
+        features.add(new InlineVectors(dim));
+        try (RandomAccessOnDiskGraphIndexWriter writer =
+                GraphWriterFactory.openWriter(graph, graphTempFile, shardSize, features)) {
             ImmutableGraphIndex.View view = graph.getView();
             EnumMap<FeatureId, IntFunction<Feature.State>> suppliers =
                     new EnumMap<>(FeatureId.class);
