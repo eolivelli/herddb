@@ -45,6 +45,21 @@
             <version>${project.version}</version>
             <classifier>uber</classifier>
         </dependency>
+        <!--
+            herddb-core supplies LogEntry / Table / Index / RecordSerializer,
+            which the gRPC protocol mode serializes by hand; herddb-indexing-service
+            supplies the PushEntries gRPC stubs and the IndexingPushClient helper.
+        -->
+        <dependency>
+            <groupId>org.herddb</groupId>
+            <artifactId>herddb-core</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.herddb</groupId>
+            <artifactId>herddb-indexing-service</artifactId>
+            <version>${project.version}</version>
+        </dependency>
         <dependency>
             <groupId>commons-cli</groupId>
             <artifactId>commons-cli</artifactId>
@@ -100,6 +115,14 @@
             <version>5.11.4</version>
             <scope>test</scope>
         </dependency>
+        <!-- EmbeddedIndexingService, for the gRPC protocol integration test. -->
+        <dependency>
+            <groupId>org.herddb</groupId>
+            <artifactId>herddb-indexing-service</artifactId>
+            <version>${project.version}</version>
+            <type>test-jar</type>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>
@@ -127,6 +150,14 @@
                                 <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
                                     <mainClass>herddb.vectortesting.VectorBench</mainClass>
                                 </transformer>
+                                <!--
+                                  Merge META-INF/services/* so the gRPC
+                                  ServiceLoader providers (channel / name
+                                  resolver) survive shading — without this the
+                                  grpc client fails with "no functional channel
+                                  service provider found".
+                                -->
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
                             </transformers>
                             <filters>
                                 <filter>

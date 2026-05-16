@@ -186,6 +186,13 @@ public class VectorBench {
     private static void runBenchmark(Config config, BenchOutput out, long benchmarkStartNs, BenchRuntime runtime) throws Exception {
         out.config(config);
 
+        // gRPC push mode: ingestion straight into a single indexing service,
+        // with no HerdDB server. Entirely separate from the JDBC path below.
+        if (config.protocol == Config.Protocol.GRPC) {
+            GrpcBench.run(config, out, benchmarkStartNs);
+            return;
+        }
+
         // Summary accumulators
         double ingestionWallSecs = -1, indexWallSecs = -1, queryWallSecs = -1;
         double checkpointPostIngestSecs = -1, checkpointPostIndexSecs = -1;

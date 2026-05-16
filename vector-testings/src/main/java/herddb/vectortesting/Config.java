@@ -35,6 +35,12 @@ public class Config {
         JSON
     }
 
+    /** Wire protocol used by the benchmark. */
+    public enum Protocol {
+        JDBC,
+        GRPC
+    }
+
     String jdbcUrl = "jdbc:herddb:server:localhost:7000";
     String username = "sa";
     String password = "hdb";
@@ -101,6 +107,18 @@ public class Config {
     int waitForIndexesTimeoutSeconds = 600;
     boolean noProgress = false;
     OutputFormat outputFormat = OutputFormat.TEXT;
+    /**
+     * Wire protocol: {@link Protocol#JDBC} (default) drives the benchmark
+     * through a HerdDB server; {@link Protocol#GRPC} pushes serialized
+     * {@code LogEntry} objects straight into a single indexing service
+     * ({@code indexing.log.type=push}) — ingestion only.
+     */
+    Protocol protocol = Protocol.JDBC;
+    /**
+     * Indexing-service gRPC endpoint ({@code host:port}) used when
+     * {@link #protocol} is {@link Protocol#GRPC}.
+     */
+    String grpcEndpoint = "localhost:9850";
     /**
      * Interval in seconds between periodic {@code [status]} dumps during ingestion.
      * A dedicated JDBC connection queries {@code syslogstatus}, {@code systablestats} and
@@ -193,6 +211,12 @@ public class Config {
         opts.addOption(null, "run-queries-during-ingestion-period", true,
                 "Seconds between consecutive query rounds when --run-queries-during-ingestion is "
                         + "active (default: 30, minimum: 1)");
+        opts.addOption(null, "protocol", true,
+                "Wire protocol: jdbc (default) or grpc. grpc pushes serialized LogEntries "
+                        + "straight into a single indexing service (ingestion only).");
+        opts.addOption(null, "grpc-endpoint", true,
+                "Indexing-service gRPC endpoint host:port for --protocol grpc "
+                        + "(default: localhost:9850)");
         opts.addOption(null, "config", true, "Path to properties file");
         opts.addOption("h", "help", false, "Show help");
         return opts;
@@ -223,6 +247,12 @@ public class Config {
         // CLI overrides
         if (cmd.hasOption("url")) {
             cfg.jdbcUrl = cmd.getOptionValue("url");
+        }
+        if (cmd.hasOption("protocol")) {
+            cfg.protocol = parseProtocol(cmd.getOptionValue("protocol"));
+        }
+        if (cmd.hasOption("grpc-endpoint")) {
+            cfg.grpcEndpoint = cmd.getOptionValue("grpc-endpoint");
         }
         if (cmd.hasOption("user")) {
             cfg.username = cmd.getOptionValue("user");
@@ -383,6 +413,12 @@ public class Config {
         if (props.containsKey("url")) {
             jdbcUrl = props.getProperty("url");
         }
+        if (props.containsKey("protocol")) {
+            protocol = parseProtocol(props.getProperty("protocol"));
+        }
+        if (props.containsKey("grpc-endpoint")) {
+            grpcEndpoint = props.getProperty("grpc-endpoint");
+        }
         if (props.containsKey("user")) {
             username = props.getProperty("user");
         }
@@ -519,6 +555,18 @@ public class Config {
             case "json", "ndjson" -> OutputFormat.JSON;
             default -> throw new IllegalArgumentException("Unknown output-format: " + raw
                     + ". Supported: text, json");
+        };
+    }
+
+    private static Protocol parseProtocol(String raw) {
+        if (raw == null) {
+            throw new IllegalArgumentException("protocol cannot be null");
+        }
+        return switch (raw.toLowerCase()) {
+            case "jdbc" -> Protocol.JDBC;
+            case "grpc" -> Protocol.GRPC;
+            default -> throw new IllegalArgumentException("Unknown protocol: " + raw
+                    + ". Supported: jdbc, grpc");
         };
     }
 
