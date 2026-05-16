@@ -196,6 +196,13 @@ message DescribeIndexResponse {
     // Issue #451 — exposed so operators can verify what sharding configuration
     // an index is actually running with from the admin CLI.
     int32 num_shards = 30;
+    // In-memory footprint of the on-disk VectorSegment objects: the
+    // pkData/pkOffsets/pkLengths arrays plus the BLink pk-to-ordinal trees,
+    // snapshotted at segment registration time. Reported separately from
+    // live_vectors_memory_bytes (issue #563) so operators can distinguish
+    // genuine live-vector heap from on-disk segment overhead — the latter
+    // grows with segment_count and does not shrink on checkpoint.
+    int64 ondisk_segment_memory_bytes = 31;
 }
 
 message ListPrimaryKeysRequest {

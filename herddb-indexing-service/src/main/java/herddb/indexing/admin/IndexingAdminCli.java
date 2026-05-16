@@ -511,6 +511,7 @@ public final class IndexingAdminCli {
         m.put("live_shard_count", r.getLiveShardCount());
         m.put("estimated_memory_bytes", r.getEstimatedMemoryBytes());
         m.put("live_vectors_memory_bytes", r.getLiveVectorsMemoryBytes());
+        m.put("ondisk_segment_memory_bytes", r.getOndiskSegmentMemoryBytes());
         m.put("ondisk_size_bytes", r.getOndiskSizeBytes());
         m.put("dirty", r.getDirty());
         m.put("tailer_lsn_ledger", r.getTailerLsnLedger());

@@ -3746,7 +3746,25 @@ public class PersistentVectorStore extends AbstractVectorStore {
         return r;
     }
 
-    private boolean shouldTriggerMemoryPressureCheckpoint() {
+    // Package-private (not private) so MemoryPressureTriggerZeroLiveVectorsTest
+    // can exercise the issue #563 zero-live-vectors guard as a whitebox test.
+    boolean shouldTriggerMemoryPressureCheckpoint() {
+        // Issue #563: skip the trigger entirely when there are no in-memory
+        // vectors to checkpoint. A memory-pressure checkpoint only moves the
+        // in-memory HNSW shards onto disk; it cannot reduce the on-disk segment
+        // pkData/BLink footprint that {@link #estimatedMemoryUsageBytes()} (and
+        // the global budget) also count. With many on-disk segments that
+        // footprint alone can permanently exceed the 70% threshold, so without
+        // this guard the compaction loop fires a spurious, no-op Phase A every
+        // cycle even though there are 0 live vectors.
+        //
+        // The count spans live + frozen + deferred shards — the same shard set
+        // {@link #getLiveShardMemoryBytes()} measures — so a checkpoint that
+        // defers shards (parking un-persisted vectors in deferredShards) is not
+        // mistaken for an empty store.
+        if (liveFrozenDeferredNodeCount() == 0) {
+            return false;
+        }
         // Check global budget first (covers all stores sharing the same heap)
         if (memoryBudget != null) {
             boolean trigger = memoryBudget.isAboveThreshold(0.7);
@@ -4554,6 +4572,43 @@ public class PersistentVectorStore extends AbstractVectorStore {
         }
         // On-disk segments: O(1) read of the incremental counter (issue #455).
         total += onDiskSegmentsEstimatedMemoryBytes.get();
+        return total;
+    }
+
+    /**
+     * Returns the estimated heap footprint of the in-memory HNSW shards only —
+     * the live, frozen, and deferred {@link LiveGraphShard} graphs — excluding
+     * the on-disk segment pkData/pkOffsets/pkLengths/BLink contribution that
+     * {@link #estimatedMemoryUsageBytes()} additionally counts.
+     *
+     * <p>Issue #563: this is the figure that genuinely shrinks when a
+     * checkpoint runs (the live shard is snapshotted onto disk and reset to
+     * empty). The memory-pressure checkpoint trigger and the
+     * {@code live_vectors_memory_bytes} diagnostic field must use this value
+     * rather than {@link #estimatedMemoryUsageBytes()}: the on-disk segment
+     * footprint is managed independently (segment eviction / compaction) and
+     * counting it toward the live-vector limit produces spurious, no-op
+     * Phase A triggers once enough segments accumulate.
+     *
+     * @return estimated bytes of heap occupied by the live/frozen/deferred shards
+     */
+    public long getLiveShardMemoryBytes() {
+        long total = 0;
+        for (LiveGraphShard shard : liveShards) {
+            total += shardMemoryBytes(shard);
+        }
+        List<LiveGraphShard> frozen = frozenShards;
+        if (frozen != null) {
+            for (LiveGraphShard shard : frozen) {
+                total += shardMemoryBytes(shard);
+            }
+        }
+        List<LiveGraphShard> deferred = deferredShards;
+        if (deferred != null) {
+            for (LiveGraphShard shard : deferred) {
+                total += shardMemoryBytes(shard);
+            }
+        }
         return total;
     }
 
@@ -7909,6 +7964,39 @@ public class PersistentVectorStore extends AbstractVectorStore {
         return totalLiveSize() + frozenCount;
     }
 
+    /**
+     * Total number of in-memory vectors across the live, frozen, and deferred
+     * shards — every vector that a checkpoint could still flush to disk.
+     *
+     * <p>Differs from {@link #getLiveNodeCount()}, which omits
+     * {@code deferredShards} for historical diagnostic reasons. The
+     * memory-pressure checkpoint guard (issue #563) uses this fuller count so
+     * it stays consistent with {@link #getLiveShardMemoryBytes()}: a Phase A
+     * byte-cap deferral parks shards holding genuine un-persisted vectors in
+     * {@code deferredShards}, and those must not be mistaken for "nothing to
+     * checkpoint".
+     *
+     * <p>The three list reads are intentionally non-atomic — the value is a
+     * best-effort snapshot for the compaction loop, which re-evaluates the
+     * condition on every cycle.
+     */
+    int liveFrozenDeferredNodeCount() {
+        int count = totalLiveSize();
+        List<LiveGraphShard> frozen = frozenShards;
+        if (frozen != null) {
+            for (LiveGraphShard shard : frozen) {
+                count += shard.nodeToPk.size();
+            }
+        }
+        List<LiveGraphShard> deferred = deferredShards;
+        if (deferred != null) {
+            for (LiveGraphShard shard : deferred) {
+                count += shard.nodeToPk.size();
+            }
+        }
+        return count;
+    }
+
     public int getOnDiskNodeCount() {
         return (int) onDiskNodeToPkSize();
     }
@@ -8099,8 +8187,18 @@ public class PersistentVectorStore extends AbstractVectorStore {
         return lastPhaseCWriteLockNanos.get();
     }
 
+    /**
+     * Returns the estimated heap footprint of the live (in-memory) vectors.
+     *
+     * <p>Issue #563: this used to delegate to {@link #estimatedMemoryUsageBytes()},
+     * which also includes the on-disk segment pkData/BLink footprint — so the
+     * {@code live_vectors_memory_bytes} diagnostic field reported gigabytes of
+     * "live" memory even when {@code live_node_count} was 0. It now returns the
+     * live/frozen/deferred shard footprint only; the on-disk contribution is
+     * surfaced separately via {@link #getOnDiskSegmentsEstimatedMemoryBytes()}.
+     */
     public long getLiveVectorsMemoryBytes() {
-        return estimatedMemoryUsageBytes();
+        return getLiveShardMemoryBytes();
     }
 
     public long getTotalBackpressureCount() {
