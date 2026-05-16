@@ -219,4 +219,87 @@ public class VectorIndexCompactorMicroSegmentTest {
                 /*microSegmentMaxNodes*/ MICRO_MAX_NODES);
         assertTrue("below minCount → no compaction at all", picked.isEmpty());
     }
+
+    /**
+     * A fully-tombstoned segment ({@code size() == 0}) is classified as a
+     * micro-segment regardless of its on-disk byte size — reclaiming it is
+     * cheap (the rebuild re-inserts no live vector) and frees a full slot.
+     */
+    @Test
+    public void zeroLiveNodeSegmentIsClassifiedAsMicro() {
+        List<VectorSegment> cand = new ArrayList<>();
+        cand.add(seg(1, 500L * MB, 0));   // large on disk, every PK tombstoned
+        cand.add(seg(2, 64L, 3));         // genuine micro-segment
+        for (int i = 3; i < 7; i++) {
+            cand.add(seg(i, 100L * MB, 100_000)); // large, live
+        }
+        List<VectorSegment> picked = VectorIndexCompactor.chooseSegmentsToMerge(
+                cand, /*minCount*/ 2, /*minBytes*/ 200L * MB,
+                /*maxBytes*/ Long.MAX_VALUE, /*maxCount*/ 200,
+                /*microSegmentMaxNodes*/ MICRO_MAX_NODES);
+        assertEquals("the 0-node and the 3-node segments are both micro",
+                2, picked.size());
+        // Smallest-bytes-first: the 64-byte micro before the 500 MB dead one.
+        assertEquals(List.of(2, 1), ids(picked));
+    }
+
+    /**
+     * Steady-state coverage with the shipped production default threshold
+     * ({@code DEFAULT_VECTOR_INDEX_COMPACTION_MICROSEGMENT_MAX_NODES} = 1000):
+     * under a sustained supply of fresh 3-node micro-segments, the merged
+     * micro-output is itself a micro-segment and gets re-merged each cycle —
+     * but the work per cycle stays bounded by the threshold (it never
+     * approaches large-segment scale), and the growing output eventually
+     * graduates past the threshold, so the re-merge is a finite sawtooth
+     * rather than unbounded write amplification.
+     */
+    @Test
+    public void mergedMicroOutputIsReMergedButWorkStaysBounded() {
+        final long threshold =
+                PersistentVectorStore.DEFAULT_VECTOR_INDEX_COMPACTION_MICROSEGMENT_MAX_NODES;
+        int nextId = 0;
+        List<VectorSegment> live = new ArrayList<>();
+        for (int i = 0; i < 4; i++) {
+            live.add(seg(nextId++, 4096L, 3));
+        }
+        long maxWorkNodes = 0L;
+        boolean sawGraduatedSegment = false;
+        final int cycles = 600;
+        for (int c = 0; c < cycles; c++) {
+            // maxCount = 2 → the issue #285 count trigger fires every cycle.
+            List<VectorSegment> picked = VectorIndexCompactor.chooseSegmentsToMerge(
+                    new ArrayList<>(live), /*minCount*/ 2,
+                    /*minBytes*/ Long.MAX_VALUE / 2, /*maxBytes*/ Long.MAX_VALUE,
+                    /*maxCount*/ 2, /*microSegmentMaxNodes*/ threshold);
+            assertTrue("cycle " + c + ": a cycle with >= 2 micro-segments must fire",
+                    picked.size() >= 2);
+            long workNodes = 0L;
+            long workBytes = 0L;
+            for (VectorSegment s : picked) {
+                assertTrue("only micro-segments must be merged by the fast path",
+                        s.size() < threshold);
+                workNodes += s.size();
+                workBytes += s.estimatedSizeBytes;
+            }
+            maxWorkNodes = Math.max(maxWorkNodes, workNodes);
+            // Simulate the merge: the inputs collapse into a single output.
+            live.removeAll(picked);
+            VectorSegment merged = seg(nextId++, workBytes, (int) workNodes);
+            live.add(merged);
+            if (merged.size() >= threshold) {
+                sawGraduatedSegment = true;
+            }
+            // A memory-pressure checkpoint flushes two fresh 3-node shards.
+            live.add(seg(nextId++, 4096L, 3));
+            live.add(seg(nextId++, 4096L, 3));
+        }
+        assertTrue("per-cycle merge work must stay bounded by the micro "
+                        + "threshold, was " + maxWorkNodes,
+                maxWorkNodes < 2L * threshold);
+        assertTrue("the growing micro output must eventually graduate past "
+                + "the threshold (re-merge is a finite sawtooth)", sawGraduatedSegment);
+        boolean graduatedPresent = live.stream().anyMatch(s -> s.size() >= threshold);
+        assertTrue("graduated segments must be left alone by the fast path",
+                graduatedPresent);
+    }
 }

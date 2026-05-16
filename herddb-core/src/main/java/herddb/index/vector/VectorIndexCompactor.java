@@ -263,7 +263,31 @@ final class VectorIndexCompactor {
      * (the live-node count), not {@code estimatedSizeBytes}: a freshly
      * checkpointed micro-segment has a tiny node count, and a large segment
      * whose PKs have mostly been tombstoned is also cheap to re-merge since
-     * the rebuild only re-inserts the authoritative live vectors.
+     * the rebuild only re-inserts the authoritative live vectors. A segment
+     * with {@code size() == 0} (every PK tombstoned) is therefore also a
+     * micro-segment — preferring it for merge is intentional, as it reclaims
+     * a full segment-count slot at near-zero rebuild cost.
+     *
+     * <p><b>Re-merge of the micro-segment output is expected and bounded.</b>
+     * The merged output of a micro-segment cycle has a live-node count equal
+     * to the sum of its inputs, which may itself still be below
+     * {@code microSegmentMaxNodes}. While memory-pressure checkpoints keep
+     * producing fresh micro-segments, each subsequent cycle re-merges that
+     * growing output with the new arrivals. This is deliberate: every such
+     * cycle still reduces the segment count (≥ 2 inputs collapse to 1) and
+     * the work per cycle is bounded by {@code microSegmentMaxNodes} live
+     * nodes — cheap by construction. Once the output crosses
+     * {@code microSegmentMaxNodes} it graduates and is no longer re-merged.
+     *
+     * <p><b>Large segments are deliberately deprioritised while
+     * micro-segments are present.</b> Under sustained micro-segment
+     * production (the abnormal, memory-pressure condition this fast path
+     * targets) the fast path may fire on every cycle, deferring large-segment
+     * compaction. This is the intended trade-off: back-pressure relief —
+     * keeping the segment count bounded so the tailer can make progress —
+     * takes priority over the search-latency benefit of merging large
+     * segments. When micro-segment production stops, no cycle has ≥ 2
+     * micro-segments and the normal tiered policy resumes for large segments.
      *
      * <p>Returns an empty list when neither the byte threshold nor the
      * count trigger is satisfied.
@@ -316,11 +340,14 @@ final class VectorIndexCompactor {
         // anyway — if at least two candidates are micro-segments, merge ONLY
         // those instead of the byte-capped `picked` set above. This is a far
         // cheaper cycle that reclaims segment-count slots quickly; larger
-        // segments are deferred to a later cycle. `sorted` is already
-        // smallest-bytes-first, so the micro-segment sub-list inherits that
-        // ordering. The same maxTotalBytes write-amplification cap is applied
-        // (it never bites for genuine micro-segments, but keeps the bound
-        // honest for low / mostly-tombstoned large segments).
+        // segments are deferred to a later cycle. The micro scan walks the
+        // full `sorted` candidate list (not `picked`), so `microPicked` may
+        // be disjoint from `picked` — that is intentional: `picked` only
+        // decided whether the cycle fires, not what it merges. `sorted` is
+        // already smallest-bytes-first, so the micro-segment sub-list
+        // inherits that ordering. The same maxTotalBytes write-amplification
+        // cap is applied (it never bites for genuine micro-segments, but
+        // keeps the bound honest for low / mostly-tombstoned large segments).
         if (microSegmentMaxNodes > 0L) {
             List<VectorSegment> microPicked = new ArrayList<>();
             long microTotal = 0L;

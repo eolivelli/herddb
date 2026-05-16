@@ -55,17 +55,21 @@ public class Issue570MicroSegmentCompactionTest {
     @Rule
     public TemporaryFolder tmpFolder = new TemporaryFolder();
 
+    /** Saved so {@link #restoreDeferral()} restores the exact prior value. */
+    private int savedMinLiveVectorsForCheckpoint;
+
     @Before
     public void disableDeferral() {
         // One checkpoint == one on-disk segment, regardless of how few
         // vectors it carries — this is exactly how memory-pressure
         // checkpoints produce micro-segments in production.
+        savedMinLiveVectorsForCheckpoint = PersistentVectorStore.minLiveVectorsForCheckpoint;
         PersistentVectorStore.minLiveVectorsForCheckpoint = 0;
     }
 
     @After
     public void restoreDeferral() {
-        PersistentVectorStore.minLiveVectorsForCheckpoint = 50_000;
+        PersistentVectorStore.minLiveVectorsForCheckpoint = savedMinLiveVectorsForCheckpoint;
     }
 
     private static void addVectors(PersistentVectorStore store, Random rng,
