@@ -25,7 +25,8 @@
 # Memory layout (heap + direct + ~1 GiB JVM overhead = container limit):
 #   server          :  20 g heap + 20 g Netty direct + 4 g JVM direct + 1 g ≈ 45 GiB RSS (50 GiB limit)
 #   fileServer      :   6 g heap +  8 g direct + 1 g = 15 g  (< 16 GiB, 16 CPU)
-#   indexingService :  28 g heap + 10 g direct + 1 g = 39 g  (< 40 GiB)
+#   indexingService :  28 g heap + 10 g direct + 1 g = 39 g  (< 63 GiB, 16 CPU)
+#   indexOptimizer  :  28 g heap + 10 g direct + 1 g = 39 g  (< 63 GiB, 16 CPU — matched to IS)
 #   bookkeeper      :   2 g heap +  1 g direct + 1 g =  4 g  (< 8 GiB)
 #   zookeeper       : 512 m heap + 512 m direct       = ~1 g  (< 4 GiB)
 
@@ -327,13 +328,12 @@ indexingService:
     initialDelaySeconds: 30
   pdb:
     enabled: true
-  # Request AVX-512 capable nodes for jvector acceleration.
-  # europe-west4 (Netherlands) has both C3 (Intel Sapphire Rapids, AVX-512F/BW/VL/DQ/VNNI/FP16)
-  # and C3D (AMD EPYC Genoa, AVX-512F/BW/VL/DQ/VNNI).  Either is a significant upgrade
-  # over the AMD EPYC Milan (AVX2 only) nodes available in the previous europe-west12 cluster.
-  # "c3" is recommended for best jvector performance (widest AVX-512 feature set).
+  # Zone-pinned to europe-west4-a (same-zone traffic is free) but no machine-family
+  # selector — the IS runs on standard nodes. AVX-512 acceleration is handled by
+  # the index-optimizer pods (pinned to c3), which do the heavy offline HNSW merges.
+  # The IS only does real-time indexing (tailer + live-graph inserts), which is
+  # not AVX-512-bound.
   nodeSelector:
-    cloud.google.com/machine-family: "c3"
     topology.kubernetes.io/zone: "europe-west4-a"
   # 28 g heap + 10 g direct + ~1 g JVM overhead = 39 g (< 40 GiB container; 1 GiB headroom).
   # Heap raised from 24 g to 28 g (+4 GiB) to give more headroom above the
@@ -367,7 +367,11 @@ indexingService:
   # at /opt/herddb/indexdata and survives pod restarts (PVC lifecycle > pod lifecycle).
   # The PVC was enlarged to 100 GiB (from 20 GiB) to hold a full heap dump of the
   # 28 GiB heap (worst-case ~28 GiB HPROF) plus IS working data (currently <1 GiB).
-  javaOpts: "-Xms28g -Xmx28g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector -Dio.netty.maxDirectMemory=10737418240 -XX:MaxDirectMemorySize=10g -Dio.netty.allocator.numDirectArenas=8 -Dherddb.commitlog.tailbatchsize=10000 -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/opt/herddb/indexdata/heapdump.hprof"
+  # -Dherddb.vectorindex.streamingCompactionEnabled=true: streaming merge — the IS
+  #   compacts segments incrementally rather than in monolithic passes.
+  # -Dherddb.vectorindex.searchAsyncPipelineEnabled=true: async reads — segment
+  #   block reads during ANN search run through the async I/O pipeline.
+  javaOpts: "-Xms28g -Xmx28g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector -Dio.netty.maxDirectMemory=10737418240 -XX:MaxDirectMemorySize=10g -Dio.netty.allocator.numDirectArenas=8 -Dherddb.vectorindex.streamingCompactionEnabled=true -Dherddb.vectorindex.searchAsyncPipelineEnabled=true -Dherddb.commitlog.tailbatchsize=10000 -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/opt/herddb/indexdata/heapdump.hprof"
   storage:
     data:
       # 100 GiB: accommodates a full heap dump (28g heap, worst-case ~28 GiB HPROF)
@@ -398,6 +402,10 @@ indexingService:
     # and BK-tailer threads without competing with the apply workers.
     # Effective apply_queue_capacity = 8 workers × 1000 (default queue per worker) = 8,000.
     indexing.apply.parallelism: "8"
+    # Maximum number of vectors held in the in-memory "live" HNSW graph before
+    # it is sealed into a segment. Raised to 100,000 so the IS builds larger
+    # live graphs (fewer, denser segments) during sustained ingest.
+    indexing.vector.maxLiveGraphSize: "100000"
     # Vector store in-memory budget (IndexingServerConfiguration.PROPERTY_MEMORY_VECTOR_LIMIT).
     # Default 0 means maxMemory/3 = 24 GiB / 3 = 8 GiB.  At 8 GiB the IS triggers
     # memory-pressure checkpoints (flush to file-server) every second during heavy
@@ -476,6 +484,98 @@ indexingService:
     # c3-standard-22 nodes (86 GiB allocatable) currently provisioned by GKE Autopilot.
     # 2 replicas × 16 CPUs: each IS handles 4 of the 8 index shards (~500 M vectors/IS
     # for the bigann 1 B run).
+    requests:
+      memory: "63Gi"
+      cpu: "16"
+    limits:
+      memory: "63Gi"
+      cpu: "16"
+
+indexOptimizer:
+  # External segment-merger service. When enabled, the IS switches every new
+  # segmented-v2 index to "pressure-driven fallback" mode — the IS only runs
+  # local compaction when back-pressure forces it; the optimizer handles all
+  # steady-state merges via a ZK-backed task queue.
+  #
+  # Pinned to c3 (Intel Sapphire Rapids, AVX-512F/BW/VL/DQ/VNNI/FP16) so that
+  # jvector's SIMD distance kernels run at full width during PQ retraining and
+  # HNSW graph construction.  The IS has been moved off c3 (nodeSelector: {})
+  # so these expensive nodes are fully reserved for merge work.
+  enabled: true
+  replicas: 2
+  tablespaceName: "herd"
+  intervalMs: 300000
+  pdb:
+    enabled: true
+    minAvailable: 1
+  nodeSelector:
+    cloud.google.com/machine-family: "c3"
+    topology.kubernetes.io/zone: "europe-west4-a"
+  # gist1m dataset: 1,000,000 vectors × 960 dimensions, L2 (Euclidean) distance.
+  # dim is REQUIRED — SegmentMetadata znodes don't carry the dimension.
+  # similarity: EUCLIDEAN matches the gist1m preset and the index DDL produced
+  # by VectorBench for that dataset.
+  merger:
+    dim: 960
+    M: 16
+    beamWidth: 100
+    neighborOverflow: 1.2
+    alpha: 1.4
+    similarity: "EUCLIDEAN"
+  # targetMaxBytes: 8 GiB (chart default).  For gist1m with 2 IS replicas and
+  # numShards=4, each IS owns ~500 K vectors.  A 960-dim FusedPQ segment for
+  # 500 K vectors is ~4–5 GiB → one final large segment per IS shard pair,
+  # well within the 8 GiB target.
+  remoteFileClient:
+    # 512 MiB write buffer — matches the IS write cap and ensures the optimizer
+    # doesn't stall on gRPC back-pressure when uploading large merged graphs.
+    maxInflightWriteBytes: "536870912"   # 512 MiB
+  # JVM budget matched to the indexing-service budget (same node class, same
+  # memory envelope).
+  #   -Xms28g -Xmx28g: same heap as the IS — large enough for PQ codebook
+  #     reservoir (~500 MB for 960-dim), jvector OnDiskGraphIndexCompactor
+  #     working set, and GC headroom during multi-segment merges.
+  #   --add-modules jdk.incubator.vector: enables Panama Vector API (AVX-512
+  #     kernels in jvector — the primary reason the optimizer runs on c3 nodes).
+  #   -Dio.netty.maxDirectMemory=10737418240 (10 GiB): Netty uses
+  #     Unsafe.allocateMemory bypassing JVM Bits.reserveMemory; this cap
+  #     matches the IS setting so gRPC file-server I/O during merge uploads
+  #     never exceeds the same direct-memory envelope.
+  #   -XX:MaxDirectMemorySize=10g: JVM native cap for non-Netty direct buffers.
+  #   -Dio.netty.allocator.numDirectArenas=8: matches IS; reduces PoolChunk
+  #     fragmentation on 16-CPU nodes without lock-contention issues.
+  #   -Dherddb.vectorindex.streamingCompactionEnabled=true: streaming merge —
+  #     the optimizer compacts segments incrementally rather than in monolithic
+  #     passes (longevity-run tuning — keeps merge work flowing continuously).
+  #   -Dherddb.vectorindex.searchAsyncPipelineEnabled=true: async reads — segment
+  #     block reads run through the async I/O pipeline.
+  #   -XX:+HeapDumpOnOutOfMemoryError / HeapDumpPath=/tmp: write heap dump to
+  #     the tmp PVC on OOM so crashes are analysable post-mortem.
+  javaOpts: "-Xms28g -Xmx28g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector -Dio.netty.maxDirectMemory=10737418240 -XX:MaxDirectMemorySize=10g -Dio.netty.allocator.numDirectArenas=8 -Dherddb.vectorindex.streamingCompactionEnabled=true -Dherddb.vectorindex.searchAsyncPipelineEnabled=true -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/tmp/heapdump.hprof"
+  # tmp PVC: staged merge-intermediate files before upload.
+  #   gist1m full-convergence merge: output graph ~7.8 GiB + map ~3.9 GiB
+  #   → ~12 GiB per merge pass.  50 GiB leaves room for two concurrent passes
+  #   plus headroom for page-cache spill.
+  #
+  # NOTE: standard-hdd-zonal (pd-standard) is NOT compatible with c3 machine
+  # types — GCE rejects the attach with "pd-standard disk type cannot be used
+  # by c3-standard-* machine type".  Use standard-rwo (pd-balanced) instead,
+  # which is supported on all GKE machine families including c3.
+  storage:
+    tmp:
+      storageClass: "standard-rwo"
+      size: 50Gi
+  resources:
+    # Matched to the indexing-service resource envelope so both land on the
+    # same c3 node tier provisioned by GKE Autopilot.
+    # Memory layout (heap + direct + JVM overhead = JVM RSS):
+    #   28 g heap + 10 g direct + ~1 g JVM overhead  =  ~39 GiB JVM RSS
+    #   /tmp output graph (gist1m full merge)          =  ~7.8 GiB
+    #   /tmp output map                                =  ~3.9 GiB
+    #   Input segment page-cache                       =  ~6–8 GiB
+    #   ─────────────────────────────────────────────    ~57–59 GiB peak
+    # 63 GiB gives ~4–6 GiB headroom; matches the IS ceiling and fits on
+    # the c3-standard-22 nodes (86 GiB allocatable) already provisioned.
     requests:
       memory: "63Gi"
       cpu: "16"

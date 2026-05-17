@@ -310,7 +310,7 @@ indexingService:
   # drove IS heap to 91% during a bigann-200M run (issue #180). 1000 leaves
   # the steady-state throughput headroom while cutting the retained working
   # set by 10x.
-  javaOpts: "-Xms7g -Xmx7g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector -Dio.netty.maxDirectMemory=6442450944 -XX:MaxDirectMemorySize=6g -Dio.netty.allocator.numDirectArenas=8 -Dherddb.commitlog.tailbatchsize=1000 -Dherddb.vectorindex.streamingCompactionEnabled=false"
+  javaOpts: "-Xms7g -Xmx7g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector -Dio.netty.maxDirectMemory=8589934592 -XX:MaxDirectMemorySize=8g -Dio.netty.allocator.numDirectArenas=8 -Dherddb.commitlog.tailbatchsize=1000 -Dherddb.vectorindex.streamingCompactionEnabled=true -Dherddb.vectorindex.searchAsyncPipelineEnabled=true -DrestartEpoch=20260516-2"
   storage:
     data:
       size: 5Gi
@@ -328,13 +328,14 @@ indexingService:
   # direct + Phase C arena at 6 GB, new 4 MB readFileRange buffers could not be
   # allocated in the query phase.
   #
-  # Budget check (MaxDirectMemorySize=6g; maxDirectMemory=6g > 0 so Netty uses
+  # Budget check (MaxDirectMemorySize=8g; maxDirectMemory=8g > 0 so Netty uses
   # Unsafe.allocateMemory — freed Phase C chunks are immediately subtracted from
   # Netty's internal AtomicLong counter, no phantom-ref GC dependency; issue #253):
   #   SegmentBlockCache: 2.5 GiB direct (live, in Netty pool)
+  #   Phase B peak arena:  2.0 GiB (parallel shard writes, 4 MiB blocks × inflight)
   #   Phase C peak arena:  4.0 GiB (1,015 × 4 MB chunks) — freed on Phase C exit
-  #   Search gRPC headroom: 3.5 GiB (6g - 2.5g cache) for concurrent reads ✓
-  #   Heap (7g) + direct (6g) + JVM overhead (1g) = 14g JVM + native ≤ 20g ✓
+  #   Search gRPC headroom: 5.5 GiB (8g - 2.5g cache) for concurrent reads ✓
+  #   Heap (7g) + direct (8g) + JVM overhead (1g) = 16g JVM + native ≤ 22g ✓
   extraConfig:
     # BookKeeper V2 wire protocol — mirrors the server setting above.
     # The IS reads BK ledgers as a commit-log tailer; enabling V2 here
@@ -376,17 +377,17 @@ indexingService:
     # IS-local fallback kicks at 70% × 80 = 56 segments; full back-pressure
     # (tailer blocks) at 80. Prevents the 150+ segment explosion observed
     # during bigann-100M ingest with the default threshold of 500.
-    vector.index.compaction.backpressure.segments: "80"
+    vector.index.compaction.backpressure.segments: "150"
   resources:
     requests:
-      memory: "20Gi"
+      memory: "22Gi"
       cpu: "4"
     limits:
-      memory: "20Gi"
+      memory: "22Gi"
       cpu: "4"
 
 indexOptimizer:
-  enabled: true
+  enabled: false
   # Human-readable tablespace name — UUID resolved from ZooKeeper at startup.
   # No manual UUID log-scraping required.
   tablespaceName: "herd"
@@ -446,7 +447,7 @@ indexOptimizer:
     # Run 7 showed the 64 MiB IS write cap stalled Phase B uploads; the optimizer
     # merges much larger segments and needs at least as much write headroom.
     maxInflightWriteBytes: "536870912"   # 512 MiB
-  javaOpts: "-Xms512m -Xmx2g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector -XX:MaxDirectMemorySize=1g -Dherddb.vectorindex.streamingCompactionEnabled=false"
+  javaOpts: "-Xms512m -Xmx2g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector -XX:MaxDirectMemorySize=1g"
   resources:
     requests:
       memory: "2Gi"
@@ -459,7 +460,9 @@ tools:
   enabled: true
   storage:
     datasets:
-      size: 10Gi
+      # Raised from 10Gi to 30Gi for bigann 200M longevity benchmark:
+      # 200M × 128-dim bvecs (uint8) = 25.6 GB on-disk + queries/ground-truth overhead.
+      size: 30Gi
   # Heap raised to 6 g: sift10m base set (10M × 128-dim × 4 B = 5.12 GB)
   # must fit in JVM heap during ingest.
   # 6 g heap (max) + 1 g direct + 1 GiB JVM overhead = 8 GiB → container = 8 GiB.

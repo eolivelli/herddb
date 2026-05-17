@@ -380,8 +380,8 @@ Differences from the JDBC workflow — apply these whenever push mode is used:
 ## Supervision
 
 Once `run-bench.sh --background` has started the JVM inside the pod and
-returned, poll the cluster at least every 60 seconds (minimum 30 s, maximum
-90 s between polls). **On each tick: spawn the `herddb-cluster-monitor`
+returned, poll the cluster at least every 300 seconds (minimum 150 s, maximum
+450 s between polls). **On each tick: spawn the `herddb-cluster-monitor`
 sub-agent** (see §Supervision delegation above) and wait for its TICK SUMMARY.
 
 The primary progress source is always `GET /status` via the admin HTTP API:
@@ -413,7 +413,7 @@ You receive a structured TICK SUMMARY (~300 tokens, ~20 lines) with a VERDICT:
 The benchmark is complete when `GET /status` returns `phase=done` (or the
 vector-bench process no longer exists in the pod, detectable via
 `kubectl --kubeconfig .kubeconfig -n default exec sts/herddb-tools -- kill -0 <REMOTE_PID> 2>/dev/null || echo gone`).
-Schedule the next tick ~60 s after the previous one.
+Schedule the next tick ~300 s after the previous one.
 
 Example cluster-monitor invocation:
 
@@ -742,7 +742,7 @@ any new flag.
 - Always use `--checkpoint-timeout-seconds 1800` and
   `--wait-for-indexes-timeout 1800`. Never use lower values.
 - Long waits (minutes/hours) are acceptable, but supervision MUST tick at
-  least every 60 s while a bench is running.
+  least every 300 s while a bench is running.
 - Never create a GH issue on success. Issues are for failures or explicit
   diagnostics requests (profiling, feature requests). They must be fully
   reproducible from the embedded `values.yaml` + workload command.
@@ -776,7 +776,7 @@ is inactive; prefer the direct `--server` flag.
 (Moved from the repository-level `CLAUDE.md`.)
 
 ### Supervision loop
-The agent supervises a running benchmark at ≤60 s cadence. When started with
+The agent supervises a running benchmark at ≤300 s cadence. When started with
 `--background`, the JVM runs inside the pod as a nohup process; the primary
 progress source is the admin HTTP API, not the local log file. Each tick:
 0. `GET /status` via `kubectl --kubeconfig .kubeconfig -n default exec herddb-tools-0 -- curl -s http://localhost:8080/status`

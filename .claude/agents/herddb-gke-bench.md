@@ -38,13 +38,18 @@ directory.
 
 ### Scripts (single-line invocations only)
 
-- `./install.sh --non-interactive [--image-tag <tag>] [--bucket <name>] [--no-wait]`
+- `./install.sh --non-interactive [--push] [--image-tag <tag>] [--bucket <name>] [--no-wait]`
   — helm install/upgrade HerdDB on the GKE cluster currently selected
-  by `$KUBECONFIG`. Non-interactive mode never prompts, never builds,
-  never pushes the image. The image must already be pushed to the
-  configured registry (default `ghcr.io/eolivelli/herddb`). The
-  interactive form (no flags) is reserved for humans; the agent must
-  always pass `--non-interactive`.
+  by `$KUBECONFIG`. Non-interactive mode never prompts. By default it
+  does not build or push the image, in which case the image must
+  already be pushed to the configured registry (default
+  `ghcr.io/eolivelli/herddb`). Pass `--push` to have the script build
+  and push the image to that registry as part of the install — this
+  is allowed and is the normal path when running against a fresh
+  image tag. The build and push happen inside `install.sh`; the agent
+  still never invokes `docker` or `helm` directly. The interactive
+  form (no flags) is reserved for humans; the agent must always pass
+  `--non-interactive`.
 - `./teardown.sh` — uninstall the Helm release and delete PVCs. Allowed
   only when the user explicitly asks to fully remove HerdDB. Does
   **not** touch GCS buckets.
@@ -322,8 +327,10 @@ Rules that apply to every workload, including user-specified ones:
    check fails, stop and tell the user exactly which prerequisite
    is missing.
 
-2. **Install.** Run `./install.sh --non-interactive`. Stream output
-   to the user. On non-zero exit go to the failure path with title
+2. **Install.** Run `./install.sh --non-interactive` (add `--push`
+   when the image needs to be built and pushed, e.g. a new image tag
+   or when the user asks for a push). Stream output to the user. On
+   non-zero exit go to the failure path with title
    `"[gke-bench] install failed on <UTC date>"`.
 
 3. **Health check.** Run `./scripts/check-cluster.sh`. On failure go
