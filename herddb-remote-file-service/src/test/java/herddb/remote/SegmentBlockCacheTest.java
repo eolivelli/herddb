@@ -318,4 +318,248 @@ public class SegmentBlockCacheTest {
         cache.cleanUp();
         assertEquals(0L, cache.estimatedSize());
     }
+
+    // ------------------------------------------------------------------
+    // Frontier (pinned) region tests
+    // ------------------------------------------------------------------
+
+    @Test
+    public void pinnedBlockSurvivesMainCacheEvictionPressure() throws Exception {
+        // Main budget = 4 KB, frontier budget = 2 KB, blocks = 1 KB each.
+        // After we pin one block, flooding the main cache with 20 new blocks
+        // must evict main-cache entries but the pinned block must still be
+        // reachable via getBlock().
+        SegmentBlockCache cache = new SegmentBlockCache(4L * BLOCK, 2L * BLOCK);
+        assertTrue("frontier cache should be active", cache.isFrontierCacheActive());
+
+        AtomicInteger pinLoaderCalls = new AtomicInteger();
+        SegmentBlockCache.BlockLoader pinLoader = (p, off, len) -> {
+            pinLoaderCalls.incrementAndGet();
+            return direct(BLOCK, (byte) 0xAA);
+        };
+
+        // Pin the block; loader must be called exactly once.
+        cache.pinBlock("seg", 0L, BLOCK, pinLoader).release();
+        assertEquals(1, pinLoaderCalls.get());
+        assertEquals(1L, cache.frontierLoadSuccessCount());
+
+        // Flood the main cache to trigger eviction of non-pinned blocks.
+        SegmentBlockCache.BlockLoader floodLoader = (p, off, len) -> direct(BLOCK, (byte) 0x01);
+        for (int i = 1; i <= 20; i++) {
+            cache.getBlock("seg", (long) i * BLOCK, BLOCK, floodLoader).release();
+        }
+        cache.cleanUp();
+
+        // The pinned block must still be served (from the frontier region)
+        // without calling the loader again.
+        ByteBuf hit = cache.getBlock("seg", 0L, BLOCK, pinLoader);
+        try {
+            assertEquals("pinned byte pattern", (byte) 0xAA, hit.getByte(0));
+        } finally {
+            hit.release();
+        }
+        assertEquals("pin loader must not be re-invoked on frontier hit",
+                1, pinLoaderCalls.get());
+        assertTrue("at least one frontier hit recorded", cache.frontierHitCount() > 0);
+    }
+
+    @Test
+    public void frontierEvictionStatsIncrementWhenFrontierBudgetOverflows() throws Exception {
+        // Frontier budget = 2 KB, blocks = 1 KB each. After inserting 10 blocks
+        // via pinBlock the frontier must have evicted some.
+        SegmentBlockCache cache = new SegmentBlockCache(1_000_000, 2L * BLOCK);
+        SegmentBlockCache.BlockLoader loader = (p, off, len) -> direct(BLOCK, (byte) 0x55);
+
+        for (int i = 0; i < 10; i++) {
+            cache.pinBlock("seg", (long) i * BLOCK, BLOCK, loader).release();
+        }
+        cache.cleanUp();
+
+        assertTrue("some frontier blocks should have been evicted",
+                cache.frontierEvictionCount() > 0);
+        assertTrue("frontier weighted size within budget, got " + cache.frontierWeightedSize(),
+                cache.frontierWeightedSize() <= 2L * BLOCK);
+    }
+
+    @Test
+    public void invalidatePathClearsFrontierBlocks() throws Exception {
+        SegmentBlockCache cache = new SegmentBlockCache(1_000_000, 100_000);
+        SegmentBlockCache.BlockLoader loader = (p, off, len) -> direct(BLOCK, (byte) 0);
+
+        cache.pinBlock("segA", 0L, BLOCK, loader).release();
+        cache.pinBlock("segA", BLOCK, BLOCK, loader).release();
+        cache.pinBlock("segB", 0L, BLOCK, loader).release();
+
+        assertTrue("segA/0 should be in frontier before invalidation",
+                cache.containsBlock("segA", 0L, BLOCK));
+
+        cache.invalidatePath("segA");
+
+        assertFalse("segA/0 must be gone from frontier after invalidatePath",
+                cache.containsBlock("segA", 0L, BLOCK));
+        assertFalse("segA/BLOCK must be gone from frontier after invalidatePath",
+                cache.containsBlock("segA", BLOCK, BLOCK));
+        assertTrue("segB must be unaffected",
+                cache.containsBlock("segB", 0L, BLOCK));
+    }
+
+    @Test
+    public void invalidatePrefixClearsFrontierBlocks() throws Exception {
+        SegmentBlockCache cache = new SegmentBlockCache(1_000_000, 100_000);
+        SegmentBlockCache.BlockLoader loader = (p, off, len) -> direct(BLOCK, (byte) 0);
+
+        cache.pinBlock("ts1/idx/a", 0L, BLOCK, loader).release();
+        cache.pinBlock("ts1/idx/b", 0L, BLOCK, loader).release();
+        cache.pinBlock("ts2/idx/a", 0L, BLOCK, loader).release();
+
+        cache.invalidatePrefix("ts1/");
+
+        assertFalse("ts1/idx/a must be gone from frontier",
+                cache.containsBlock("ts1/idx/a", 0L, BLOCK));
+        assertFalse("ts1/idx/b must be gone from frontier",
+                cache.containsBlock("ts1/idx/b", 0L, BLOCK));
+        assertTrue("ts2/idx/a must survive",
+                cache.containsBlock("ts2/idx/a", 0L, BLOCK));
+    }
+
+    @Test
+    public void clearRemovesAllFrontierEntries() throws Exception {
+        SegmentBlockCache cache = new SegmentBlockCache(1_000_000, 100_000);
+        SegmentBlockCache.BlockLoader loader = (p, off, len) -> direct(BLOCK, (byte) 0);
+        cache.pinBlock("segA", 0L, BLOCK, loader).release();
+        cache.pinBlock("segB", 0L, BLOCK, loader).release();
+
+        assertTrue("segA in frontier before clear", cache.isFrontierCacheActive());
+        cache.clear();
+        cache.cleanUp();
+
+        assertEquals("frontier must be empty after clear",
+                0L, cache.frontierEstimatedSize());
+    }
+
+    @Test
+    public void pinBlockFallsThroughToMainCacheWhenFrontierDisabled() throws Exception {
+        // With frontierMaxBytes = 0 the frontier region is not created.
+        SegmentBlockCache cache = new SegmentBlockCache(1_000_000, 0);
+        assertFalse("frontier cache must be inactive", cache.isFrontierCacheActive());
+
+        AtomicInteger calls = new AtomicInteger();
+        SegmentBlockCache.BlockLoader loader = (p, off, len) -> {
+            calls.incrementAndGet();
+            return direct(BLOCK, (byte) 0x77);
+        };
+
+        // pinBlock must still work (falls through to getBlock), loader called once.
+        ByteBuf a = cache.pinBlock("seg", 0L, BLOCK, loader);
+        ByteBuf b = cache.pinBlock("seg", 0L, BLOCK, loader);
+        try {
+            assertEquals("loader invoked once — second call is a main-cache hit", 1, calls.get());
+            assertEquals((byte) 0x77, a.getByte(0));
+            assertEquals((byte) 0x77, b.getByte(0));
+        } finally {
+            a.release();
+            b.release();
+        }
+    }
+
+    @Test
+    public void frontierHitCountedWhenGetBlockServedFromFrontier() throws Exception {
+        SegmentBlockCache cache = new SegmentBlockCache(1_000_000, 100_000);
+        SegmentBlockCache.BlockLoader loader = (p, off, len) -> direct(BLOCK, (byte) 0xBB);
+
+        cache.pinBlock("seg", 0L, BLOCK, loader).release();
+        // Now getBlock should serve from frontier, not main cache.
+        ByteBuf hit = cache.getBlock("seg", 0L, BLOCK, loader);
+        hit.release();
+
+        assertTrue("at least one frontier hit", cache.frontierHitCount() >= 1);
+    }
+
+    @Test
+    public void frontierLoadFailureCountedOnLoaderException() {
+        SegmentBlockCache cache = new SegmentBlockCache(1_000_000, 100_000);
+        SegmentBlockCache.BlockLoader failing = (p, off, len) -> {
+            throw new IOException("frontier load failure");
+        };
+        assertThrows(IOException.class, () -> cache.pinBlock("seg", 0L, BLOCK, failing));
+        assertEquals(1L, cache.frontierLoadFailureCount());
+        assertEquals(0L, cache.frontierLoadSuccessCount());
+    }
+
+    @Test
+    public void maxFrontierBytesAccessor() {
+        SegmentBlockCache cache = new SegmentBlockCache(1_000_000, 200_000);
+        assertEquals(200_000L, cache.maxFrontierBytes());
+    }
+
+    @Test
+    public void pinBlockSuccessfulPathDoesNotThrow() throws Exception {
+        // compute() is non-null by construction; the guard now throws
+        // IllegalStateException instead of silently calling the loader again.
+        // Triggering the ISE would require Caffeine internals access; this test
+        // verifies the normal (non-exceptional) path: a successful pinBlock
+        // returns the expected buffer without throwing.
+        SegmentBlockCache cache = new SegmentBlockCache(1_000_000, 100_000);
+        SegmentBlockCache.BlockLoader loader = (p, off, len) -> direct(BLOCK, (byte) 0xCC);
+        ByteBuf buf = cache.pinBlock("seg", 0L, BLOCK, loader);
+        try {
+            assertEquals((byte) 0xCC, buf.getByte(0));
+        } finally {
+            buf.release();
+        }
+        assertEquals(1L, cache.frontierLoadSuccessCount());
+        assertEquals(0L, cache.frontierHitCount());
+    }
+
+    /**
+     * Concurrency stress: many threads interleave {@link SegmentBlockCache#pinBlock}
+     * and {@link SegmentBlockCache#getBlock} on the same key. The test verifies
+     * that refcount discipline holds (no {@code IllegalReferenceCountException},
+     * all slices readable) and that every call returns the correct byte pattern.
+     */
+    @Test
+    public void concurrentPinBlockAndGetBlockOnSameKey() throws Exception {
+        SegmentBlockCache cache = new SegmentBlockCache(1_000_000, 200_000);
+        SegmentBlockCache.BlockLoader pinLoader = (p, off, len) -> direct(BLOCK, (byte) 0xAA);
+        SegmentBlockCache.BlockLoader getLoader = (p, off, len) -> direct(BLOCK, (byte) 0xAA);
+
+        int threads = 32;
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        CountDownLatch ready = new CountDownLatch(threads);
+        CountDownLatch go = new CountDownLatch(1);
+        java.util.concurrent.atomic.AtomicReference<Throwable> failure =
+                new java.util.concurrent.atomic.AtomicReference<>();
+
+        for (int t = 0; t < threads; t++) {
+            final boolean pinMode = (t % 2 == 0);
+            pool.submit(() -> {
+                ready.countDown();
+                try {
+                    go.await();
+                    for (int iter = 0; iter < 50; iter++) {
+                        ByteBuf buf;
+                        if (pinMode) {
+                            buf = cache.pinBlock("seg", 0L, BLOCK, pinLoader);
+                        } else {
+                            buf = cache.getBlock("seg", 0L, BLOCK, getLoader);
+                        }
+                        try {
+                            assertEquals("wrong byte value", (byte) 0xAA, buf.getByte(0));
+                        } finally {
+                            buf.release();
+                        }
+                    }
+                } catch (Throwable e) {
+                    failure.compareAndSet(null, e);
+                }
+            });
+        }
+        assertTrue(ready.await(5, TimeUnit.SECONDS));
+        go.countDown();
+        pool.shutdown();
+        assertTrue(pool.awaitTermination(10, TimeUnit.SECONDS));
+        if (failure.get() != null) {
+            throw new AssertionError("concurrent pin/get stress test failed", failure.get());
+        }
+    }
 }

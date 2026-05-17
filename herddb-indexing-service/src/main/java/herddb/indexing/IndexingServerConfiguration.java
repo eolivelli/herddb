@@ -211,6 +211,30 @@ public final class IndexingServerConfiguration {
     /** Hard-coded default: async warmup is enabled. */
     public static final boolean PROPERTY_VECTOR_SEGMENT_CACHE_WARMUP_ASYNC_DEFAULT = true;
 
+    /**
+     * Byte budget for the frontier (pinned) region of the
+     * {@link herddb.remote.SegmentBlockCache} (issue #578).
+     *
+     * <p>When the frontier region is enabled, the post-warmup BFS pass
+     * (triggered after the main warmup BFS) inserts entry-frontier Layer-0
+     * blocks into a second Caffeine cache with its own independent byte budget.
+     * Blocks in the frontier region are evicted only when the frontier budget
+     * overflows — never by pressure from the much larger main cache — so they
+     * act as "soft-pinned" entries for the HNSW entry-point neighbourhood.
+     *
+     * <p>Default: {@code 0} = auto-size as 10% of
+     * {@link #PROPERTY_VECTOR_SEGMENT_PAGE_CACHE_MAX_BYTES} (after auto-sizing
+     * of the main cache budget, if needed). Set to a negative value to disable
+     * the frontier region entirely; set to a positive value to override.
+     */
+    public static final String PROPERTY_VECTOR_SEGMENT_PAGE_CACHE_FRONTIER_MAX_BYTES =
+            "indexing.vector.segmentPageCacheFrontierMaxBytes";
+    /**
+     * {@code 0} → auto-size as 10 % of the main cache budget.
+     * Negative → disabled.
+     */
+    public static final long PROPERTY_VECTOR_SEGMENT_PAGE_CACHE_FRONTIER_MAX_BYTES_DEFAULT = 0;
+
     // Compaction (checkpoint driver — existing)
     public static final String PROPERTY_COMPACTION_INTERVAL = "indexing.compaction.interval";
     public static final long PROPERTY_COMPACTION_INTERVAL_DEFAULT = 60000L;

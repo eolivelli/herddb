@@ -55,6 +55,18 @@ import java.util.concurrent.atomic.AtomicLong;
  * Callers always hold a non-null {@code SegmentBlockCache} — the disabled
  * instance is interchangeable with a real one and eliminates null checks.
  *
+ * <h3>Frontier (pinned) region</h3>
+ * <p>When a non-zero {@code frontierMaxBytes} budget is supplied, a second
+ * Caffeine cache — the <em>frontier region</em> — is created alongside the
+ * main eviction region. Blocks inserted via {@link #pinBlock} are placed into
+ * the frontier region and are served back by {@link #getBlock} /
+ * {@link #getBlockAsync} <em>before</em> the main cache is consulted.
+ * Because the frontier region has its own independent byte budget, its blocks
+ * are only evicted when the frontier budget overflows (LRU within the frontier
+ * region), never by pressure from the much larger main cache. This makes hot
+ * entry-frontier HNSW Layer-0 blocks effectively pinned regardless of overall
+ * access patterns (issue #578).
+ *
  * @author enrico.olivelli
  */
 public final class SegmentBlockCache {
@@ -105,11 +117,37 @@ public final class SegmentBlockCache {
      * when the load completes.
      */
     private final ConcurrentHashMap<BlockKey, InFlightLoad> inFlightAsync;
+
+    /**
+     * Byte budget for the frontier region. {@code 0} means no frontier region.
+     * Set once at construction; see {@link #SegmentBlockCache(long, long)}.
+     */
+    private final long frontierMaxBytes;
+
+    /**
+     * Second, independently-budgeted Caffeine cache for blocks that the warmup
+     * BFS has explicitly promoted as high-value entry-frontier Layer-0 blocks
+     * (issue #578). Non-null only when {@link #frontierMaxBytes} &gt; 0.
+     *
+     * <p>Blocks inserted via {@link #pinBlock} land here. {@link #getBlock} and
+     * {@link #getBlockAsync} check this cache <em>before</em> the main
+     * {@link #cache}, so a frontier-pinned block is always served from the
+     * frontier region regardless of whether the main cache also holds a copy.
+     *
+     * <p>When the frontier budget overflows, Caffeine evicts only the
+     * coldest block within the frontier — never an unpinned hot block from
+     * the main cache. This gives the entry-frontier a bounded, predictable
+     * memory footprint across arbitrarily many loaded segments.
+     */
+    private final Cache<BlockKey, ByteBuf> frontierCache;
+
     // We track hit/miss/load stats ourselves because the only way to do an
     // atomic retain-under-lock is via asMap().compute(), and Caffeine's
     // recordStats() does not count compute() invocations as gets. Keeping our
     // own counters is also what makes the stats meaningful for the Grafana
     // panels and the per-request cache_hits_per_request histogram.
+
+    // --- Main cache stats ---
     private final AtomicLong hits = new AtomicLong();
     private final AtomicLong misses = new AtomicLong();
     private final AtomicLong evictions = new AtomicLong();
@@ -117,11 +155,47 @@ public final class SegmentBlockCache {
     private final AtomicLong loadFailure = new AtomicLong();
     private final AtomicLong loadTimeNanos = new AtomicLong();
 
+    // --- Frontier (pinned) region stats — same shape as main cache stats ---
+    private final AtomicLong frontierHits = new AtomicLong();
+    private final AtomicLong frontierEvictions = new AtomicLong();
+    private final AtomicLong frontierLoadSuccess = new AtomicLong();
+    private final AtomicLong frontierLoadFailure = new AtomicLong();
+    private final AtomicLong frontierLoadTimeNanos = new AtomicLong();
+
+    /**
+     * Creates a cache with a main eviction region and no frontier (pinned) region.
+     * Equivalent to {@code SegmentBlockCache(maxBytes, 0)}.
+     *
+     * @param maxBytes byte budget for the main (evictable) region;
+     *     {@code <= 0} disables caching entirely
+     */
     public SegmentBlockCache(long maxBytes) {
+        this(maxBytes, 0L);
+    }
+
+    /**
+     * Creates a cache with a main eviction region and an optional frontier
+     * (pinned) region (issue #578).
+     *
+     * <p>The frontier region is a second Caffeine cache with its own
+     * {@code maximumWeight(frontierMaxBytes)} budget. Blocks inserted via
+     * {@link #pinBlock} land here and are evicted only when the frontier budget
+     * itself overflows (LRU within the frontier region). {@link #getBlock} and
+     * {@link #getBlockAsync} check the frontier region first, so a pinned block
+     * is always served even if the main cache has already evicted its copy.
+     *
+     * @param maxBytes         byte budget for the main (evictable) region;
+     *     {@code <= 0} disables caching entirely (including the frontier region)
+     * @param frontierMaxBytes byte budget for the frontier (pinned) region;
+     *     {@code <= 0} disables pinning (no second cache is created)
+     */
+    public SegmentBlockCache(long maxBytes, long frontierMaxBytes) {
         this.maxBytes = maxBytes;
+        this.frontierMaxBytes = frontierMaxBytes;
         if (maxBytes <= 0) {
             this.cache = null;
             this.inFlightAsync = null;
+            this.frontierCache = null;
         } else {
             this.cache = Caffeine.newBuilder()
                     .maximumWeight(maxBytes)
@@ -147,6 +221,21 @@ public final class SegmentBlockCache {
                     })
                     .build();
             this.inFlightAsync = new ConcurrentHashMap<>();
+            if (frontierMaxBytes > 0) {
+                this.frontierCache = Caffeine.newBuilder()
+                        .maximumWeight(frontierMaxBytes)
+                        .weigher((BlockKey k, ByteBuf v) -> v == null ? 0 : v.capacity())
+                        .executor(Runnable::run)
+                        .removalListener((BlockKey k, ByteBuf v, RemovalCause cause) -> {
+                            if (cause != null && cause.wasEvicted()) {
+                                frontierEvictions.incrementAndGet();
+                            }
+                            ReferenceCountUtil.safeRelease(v);
+                        })
+                        .build();
+            } else {
+                this.frontierCache = null;
+            }
         }
     }
 
@@ -155,8 +244,25 @@ public final class SegmentBlockCache {
         return cache != null;
     }
 
+    /**
+     * Returns {@code true} when the frontier (pinned) region is enabled. Callers
+     * can use this to skip the warmup BFS pin pass when no frontier budget has
+     * been allocated (e.g. when running with a 0-budget testing configuration).
+     */
+    public boolean isFrontierCacheActive() {
+        return frontierCache != null;
+    }
+
     public long maxBytes() {
         return maxBytes;
+    }
+
+    /**
+     * Returns the configured byte budget for the frontier (pinned) region.
+     * Returns {@code 0} when the frontier region is disabled.
+     */
+    public long maxFrontierBytes() {
+        return frontierMaxBytes;
     }
 
     /**
@@ -165,6 +271,11 @@ public final class SegmentBlockCache {
      * a multiple of {@code length} — this is the natural alignment used by
      * {@link RemoteRandomAccessReader}, where the read window is a fixed-size
      * sliding buffer.
+     *
+     * <p>The frontier (pinned) region is checked <em>before</em> the main
+     * eviction cache. If the block was previously promoted via
+     * {@link #pinBlock}, it is returned from the frontier region regardless of
+     * whether it is also present in the main cache.
      *
      * <p><b>Ownership</b>: the returned {@link ByteBuf} is a caller-owned
      * retained slice; the caller MUST release it exactly once. The underlying
@@ -199,6 +310,36 @@ public final class SegmentBlockCache {
         }
         long blockIndex = offset / length;
         BlockKey key = new BlockKey(path, blockIndex);
+
+        // Fast path: check the frontier (pinned) region first. A block that
+        // was explicitly pinned via pinBlock() is served from here regardless
+        // of whether the main cache also holds a copy. This prevents eviction
+        // pressure in the much larger main cache from displacing entry-frontier
+        // Layer-0 blocks.
+        //
+        // Performance note: this adds one ConcurrentHashMap.computeIfPresent()
+        // call per getBlock() invocation when the frontier region is active
+        // (frontierCache != null). computeIfPresent returns without executing
+        // the mapping function when the key is absent (the overwhelmingly common
+        // case for non-entry-frontier blocks) — cost is one hash + probe.
+        // The frontier is disabled (frontierCache == null) in the majority of
+        // test and tooling deployments, so the hot path is unaffected there.
+        if (frontierCache != null) {
+            ByteBuf[] frontierRetained = new ByteBuf[1];
+            frontierCache.asMap().computeIfPresent(key, (k, existing) -> {
+                frontierHits.incrementAndGet();
+                existing.retain();
+                frontierRetained[0] = existing;
+                return existing;
+            });
+            if (frontierRetained[0] != null) {
+                try {
+                    return frontierRetained[0].retainedSlice(0, frontierRetained[0].readableBytes());
+                } finally {
+                    frontierRetained[0].release();
+                }
+            }
+        }
 
         // Everything happens inside a single asMap().compute() call so that
         // the retain is atomic with the entry-present check — no window for
@@ -264,12 +405,107 @@ public final class SegmentBlockCache {
     }
 
     /**
+     * Loads the block at {@code (path, offset, length)} into the frontier
+     * (pinned) region, giving it eviction-resistant treatment (issue #578).
+     *
+     * <p>The frontier region has its own byte budget ({@code frontierMaxBytes}).
+     * Blocks here are evicted only when the frontier budget overflows — never by
+     * eviction pressure in the much larger main cache. On a subsequent
+     * {@link #getBlock} or {@link #getBlockAsync} call the frontier region is
+     * checked first, so pinned blocks are served from the frontier regardless of
+     * main-cache state.
+     *
+     * <p>When no frontier budget has been allocated ({@code !isFrontierCacheActive()})
+     * this method falls through to {@link #getBlock}, so callers never need to
+     * guard against a null frontier.
+     *
+     * <p><b>Ownership</b>: identical to {@link #getBlock} — the returned
+     * {@link ByteBuf} is a caller-owned retained slice; the caller MUST release
+     * it exactly once.
+     *
+     * @param path   logical multipart path
+     * @param offset block start, must be a multiple of {@code length}
+     * @param length block length in bytes (&gt; 0)
+     * @param loader invoked at most once per key on miss in the frontier region
+     */
+    public ByteBuf pinBlock(String path, long offset, int length, BlockLoader loader)
+            throws IOException {
+        Objects.requireNonNull(path, "path");
+        Objects.requireNonNull(loader, "loader");
+        if (length <= 0) {
+            throw new IllegalArgumentException("length must be > 0, got " + length);
+        }
+        if (offset < 0) {
+            throw new IllegalArgumentException("offset must be >= 0, got " + offset);
+        }
+        if (frontierCache == null) {
+            // No frontier budget: degrade gracefully to normal caching so the
+            // call is never a no-op even when pinning is disabled.
+            return getBlock(path, offset, length, loader);
+        }
+        long blockIndex = offset / length;
+        BlockKey key = new BlockKey(path, blockIndex);
+
+        // Same atomic retain-under-lock pattern as getBlock: the compute()
+        // serialises the retain with the removal listener so we can never
+        // hand out a slice of an already-released buffer.
+        ByteBuf retained;
+        try {
+            retained = frontierCache.asMap().compute(key, (k, existing) -> {
+                if (existing != null) {
+                    frontierHits.incrementAndGet();
+                    existing.retain();
+                    return existing;
+                }
+                long startNanos = System.nanoTime();
+                ByteBuf loaded;
+                try {
+                    loaded = loader.load(path, offset, length);
+                } catch (IOException ioe) {
+                    frontierLoadFailure.incrementAndGet();
+                    frontierLoadTimeNanos.addAndGet(System.nanoTime() - startNanos);
+                    throw new CacheLoadException(ioe);
+                }
+                frontierLoadTimeNanos.addAndGet(System.nanoTime() - startNanos);
+                if (loaded == null) {
+                    frontierLoadFailure.incrementAndGet();
+                    throw new CacheLoadException(new IOException(
+                            "loader returned null for " + path + "@" + offset));
+                }
+                frontierLoadSuccess.incrementAndGet();
+                loaded.retain();
+                return loaded;
+            });
+        } catch (CacheLoadException e) {
+            throw (IOException) e.getCause();
+        }
+        // compute() always returns non-null here: the hit branch retains and returns
+        // existing, the miss branch either throws CacheLoadException or returns the
+        // freshly loaded buffer. A null return from Caffeine.compute() would mean the
+        // mapping was removed by another thread inside the lambda, which is not possible
+        // because the lambda itself never returns null and no other thread can remove the
+        // entry while the lambda holds the per-key lock. Treat null as a programming error.
+        if (retained == null) {
+            throw new IllegalStateException(
+                    "Caffeine compute() returned null unexpectedly for " + key);
+        }
+        try {
+            return retained.retainedSlice(0, retained.readableBytes());
+        } finally {
+            retained.release();
+        }
+    }
+
+    /**
      * Async sibling of {@link #getBlock}: fetches the block at
      * {@code (path, offset, length)} and returns a {@link CompletableFuture}
      * that completes with a <em>caller-owned retained slice</em> of the cached
      * buffer. Ownership rules are identical to those of {@link #getBlock}:
      * the caller MUST release the returned {@link ByteBuf} exactly once; the
      * cache's own reference is released on eviction.
+     *
+     * <p>The frontier (pinned) region is checked first, before the main cache
+     * fast-path — matching {@link #getBlock}'s lookup order.
      *
      * <p><b>Single-flight</b>: concurrent callers for the same
      * {@code (path, blockIndex)} share a single in-flight loader call via
@@ -323,7 +559,23 @@ public final class SegmentBlockCache {
         long blockIndex = offset / length;
         BlockKey key = new BlockKey(path, blockIndex);
 
-        // --- Fast path: check cache with atomic retain-under-lock ---
+        // --- Fast path 1: check frontier (pinned) region first ---
+        if (frontierCache != null) {
+            ByteBuf[] frontierRetained = new ByteBuf[1];
+            frontierCache.asMap().computeIfPresent(key, (k, existing) -> {
+                frontierHits.incrementAndGet();
+                existing.retain();
+                frontierRetained[0] = existing;
+                return existing;
+            });
+            if (frontierRetained[0] != null) {
+                ByteBuf slice = frontierRetained[0].retainedSlice(0, frontierRetained[0].readableBytes());
+                frontierRetained[0].release();
+                return CompletableFuture.completedFuture(slice);
+            }
+        }
+
+        // --- Fast path 2: check main cache with atomic retain-under-lock ---
         // Use computeIfPresent so the retain and the entry-present check are
         // serialised with the removal listener, exactly as in getBlock().
         ByteBuf[] retained = new ByteBuf[1];
@@ -508,22 +760,25 @@ public final class SegmentBlockCache {
     /**
      * Checks whether the cache currently holds the block at
      * {@code (path, offset, length)} without triggering a load or affecting
-     * LRU ordering. Used by {@link RemoteRandomAccessReader} to distinguish
-     * per-request cache hits from cache misses.
+     * LRU ordering. Checks both the frontier and main caches. Used by
+     * {@link RemoteRandomAccessReader} to distinguish per-request cache hits
+     * from cache misses.
      */
     public boolean containsBlock(String path, long offset, int length) {
         if (cache == null) {
             return false;
         }
         long blockIndex = offset / length;
-        return cache.asMap().containsKey(new BlockKey(path, blockIndex));
+        BlockKey key = new BlockKey(path, blockIndex);
+        return (frontierCache != null && frontierCache.asMap().containsKey(key))
+                || cache.asMap().containsKey(key);
     }
 
     /**
-     * Removes every cached block whose key path equals {@code path}. Called
-     * when a multipart segment file is deleted or rewritten so that stale
-     * bytes cannot be served to a subsequent reader that happens to hit the
-     * same logical path.
+     * Removes every cached block whose key path equals {@code path} from both
+     * the main cache and the frontier (pinned) region. Called when a multipart
+     * segment file is deleted or rewritten so that stale bytes cannot be served
+     * to a subsequent reader that happens to hit the same logical path.
      */
     public void invalidatePath(String path) {
         if (cache == null || path == null) {
@@ -536,12 +791,22 @@ public final class SegmentBlockCache {
                 it.remove();
             }
         }
+        if (frontierCache != null) {
+            Iterator<BlockKey> fit = frontierCache.asMap().keySet().iterator();
+            while (fit.hasNext()) {
+                BlockKey k = fit.next();
+                if (path.equals(k.path)) {
+                    fit.remove();
+                }
+            }
+        }
     }
 
     /**
-     * Removes every cached block whose key path starts with {@code prefix}.
-     * Used by bulk deletions (e.g. {@code eraseTablespaceData}) so that
-     * multipart segments sharing a logical prefix are invalidated together.
+     * Removes every cached block whose key path starts with {@code prefix} from
+     * both the main cache and the frontier (pinned) region. Used by bulk
+     * deletions (e.g. {@code eraseTablespaceData}) so that multipart segments
+     * sharing a logical prefix are invalidated together.
      */
     public void invalidatePrefix(String prefix) {
         if (cache == null || prefix == null) {
@@ -554,21 +819,38 @@ public final class SegmentBlockCache {
                 it.remove();
             }
         }
+        if (frontierCache != null) {
+            Iterator<BlockKey> fit = frontierCache.asMap().keySet().iterator();
+            while (fit.hasNext()) {
+                BlockKey k = fit.next();
+                if (k.path.startsWith(prefix)) {
+                    fit.remove();
+                }
+            }
+        }
     }
 
+    /** Clears all entries from both the main cache and the frontier region. */
     public void clear() {
         if (cache != null) {
             cache.invalidateAll();
         }
+        if (frontierCache != null) {
+            frontierCache.invalidateAll();
+        }
     }
 
     /**
-     * Forces Caffeine to drain its async maintenance queue. Tests use this
-     * before asserting on eviction counts; not needed in production.
+     * Forces Caffeine to drain its async maintenance queue on both caches.
+     * Tests use this before asserting on eviction counts; not needed in
+     * production.
      */
     public void cleanUp() {
         if (cache != null) {
             cache.cleanUp();
+        }
+        if (frontierCache != null) {
+            frontierCache.cleanUp();
         }
     }
 
@@ -608,11 +890,12 @@ public final class SegmentBlockCache {
         return PooledByteBufAllocator.DEFAULT.directBuffer(length);
     }
 
-    // ---------------------------------------------------------------------
-    // Stats accessors. Hits/misses are 0 when the cache is disabled (pass-
-    // through mode) because no lookups happen; load_success / load_failure /
-    // load_time still track the pass-through loader calls.
-    // ---------------------------------------------------------------------
+    // -------------------------------------------------------------------------
+    // Main cache stats accessors.
+    // Hits/misses are 0 when the cache is disabled (pass-through mode) because
+    // no lookups happen; load_success / load_failure / load_time still track
+    // the pass-through loader calls.
+    // -------------------------------------------------------------------------
 
     public long hitCount() {
         return hits.get();
@@ -651,9 +934,81 @@ public final class SegmentBlockCache {
                 .orElse(0L);
     }
 
-    // ---------------------------------------------------------------------
+    // -------------------------------------------------------------------------
+    // Frontier (pinned) region stats accessors.
+    // Same shape as the main cache stats so that Prometheus dashboards can use
+    // the same panels for both regions. All return 0 when the frontier region
+    // is disabled (frontierCache == null).
+    //
+    // Naming convention: "frontier_*" maps to the Prometheus label
+    //   cache_region="frontier"
+    // to distinguish from the main cache (cache_region="main").
+    // -------------------------------------------------------------------------
+
+    /**
+     * Blocks served from the frontier region by {@link #getBlock} /
+     * {@link #getBlockAsync}. Also counts hits inside {@link #pinBlock} when the
+     * block was already resident in the frontier (i.e. a re-pin of a warm block).
+     */
+    public long frontierHitCount() {
+        return frontierHits.get();
+    }
+
+    /**
+     * Blocks evicted from the frontier region because the frontier byte budget
+     * was exceeded (LRU eviction within the frontier).
+     */
+    public long frontierEvictionCount() {
+        return frontierEvictions.get();
+    }
+
+    /**
+     * Successful block loads via {@link #pinBlock} (loader returned a non-null
+     * buffer and the insert into the frontier region succeeded).
+     */
+    public long frontierLoadSuccessCount() {
+        return frontierLoadSuccess.get();
+    }
+
+    /**
+     * Failed block loads via {@link #pinBlock} (loader threw {@link IOException}
+     * or returned null).
+     */
+    public long frontierLoadFailureCount() {
+        return frontierLoadFailure.get();
+    }
+
+    /**
+     * Total wall-clock nanoseconds spent inside {@link #pinBlock} loader
+     * invocations (excluding hits). Useful for tracking how much time the
+     * warmup BFS spends on network reads.
+     */
+    public long frontierTotalLoadTimeNanos() {
+        return frontierLoadTimeNanos.get();
+    }
+
+    /** Approximate number of entries currently in the frontier region. */
+    public long frontierEstimatedSize() {
+        return frontierCache == null ? 0 : frontierCache.estimatedSize();
+    }
+
+    /**
+     * Byte-weighted size of the frontier region (sum of all entry weights as
+     * reported by the weigher). May lag slightly behind actual memory use until
+     * the next Caffeine maintenance pass.
+     */
+    public long frontierWeightedSize() {
+        if (frontierCache == null) {
+            return 0;
+        }
+        return frontierCache.policy().eviction()
+                .map(e -> e.weightedSize().orElse(0L))
+                .orElse(0L);
+    }
+
+    // -------------------------------------------------------------------------
     // Types
-    // ---------------------------------------------------------------------
+    // -------------------------------------------------------------------------
 
     /** Immutable composite cache key. Hash is precomputed to avoid repeated path hashing. */
     static final class BlockKey {

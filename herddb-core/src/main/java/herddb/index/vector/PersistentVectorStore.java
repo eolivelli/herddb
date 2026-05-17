@@ -33,6 +33,7 @@ import herddb.utils.ByteBufDataOutput;
 import herddb.utils.Bytes;
 import herddb.utils.VectorSearchRequestContext;
 import herddb.utils.VisibleByteArrayOutputStream;
+import io.github.jbellis.jvector.disk.RandomAccessReader;
 import io.github.jbellis.jvector.disk.ReaderSupplier;
 import io.github.jbellis.jvector.graph.GraphIndexBuilder;
 import io.github.jbellis.jvector.graph.GraphSearcher;
@@ -64,10 +65,12 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.AbstractMap;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.EnumMap;
@@ -4950,6 +4953,25 @@ public class PersistentVectorStore extends AbstractVectorStore {
     }
 
     /**
+     * Per-segment byte budget for the frontier (pinned) region BFS pass
+     * (issue #578). When {@code -1} (the default) the budget mirrors
+     * {@link #warmupBytesPerSegment}. When {@code 0} or negative (and not
+     * {@code -1}) the pin BFS is disabled. Set via
+     * {@link #setPinBytesPerSegment(long)}.
+     */
+    private volatile long pinBytesPerSegment = -1;
+
+    /**
+     * Sets the per-segment byte budget for the frontier-warmup BFS pass
+     * (issue #578). A value of {@code 0} disables pin-warmup. A value of
+     * {@code -1} (the default) makes the pin budget mirror
+     * {@link #warmupBytesPerSegment}.
+     */
+    public void setPinBytesPerSegment(long pinBytesPerSegment) {
+        this.pinBytesPerSegment = pinBytesPerSegment;
+    }
+
+    /**
      * Total number of segments actually BFS-warmed by this store since start
      * (issue #569). Exposed for tests and Prometheus exporters.
      */
@@ -5009,6 +5031,15 @@ public class PersistentVectorStore extends AbstractVectorStore {
         if (nodesVisited > 0) {
             seg.warmedUp = true;
             warmedSegmentsTotal.incrementAndGet();
+            // After the main warm pass, run the pin BFS to promote
+            // entry-frontier blocks into the eviction-resistant frontier region.
+            long pinBudget = this.pinBytesPerSegment;
+            if (pinBudget == -1) {
+                pinBudget = bytesPerSegment;
+            }
+            if (pinBudget > 0) {
+                pinSegmentBfs(seg, odg, approxBytesPerNode, pinBudget);
+            }
             return nodesVisited;
         }
         // nodesVisited == 0 means warmUpSegmentBfs hit an I/O error (it
@@ -5106,6 +5137,95 @@ public class PersistentVectorStore extends AbstractVectorStore {
                     "warmUpBlockCache " + indexName + ": unexpected error warming segment "
                             + seg.segmentId, e);
             return 0;
+        }
+    }
+
+    /**
+     * Performs a secondary BFS over Layer 0 of {@code seg} using a
+     * <em>pin-mode</em> reader so that every accessed block is inserted into
+     * the frontier (pinned) region of the {@link herddb.remote.SegmentBlockCache}
+     * instead of the ordinary evictable region (issue #578).
+     *
+     * <p>The pin BFS is only possible when:
+     * <ol>
+     *   <li>The segment's {@code onDiskReaderSupplier} is a
+     *       {@link RemoteRandomAccessReader.Supplier} (not a local-disk supplier).</li>
+     *   <li>The supplier's block cache has a frontier region configured
+     *       ({@link RemoteRandomAccessReader.Supplier#hasFrontierCacheActive()}).</li>
+     * </ol>
+     * When either condition is not met, this method returns silently — the ordinary
+     * warm pass (which already loaded the blocks into the main cache) is
+     * sufficient.
+     *
+     * <p>Upper-layer HNSW data is heap-resident after
+     * {@code OnDiskGraphIndex.loadInMemoryLayers} so only Level-0 reads actually
+     * go through the remote reader — meaning only Layer-0 blocks end up pinned,
+     * which is exactly the right set (entry-frontier blocks).
+     *
+     * @param seg              segment whose frontier region is being warmed
+     * @param odg              the already-open {@link OnDiskGraphIndex} for that segment
+     * @param approxBytesPerNode estimated bytes per graph node, used to cap the BFS
+     * @param pinBytesPerSegment frontier budget; nodes visited = min(size, budget / bpn)
+     */
+    void pinSegmentBfs(VectorSegment seg, OnDiskGraphIndex odg,
+                               long approxBytesPerNode, long pinBytesPerSegment) {
+        io.github.jbellis.jvector.disk.ReaderSupplier rs = seg.onDiskReaderSupplier;
+        if (!(rs instanceof PinModeReaderSupplier)) {
+            // Not a pin-capable reader supplier (e.g. local disk in unit tests): skip.
+            return;
+        }
+        PinModeReaderSupplier pinCapable = (PinModeReaderSupplier) rs;
+        if (!pinCapable.hasFrontierCacheActive()) {
+            // Frontier region not configured: skip (no benefit, avoid wasted reads).
+            return;
+        }
+        ReaderSupplier pinSupplier = pinCapable.withPinMode();
+        int idUpperBound = odg.getIdUpperBound();
+        int nodeLimit = (int) Math.min(
+                idUpperBound,
+                Math.max(1L, pinBytesPerSegment / approxBytesPerNode));
+        try {
+            RandomAccessReader pinReader = pinSupplier.get();
+            OnDiskGraphIndex.View pinView = odg.new View(pinReader);
+            try {
+                ImmutableGraphIndex.NodeAtLevel entry = pinView.entryNode();
+                Set<Integer> visited = new HashSet<>();
+                ArrayDeque<Integer> queue = new ArrayDeque<>();
+                queue.add(entry.node);
+                visited.add(entry.node);
+                while (!queue.isEmpty() && visited.size() < nodeLimit) {
+                    int node = queue.poll();
+                    // Level-0 read: routes through pin-mode RemoteRandomAccessReader
+                    // → SegmentBlockCache.pinBlock → frontier cache
+                    NodesIterator neighbors = pinView.getNeighborsIterator(0, node);
+                    while (neighbors.hasNext() && visited.size() < nodeLimit) {
+                        int neighbor = neighbors.nextInt();
+                        if (visited.add(neighbor)) {
+                            queue.add(neighbor);
+                        }
+                    }
+                }
+                LOGGER.log(Level.FINE,
+                        "pinSegmentBfs {0}: pinned {1} frontier nodes for segment {2}",
+                        new Object[]{indexName, visited.size(), seg.segmentId});
+            } finally {
+                pinView.close();
+            }
+        } catch (IOException e) {
+            LOGGER.log(Level.WARNING,
+                    "pinSegmentBfs {0}: I/O error pinning segment {1}: {2}",
+                    new Object[]{indexName, seg.segmentId, e.getMessage()});
+        } catch (UncheckedIOException e) {
+            LOGGER.log(Level.WARNING,
+                    "pinSegmentBfs {0}: I/O error pinning segment {1}: {2}",
+                    new Object[]{indexName, seg.segmentId,
+                            e.getCause() != null ? e.getCause().getMessage() : e.getMessage()});
+        } catch (Exception e) {
+            // Broad catch: pin BFS is best-effort; any unexpected failure from
+            // an unknown ReaderSupplier implementation must not abort warmup.
+            LOGGER.log(Level.WARNING,
+                    "pinSegmentBfs " + indexName + ": unexpected error pinning segment "
+                            + seg.segmentId, e);
         }
     }
 
