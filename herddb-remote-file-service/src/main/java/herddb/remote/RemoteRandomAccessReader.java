@@ -21,6 +21,7 @@
 package herddb.remote;
 
 import edu.umd.cs.findbugs.annotations.Nullable;
+import herddb.index.vector.PinModeReaderSupplier;
 import herddb.utils.VectorSearchRequestContext;
 import io.github.jbellis.jvector.disk.RandomAccessReader;
 import io.github.jbellis.jvector.disk.ReaderSupplier;
@@ -69,6 +70,15 @@ public class RemoteRandomAccessReader implements RandomAccessReader {
     private final Counter clientReadBytes;
     private final Counter clientReadRequests;
     private final SegmentBlockCache blockCache;
+    /**
+     * When {@code true}, every block loaded by {@link #ensureBlockLoaded} is
+     * inserted into the frontier (pinned) region of the {@link SegmentBlockCache}
+     * via {@link SegmentBlockCache#pinBlock} instead of the ordinary
+     * {@link SegmentBlockCache#getBlock}. Used by the warmup BFS pass so that
+     * entry-frontier Layer-0 blocks survive main-cache eviction pressure.
+     * Set to {@code false} on all normal (non-warmup) readers.
+     */
+    private final boolean pinMode;
 
     private long position;
     /**
@@ -106,6 +116,21 @@ public class RemoteRandomAccessReader implements RandomAccessReader {
                                     long totalSize, int writeBlockSize, int bufferSize,
                                     StatsLogger statsLogger,
                                     SegmentBlockCache blockCache) {
+        this(client, path, totalSize, writeBlockSize, bufferSize, statsLogger, blockCache, false);
+    }
+
+    /**
+     * Full constructor. All public convenience constructors delegate here.
+     *
+     * @param pinMode when {@code true} blocks are inserted into the frontier
+     *     (pinned) region via {@link SegmentBlockCache#pinBlock}; when
+     *     {@code false} blocks use normal eviction via
+     *     {@link SegmentBlockCache#getBlock}
+     */
+    RemoteRandomAccessReader(RemoteFileServiceClient client, String path,
+                             long totalSize, int writeBlockSize, int bufferSize,
+                             StatsLogger statsLogger,
+                             SegmentBlockCache blockCache, boolean pinMode) {
         Objects.requireNonNull(statsLogger, "statsLogger (use NullStatsLogger.INSTANCE to disable)");
         Objects.requireNonNull(blockCache, "blockCache (use SegmentBlockCache.disabled() to disable)");
         if (writeBlockSize <= 0) {
@@ -126,6 +151,7 @@ public class RemoteRandomAccessReader implements RandomAccessReader {
         this.writeBlockSize = writeBlockSize;
         this.bufferSize = effective;
         this.blockCache = blockCache;
+        this.pinMode = pinMode;
 
         StatsLogger clientScope = statsLogger.scope("rfs").scope("client");
         this.clientReadLatency = clientScope.getOpStatsLogger("read_latency");
@@ -523,8 +549,15 @@ public class RemoteRandomAccessReader implements RandomAccessReader {
         long startNanos = System.nanoTime();
         ByteBuf data;
         try {
-            data = blockCache.getBlock(path, bufferOffset, bufferSize,
-                    (p, off, len) -> fetchBlockFromRemote(p, off, len, bufferIndex));
+            if (pinMode) {
+                // Pin-warmup BFS: insert this block into the frontier region so it
+                // survives eviction pressure from the much larger main cache.
+                data = blockCache.pinBlock(path, bufferOffset, bufferSize,
+                        (p, off, len) -> fetchBlockFromRemote(p, off, len, bufferIndex));
+            } else {
+                data = blockCache.getBlock(path, bufferOffset, bufferSize,
+                        (p, off, len) -> fetchBlockFromRemote(p, off, len, bufferIndex));
+            }
         } catch (IOException e) {
             if (ctx != null && !wasCached) {
                 ctx.recordCacheMiss();
@@ -591,8 +624,14 @@ public class RemoteRandomAccessReader implements RandomAccessReader {
     /**
      * A {@link ReaderSupplier} that creates {@link RemoteRandomAccessReader} instances
      * for concurrent searcher threads (jvector calls {@code get()} per search thread).
+     *
+     * <p>To obtain a pin-mode supplier for the frontier-warmup BFS pass, call
+     * {@link #withPinMode()}. The returned supplier creates readers that insert
+     * every loaded block into the frontier (pinned) region of the block cache so
+     * that entry-frontier Layer-0 blocks survive eviction pressure from the main
+     * cache.
      */
-    public static class Supplier implements ReaderSupplier {
+    public static class Supplier implements ReaderSupplier, PinModeReaderSupplier {
 
         private final RemoteFileServiceClient client;
         private final String path;
@@ -601,11 +640,23 @@ public class RemoteRandomAccessReader implements RandomAccessReader {
         private final int bufferSize;
         private final StatsLogger statsLogger;
         private final SegmentBlockCache blockCache;
+        /**
+         * When {@code true}, {@link #get()} returns a pin-mode reader that
+         * routes block loads through {@link SegmentBlockCache#pinBlock}.
+         */
+        private final boolean pinMode;
 
         public Supplier(RemoteFileServiceClient client, String path,
                         long totalSize, int writeBlockSize, int bufferSize,
                         StatsLogger statsLogger,
                         SegmentBlockCache blockCache) {
+            this(client, path, totalSize, writeBlockSize, bufferSize, statsLogger, blockCache, false);
+        }
+
+        private Supplier(RemoteFileServiceClient client, String path,
+                         long totalSize, int writeBlockSize, int bufferSize,
+                         StatsLogger statsLogger,
+                         SegmentBlockCache blockCache, boolean pinMode) {
             this.client = client;
             this.path = path;
             this.totalSize = totalSize;
@@ -615,6 +666,7 @@ public class RemoteRandomAccessReader implements RandomAccessReader {
                     "statsLogger (use NullStatsLogger.INSTANCE to disable)");
             this.blockCache = Objects.requireNonNull(blockCache,
                     "blockCache (use SegmentBlockCache.disabled() to disable)");
+            this.pinMode = pinMode;
         }
 
         /**
@@ -651,10 +703,37 @@ public class RemoteRandomAccessReader implements RandomAccessReader {
                     NullStatsLogger.INSTANCE, SegmentBlockCache.disabled());
         }
 
+        /**
+         * Returns a new {@link Supplier} with the same configuration but with
+         * {@code pinMode=true}. Readers produced by the returned supplier route
+         * every block load through {@link SegmentBlockCache#pinBlock}, placing
+         * the block into the frontier (pinned) region of the cache. Use this
+         * for the one-time warmup BFS pass so that entry-frontier Layer-0 blocks
+         * are eviction-resistant during subsequent searches.
+         *
+         * <p>Note: the returned supplier still targets the same
+         * {@link SegmentBlockCache}, so pinned blocks are immediately visible to
+         * all normal readers sharing the same cache instance.
+         */
+        public Supplier withPinMode() {
+            return new Supplier(client, path, totalSize, writeBlockSize, bufferSize,
+                    statsLogger, blockCache, true);
+        }
+
+        /**
+         * Returns {@code true} when the underlying {@link SegmentBlockCache}
+         * has a frontier (pinned) region configured. Callers can skip the
+         * {@link #withPinMode()} BFS pass when this returns {@code false} (no
+         * frontier budget has been allocated).
+         */
+        public boolean hasFrontierCacheActive() {
+            return blockCache.isFrontierCacheActive();
+        }
+
         @Override
         public RandomAccessReader get() throws IOException {
             return new RemoteRandomAccessReader(client, path, totalSize,
-                    writeBlockSize, bufferSize, statsLogger, blockCache);
+                    writeBlockSize, bufferSize, statsLogger, blockCache, pinMode);
         }
 
         @Override

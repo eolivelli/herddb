@@ -875,12 +875,25 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                                 source
                         });
             }
+            // Frontier (pinned) region budget (issue #578).
+            // Default 0 → auto-size as 10% of the main cache budget.
+            long frontierMaxBytes = config.getLong(
+                    IndexingServerConfiguration.PROPERTY_VECTOR_SEGMENT_PAGE_CACHE_FRONTIER_MAX_BYTES,
+                    IndexingServerConfiguration.PROPERTY_VECTOR_SEGMENT_PAGE_CACHE_FRONTIER_MAX_BYTES_DEFAULT);
+            if (frontierMaxBytes == 0 && segmentPageCacheMaxBytes > 0) {
+                frontierMaxBytes = segmentPageCacheMaxBytes / 10;
+            }
+            if (frontierMaxBytes < 0) {
+                frontierMaxBytes = 0; // explicit disable
+            }
             this.segmentBlockCache = segmentPageCacheMaxBytes > 0
-                    ? new SegmentBlockCache(segmentPageCacheMaxBytes)
+                    ? new SegmentBlockCache(segmentPageCacheMaxBytes, frontierMaxBytes)
                     : SegmentBlockCache.disabled();
             LOGGER.log(Level.INFO,
-                    "vector index segmentPageCacheMaxBytes: {0} (active={1})",
-                    new Object[]{segmentPageCacheMaxBytes, segmentBlockCache.isActive()});
+                    "vector index segmentPageCacheMaxBytes: {0} (active={1}), "
+                            + "frontierMaxBytes: {2} (active={3})",
+                    new Object[]{segmentPageCacheMaxBytes, segmentBlockCache.isActive(),
+                            frontierMaxBytes, segmentBlockCache.isFrontierCacheActive()});
             // Install the cache + stats logger on the remote DSM so that every
             // multipartIndexReaderSupplier it builds routes reads through it.
             // Stats logger may still be null at this point (set later by
@@ -902,6 +915,7 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             final long vectorMemLimit = maxVectorMemoryBytes;
             final VectorMemoryBudget budget = this;
             final long finalSegmentPageCacheMaxBytes = segmentPageCacheMaxBytes;
+            final long finalFrontierMaxBytes = frontierMaxBytes;
             int configuredSearchParallelism = config.getInt(
                     IndexingServerConfiguration.PROPERTY_VECTOR_SEARCH_PARALLELISM,
                     IndexingServerConfiguration.PROPERTY_VECTOR_SEARCH_PARALLELISM_DEFAULT);
@@ -951,6 +965,13 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                 // start(); the factory lambda runs later (tailer-driven), so the
                 // field is always populated by the time this executes.
                 store.setWarmupBytesPerSegment(this.warmupBytesPerSegment);
+                // Issue #578: set the frontier-pin budget for the secondary BFS
+                // pass that inserts entry-frontier Layer-0 blocks into the
+                // eviction-resistant frontier region after warmup. A value of -1
+                // (the PersistentVectorStore default) means "use the same budget as
+                // warmupBytesPerSegment"; we pass the actual frontier budget so the
+                // store can cap the pin BFS to the frontier budget independently.
+                store.setPinBytesPerSegment(finalFrontierMaxBytes > 0 ? -1L : 0L);
                 // Issue #491: when the external index-optimizer is enabled cluster-wide
                 // (indexing.optimizer.enabled=true) AND the metadata storage manager is
                 // ZK-backed, attach a SegmentRegistryPublisher BEFORE start() so that:
@@ -5039,6 +5060,84 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
 
             @Override public Long getSample() {
                 return cache.maxBytes();
+            }
+        });
+
+        // --- Frontier (pinned) region metrics ---
+        // Same shape as the main cache metrics so the Grafana dashboard can
+        // use the same panel templates with a "frontier" label filter.
+        // All return 0 when the frontier region is disabled.
+        StatsLogger frontier = scope.scope("frontier");
+        frontier.registerGauge("hits", new Gauge<Long>() {
+            @Override public Long getDefaultValue() {
+                return 0L;
+            }
+
+            @Override public Long getSample() {
+                return cache.frontierHitCount();
+            }
+        });
+        frontier.registerGauge("evictions", new Gauge<Long>() {
+            @Override public Long getDefaultValue() {
+                return 0L;
+            }
+
+            @Override public Long getSample() {
+                return cache.frontierEvictionCount();
+            }
+        });
+        frontier.registerGauge("load_success", new Gauge<Long>() {
+            @Override public Long getDefaultValue() {
+                return 0L;
+            }
+
+            @Override public Long getSample() {
+                return cache.frontierLoadSuccessCount();
+            }
+        });
+        frontier.registerGauge("load_failure", new Gauge<Long>() {
+            @Override public Long getDefaultValue() {
+                return 0L;
+            }
+
+            @Override public Long getSample() {
+                return cache.frontierLoadFailureCount();
+            }
+        });
+        frontier.registerGauge("load_time_nanos_total", new Gauge<Long>() {
+            @Override public Long getDefaultValue() {
+                return 0L;
+            }
+
+            @Override public Long getSample() {
+                return cache.frontierTotalLoadTimeNanos();
+            }
+        });
+        frontier.registerGauge("size_entries", new Gauge<Long>() {
+            @Override public Long getDefaultValue() {
+                return 0L;
+            }
+
+            @Override public Long getSample() {
+                return cache.frontierEstimatedSize();
+            }
+        });
+        frontier.registerGauge("size_bytes", new Gauge<Long>() {
+            @Override public Long getDefaultValue() {
+                return 0L;
+            }
+
+            @Override public Long getSample() {
+                return cache.frontierWeightedSize();
+            }
+        });
+        frontier.registerGauge("max_bytes", new Gauge<Long>() {
+            @Override public Long getDefaultValue() {
+                return 0L;
+            }
+
+            @Override public Long getSample() {
+                return cache.maxFrontierBytes();
             }
         });
     }

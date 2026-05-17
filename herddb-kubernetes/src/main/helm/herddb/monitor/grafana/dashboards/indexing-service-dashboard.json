@@ -4543,6 +4543,186 @@
       "panels": [
         {
           "datasource": "Prometheus",
+          "fill": 1,
+          "id": 450,
+          "legend": {"avg": true, "current": true, "max": true, "min": false, "show": true, "total": false, "values": true},
+          "lines": true,
+          "linewidth": 1,
+          "span": 6,
+          "targets": [
+            {
+              "expr": "indexing_segment_block_cache_frontier_size_bytes{job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "used [{{instance}}]",
+              "refId": "A"
+            },
+            {
+              "expr": "indexing_segment_block_cache_frontier_max_bytes{job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "max [{{instance}}]",
+              "refId": "B"
+            }
+          ],
+          "seriesOverrides": [
+            {
+              "alias": "/max/",
+              "fill": 0,
+              "dashes": true
+            }
+          ],
+          "title": "Frontier Cache (Pinned Region) — Size (bytes)",
+          "type": "graph",
+          "xaxis": {"mode": "time", "show": true},
+          "yaxes": [
+            {"format": "bytes", "logBase": 1, "min": 0, "show": true},
+            {"format": "short", "logBase": 1, "show": false}
+          ]
+        },
+        {
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 451,
+          "legend": {"avg": true, "current": true, "max": true, "min": false, "show": true, "total": false, "values": true},
+          "lines": true,
+          "linewidth": 1,
+          "span": 6,
+          "targets": [
+            {
+              "expr": "indexing_segment_block_cache_frontier_size_entries{job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "entries [{{instance}}]",
+              "refId": "A"
+            }
+          ],
+          "title": "Frontier Cache (Pinned Region) — Entries",
+          "type": "graph",
+          "xaxis": {"mode": "time", "show": true},
+          "yaxes": [
+            {"format": "short", "decimals": 0, "logBase": 1, "min": 0, "show": true},
+            {"format": "short", "logBase": 1, "show": false}
+          ]
+        },
+        {
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 452,
+          "legend": {"avg": true, "current": true, "max": true, "min": false, "show": true, "total": false, "values": true},
+          "lines": true,
+          "linewidth": 1,
+          "span": 6,
+          "targets": [
+            {
+              "expr": "rate(indexing_segment_block_cache_frontier_hits{job=\"indexing-service\",instance=~\"$instance\"}[1m])",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "hits/s [{{instance}}]",
+              "refId": "A"
+            }
+          ],
+          "title": "Frontier Cache (Pinned Region) — Hits (1m)",
+          "type": "graph",
+          "xaxis": {"mode": "time", "show": true},
+          "yaxes": [
+            {"format": "ops", "logBase": 1, "min": 0, "show": true},
+            {"format": "short", "logBase": 1, "show": false}
+          ]
+        },
+        {
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 453,
+          "legend": {"avg": true, "current": true, "max": true, "min": false, "show": true, "total": false, "values": true},
+          "lines": true,
+          "linewidth": 1,
+          "span": 6,
+          "targets": [
+            {
+              "expr": "rate(indexing_segment_block_cache_frontier_evictions{job=\"indexing-service\",instance=~\"$instance\"}[1m])",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "evictions/s [{{instance}}]",
+              "refId": "A"
+            }
+          ],
+          "title": "Frontier Cache (Pinned Region) — Evictions (1m)",
+          "type": "graph",
+          "xaxis": {"mode": "time", "show": true},
+          "yaxes": [
+            {"format": "ops", "logBase": 1, "min": 0, "show": true},
+            {"format": "short", "logBase": 1, "show": false}
+          ]
+        },
+        {
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 454,
+          "legend": {"avg": true, "current": true, "max": true, "min": false, "show": true, "total": false, "values": true},
+          "lines": true,
+          "linewidth": 1,
+          "span": 6,
+          "targets": [
+            {
+              "expr": "rate(indexing_segment_block_cache_frontier_load_time_nanos_total{job=\"indexing-service\",instance=~\"$instance\"}[1m]) / clamp_min(rate(indexing_segment_block_cache_frontier_load_success{job=\"indexing-service\",instance=~\"$instance\"}[1m]) + rate(indexing_segment_block_cache_frontier_load_failure{job=\"indexing-service\",instance=~\"$instance\"}[1m]), 1)",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "avg pin load ns [{{instance}}]",
+              "refId": "A"
+            }
+          ],
+          "title": "Frontier Cache (Pinned Region) — Average Pin Load Latency",
+          "type": "graph",
+          "xaxis": {"mode": "time", "show": true},
+          "yaxes": [
+            {"format": "ns", "logBase": 1, "min": 0, "show": true},
+            {"format": "short", "logBase": 1, "show": false}
+          ]
+        },
+        {
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 455,
+          "legend": {"avg": true, "current": true, "max": true, "min": false, "show": true, "total": false, "values": true},
+          "lines": true,
+          "linewidth": 1,
+          "span": 6,
+          "targets": [
+            {
+              "expr": "rate(indexing_segment_block_cache_frontier_load_success{job=\"indexing-service\",instance=~\"$instance\"}[1m])",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "load_success/s [{{instance}}]",
+              "refId": "A"
+            },
+            {
+              "expr": "rate(indexing_segment_block_cache_frontier_load_failure{job=\"indexing-service\",instance=~\"$instance\"}[1m])",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "load_failure/s [{{instance}}]",
+              "refId": "B"
+            }
+          ],
+          "title": "Frontier Cache (Pinned Region) — Pin Loads / Failures (1m)",
+          "type": "graph",
+          "xaxis": {"mode": "time", "show": true},
+          "yaxes": [
+            {"format": "ops", "logBase": 1, "min": 0, "show": true},
+            {"format": "short", "logBase": 1, "show": false}
+          ]
+        }
+      ],
+      "showTitle": true,
+      "title": "Frontier Cache — Entry-Frontier Pinned Region (issue #578)",
+      "titleSize": "h6"
+    },
+    {
+      "collapse": false,
+      "height": 250,
+      "panels": [
+        {
+          "datasource": "Prometheus",
           "id": 500,
           "span": 3,
           "targets": [
