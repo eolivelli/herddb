@@ -965,12 +965,13 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                 // start(); the factory lambda runs later (tailer-driven), so the
                 // field is always populated by the time this executes.
                 store.setWarmupBytesPerSegment(this.warmupBytesPerSegment);
-                // Issue #578: set the frontier-pin budget for the secondary BFS
-                // pass that inserts entry-frontier Layer-0 blocks into the
-                // eviction-resistant frontier region after warmup. A value of -1
-                // (the PersistentVectorStore default) means "use the same budget as
-                // warmupBytesPerSegment"; we pass the actual frontier budget so the
-                // store can cap the pin BFS to the frontier budget independently.
+                // Issue #578: set the frontier-pin BFS budget:
+                //   -1  = mirror warmupBytesPerSegment (the default sentinel in
+                //         PersistentVectorStore); used when the frontier region is
+                //         active so the pin BFS covers the same number of nodes as
+                //         the main warmup BFS.
+                //    0  = disable pin BFS entirely; used when no frontier budget
+                //         has been allocated (finalFrontierMaxBytes <= 0).
                 store.setPinBytesPerSegment(finalFrontierMaxBytes > 0 ? -1L : 0L);
                 // Issue #491: when the external index-optimizer is enabled cluster-wide
                 // (indexing.optimizer.enabled=true) AND the metadata storage manager is

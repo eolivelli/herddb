@@ -493,11 +493,12 @@ public class SegmentBlockCacheTest {
     }
 
     @Test
-    public void pinBlockThrowsIllegalStateIfComputeReturnsNull() throws Exception {
+    public void pinBlockSuccessfulPathDoesNotThrow() throws Exception {
         // compute() is non-null by construction; the guard now throws
         // IllegalStateException instead of silently calling the loader again.
-        // This is hard to trigger without Caffeine internals, so we verify the
-        // normal path: a successful pinBlock does NOT throw.
+        // Triggering the ISE would require Caffeine internals access; this test
+        // verifies the normal (non-exceptional) path: a successful pinBlock
+        // returns the expected buffer without throwing.
         SegmentBlockCache cache = new SegmentBlockCache(1_000_000, 100_000);
         SegmentBlockCache.BlockLoader loader = (p, off, len) -> direct(BLOCK, (byte) 0xCC);
         ByteBuf buf = cache.pinBlock("seg", 0L, BLOCK, loader);
