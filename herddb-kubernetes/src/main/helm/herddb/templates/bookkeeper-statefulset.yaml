@@ -8,7 +8,8 @@ metadata:
     app.kubernetes.io/component: bookkeeper
 spec:
   serviceName: {{ include "herddb.fullname" . }}-bookkeeper
-  replicas: {{ .Values.bookkeeper.replicaCount }}
+  # Push-indexing mode uses no commit log, so BookKeeper scales to 0.
+  replicas: {{ if .Values.pushIndexingMode.enabled }}0{{ else }}{{ .Values.bookkeeper.replicaCount }}{{ end }}
   selector:
     matchLabels:
       {{- include "herddb.selectorLabels" . | nindent 6 }}

@@ -1,3 +1,6 @@
+{{- if and .Values.pushIndexingMode.enabled (ne .Values.server.mode "cluster") }}
+{{- fail "pushIndexingMode.enabled=true requires server.mode=cluster (push mode is a cluster-mode deployment: ZooKeeper, the file server and the index optimizer remain up)" }}
+{{- end }}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -7,7 +10,9 @@ metadata:
     app.kubernetes.io/component: server
 spec:
   serviceName: {{ include "herddb.fullname" . }}-server
-  replicas: {{ .Values.server.replicaCount }}
+  # Push-indexing mode runs with no HerdDB server (entries are pushed straight
+  # into the indexing service over gRPC), so the server scales to 0.
+  replicas: {{ if .Values.pushIndexingMode.enabled }}0{{ else }}{{ .Values.server.replicaCount }}{{ end }}
   selector:
     matchLabels:
       {{- include "herddb.selectorLabels" . | nindent 6 }}

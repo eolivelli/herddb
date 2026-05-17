@@ -36,3 +36,35 @@ tests:
       - matchRegex:
           path: data["indexingservice.properties"]
           pattern: "indexing\\.optimizer\\.enabled=true"
+
+  # Push mode: the IS configmap must emit indexing.log.type=push (not
+  # bookkeeper) so the indexing service tails no commit log.
+  - it: should emit indexing.log.type=push when pushIndexingMode is enabled
+    set:
+      indexingService.enabled: true
+      server.mode: cluster
+      pushIndexingMode.enabled: true
+    asserts:
+      - matchRegex:
+          path: data["indexingservice.properties"]
+          pattern: "indexing\\.log\\.type=push"
+      - notMatchRegex:
+          path: data["indexingservice.properties"]
+          pattern: "indexing\\.log\\.type=bookkeeper"
+      # Push mode drops the bookkeeper ledgers path entirely.
+      - notMatchRegex:
+          path: data["indexingservice.properties"]
+          pattern: "server\\.bookkeeper\\.ledgers\\.path"
+
+  - it: should emit indexing.log.type=bookkeeper in cluster mode when pushIndexingMode is disabled
+    set:
+      indexingService.enabled: true
+      server.mode: cluster
+      pushIndexingMode.enabled: false
+    asserts:
+      - matchRegex:
+          path: data["indexingservice.properties"]
+          pattern: "indexing\\.log\\.type=bookkeeper"
+      - notMatchRegex:
+          path: data["indexingservice.properties"]
+          pattern: "indexing\\.log\\.type=push"

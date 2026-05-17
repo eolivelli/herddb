@@ -50,6 +50,20 @@ service IndexingService {
     // this RPC return UNIMPLEMENTED, which the client treats as a warning.
     // The commit-log tailer path remains the authoritative cleanup fallback.
     rpc DropIndex (DropIndexRequest) returns (DropIndexResponse);
+
+    // Push-based indexing (TESTING ONLY). When the indexing service runs with
+    // indexing.log.type=push it does NOT tail a file/BookKeeper commit log;
+    // instead a client serializes herddb.log.LogEntry objects and pushes them
+    // straight into a bounded in-memory buffer via this RPC. No HerdDB server
+    // and no commit log are required.
+    //
+    // The call blocks server-side until every entry in the batch has been
+    // accepted into the buffer — while a checkpoint/compaction stalls the
+    // tailer the buffer fills and the call parks. Clients MUST therefore use
+    // an infinite deadline. The client owns LSN assignment and MUST send
+    // entries in strictly increasing LSN order (and, when feeding multiple
+    // indexing-service instances, identically to every instance).
+    rpc PushEntries (PushEntriesRequest) returns (PushEntriesResponse);
 }
 
 message SearchRequest {
@@ -347,4 +361,28 @@ message DropIndexRequest {
 // Intentionally empty: the IS begins cleanup asynchronously and returns as
 // soon as the in-memory store has been removed from its tracking map.
 message DropIndexResponse {
+}
+
+// ---- Push-based indexing RPC (testing only — see rpc PushEntries) ----
+
+// One commit-log entry to push, with its client-assigned LSN.
+message PushedLogEntry {
+    // Log sequence number assigned by the client (ledgerId, offset).
+    int64 lsn_ledger = 1;
+    int64 lsn_offset = 2;
+    // A single serialized herddb.log.LogEntry (LogEntry.serialize()).
+    bytes entry = 3;
+}
+
+message PushEntriesRequest {
+    // Entries to enqueue, in strictly increasing LSN order.
+    repeated PushedLogEntry entries = 1;
+}
+
+message PushEntriesResponse {
+    // Number of entries this call accepted into the push buffer.
+    int64 accepted_count = 1;
+    // Tailer watermark (last applied LSN) at the moment the call returned.
+    int64 watermark_ledger = 2;
+    int64 watermark_offset = 3;
 }

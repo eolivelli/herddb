@@ -238,6 +238,48 @@ Rules that apply to every workload, including user-specified ones:
 
 ---
 
+## gRPC push mode (testing-only, no server)
+
+When the user asks to run the benchmark in **gRPC push mode** — also called
+"push-based indexing", "`--protocol grpc`", or "no-server bench" — the
+topology is just a single indexing service running with
+`indexing.log.type=push`: **no HerdDB server and no commit log**. VectorBench
+serializes commit-log entries itself and pushes them straight in over the
+`PushEntries` gRPC RPC.
+
+This mode does NOT use `./install.sh` (which installs a server + indexing
+service sharing a commit log on disk). Instead, from the repo root:
+
+1. Start one indexing service in standalone push mode — a single-line
+   invocation of the herddb-services launcher:
+   ```
+   herddb-services/test-start-indexing-service-push.sh
+   ```
+   It unzips the distribution and starts the indexing service in standalone
+   push mode, gRPC on `localhost:9850`. No server, BookKeeper or ZooKeeper.
+
+2. Run the workload with `--protocol grpc` (the `run.sh` launcher forwards
+   every argument to VectorBench):
+   ```
+   vector-testings/run.sh --protocol grpc --grpc-endpoint localhost:9850 \
+       --dataset sift10k -n 10000 --batch-size 10000
+   ```
+
+Differences from the JDBC workflow — apply these whenever push mode is used:
+
+- **Ingestion only.** gRPC mode runs no query/recall phase. Do NOT pass
+  `--checkpoint` or `--wait-for-indexes` (there is no server to checkpoint;
+  pushed entries are applied directly). gRPC ingestion is single-threaded, so
+  `--ingest-threads` and `--ingest-max-ops` are ignored. VectorBench verifies
+  the run itself by polling the indexed vector count over gRPC
+  (`GetIndexStatus`).
+- **Supervision.** There is only one process — the indexing service. There
+  is no `herddb-server` to poll; do not flag it missing. Watch the
+  indexing-service log and `bin/indexing-admin.sh describe-index`
+  (`vector_count`).
+
+---
+
 ## Workflow
 
 1. **Preflight.** Check that `java`, `unzip`, `curl`, and `gh` are on

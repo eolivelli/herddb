@@ -367,7 +367,12 @@ public class IndexingServer implements AutoCloseable {
 
         engine.setStatsLogger(statsLogger);
         this.serviceImpl = new IndexingServiceImpl(engine, statsLogger);
-        ServerBuilder<?> grpcBuilder = ServerBuilder.forPort(port).addService(serviceImpl);
+        int maxInboundMessageSize = config.getInt(
+                IndexingServerConfiguration.PROPERTY_GRPC_MAX_MESSAGE_SIZE,
+                IndexingServerConfiguration.PROPERTY_GRPC_MAX_MESSAGE_SIZE_DEFAULT);
+        ServerBuilder<?> grpcBuilder = ServerBuilder.forPort(port)
+                .addService(serviceImpl)
+                .maxInboundMessageSize(maxInboundMessageSize);
         java.util.Properties oidcProps = config.asProperties();
         if (OidcBootstrap.isEnabled(oidcProps)) {
             try {

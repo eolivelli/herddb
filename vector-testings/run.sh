@@ -16,6 +16,13 @@
 # specific language governing permissions and limitations
 # under the License.
 #
+# Runs the VectorBench tool; all arguments are forwarded to it. Examples:
+#   ./run.sh --dataset sift1m --rows 100000                   (default --protocol jdbc)
+#   ./run.sh --protocol grpc --grpc-endpoint localhost:9850 --dataset sift1m --rows 100000
+# With --protocol grpc the bench pushes serialized commit-log entries straight
+# into a single indexing service (indexing.log.type=push) — ingestion only,
+# no HerdDB server required.
+#
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
