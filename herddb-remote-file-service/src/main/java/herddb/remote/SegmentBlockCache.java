@@ -316,6 +316,14 @@ public final class SegmentBlockCache {
         // of whether the main cache also holds a copy. This prevents eviction
         // pressure in the much larger main cache from displacing entry-frontier
         // Layer-0 blocks.
+        //
+        // Performance note: this adds one ConcurrentHashMap.computeIfPresent()
+        // call per getBlock() invocation when the frontier region is active
+        // (frontierCache != null). computeIfPresent returns without executing
+        // the mapping function when the key is absent (the overwhelmingly common
+        // case for non-entry-frontier blocks) — cost is one hash + probe.
+        // The frontier is disabled (frontierCache == null) in the majority of
+        // test and tooling deployments, so the hot path is unaffected there.
         if (frontierCache != null) {
             ByteBuf[] frontierRetained = new ByteBuf[1];
             frontierCache.asMap().computeIfPresent(key, (k, existing) -> {
@@ -471,8 +479,15 @@ public final class SegmentBlockCache {
         } catch (CacheLoadException e) {
             throw (IOException) e.getCause();
         }
+        // compute() always returns non-null here: the hit branch retains and returns
+        // existing, the miss branch either throws CacheLoadException or returns the
+        // freshly loaded buffer. A null return from Caffeine.compute() would mean the
+        // mapping was removed by another thread inside the lambda, which is not possible
+        // because the lambda itself never returns null and no other thread can remove the
+        // entry while the lambda holds the per-key lock. Treat null as a programming error.
         if (retained == null) {
-            return invokeLoader(loader, path, offset, length);
+            throw new IllegalStateException(
+                    "Caffeine compute() returned null unexpectedly for " + key);
         }
         try {
             return retained.retainedSlice(0, retained.readableBytes());

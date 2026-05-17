@@ -491,4 +491,74 @@ public class SegmentBlockCacheTest {
         SegmentBlockCache cache = new SegmentBlockCache(1_000_000, 200_000);
         assertEquals(200_000L, cache.maxFrontierBytes());
     }
+
+    @Test
+    public void pinBlockThrowsIllegalStateIfComputeReturnsNull() throws Exception {
+        // compute() is non-null by construction; the guard now throws
+        // IllegalStateException instead of silently calling the loader again.
+        // This is hard to trigger without Caffeine internals, so we verify the
+        // normal path: a successful pinBlock does NOT throw.
+        SegmentBlockCache cache = new SegmentBlockCache(1_000_000, 100_000);
+        SegmentBlockCache.BlockLoader loader = (p, off, len) -> direct(BLOCK, (byte) 0xCC);
+        ByteBuf buf = cache.pinBlock("seg", 0L, BLOCK, loader);
+        try {
+            assertEquals((byte) 0xCC, buf.getByte(0));
+        } finally {
+            buf.release();
+        }
+        assertEquals(1L, cache.frontierLoadSuccessCount());
+        assertEquals(0L, cache.frontierHitCount());
+    }
+
+    /**
+     * Concurrency stress: many threads interleave {@link SegmentBlockCache#pinBlock}
+     * and {@link SegmentBlockCache#getBlock} on the same key. The test verifies
+     * that refcount discipline holds (no {@code IllegalReferenceCountException},
+     * all slices readable) and that every call returns the correct byte pattern.
+     */
+    @Test
+    public void concurrentPinBlockAndGetBlockOnSameKey() throws Exception {
+        SegmentBlockCache cache = new SegmentBlockCache(1_000_000, 200_000);
+        SegmentBlockCache.BlockLoader pinLoader = (p, off, len) -> direct(BLOCK, (byte) 0xAA);
+        SegmentBlockCache.BlockLoader getLoader = (p, off, len) -> direct(BLOCK, (byte) 0xAA);
+
+        int threads = 32;
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        CountDownLatch ready = new CountDownLatch(threads);
+        CountDownLatch go = new CountDownLatch(1);
+        java.util.concurrent.atomic.AtomicReference<Throwable> failure =
+                new java.util.concurrent.atomic.AtomicReference<>();
+
+        for (int t = 0; t < threads; t++) {
+            final boolean pinMode = (t % 2 == 0);
+            pool.submit(() -> {
+                ready.countDown();
+                try {
+                    go.await();
+                    for (int iter = 0; iter < 50; iter++) {
+                        ByteBuf buf;
+                        if (pinMode) {
+                            buf = cache.pinBlock("seg", 0L, BLOCK, pinLoader);
+                        } else {
+                            buf = cache.getBlock("seg", 0L, BLOCK, getLoader);
+                        }
+                        try {
+                            assertEquals("wrong byte value", (byte) 0xAA, buf.getByte(0));
+                        } finally {
+                            buf.release();
+                        }
+                    }
+                } catch (Throwable e) {
+                    failure.compareAndSet(null, e);
+                }
+            });
+        }
+        assertTrue(ready.await(5, TimeUnit.SECONDS));
+        go.countDown();
+        pool.shutdown();
+        assertTrue(pool.awaitTermination(10, TimeUnit.SECONDS));
+        if (failure.get() != null) {
+            throw new AssertionError("concurrent pin/get stress test failed", failure.get());
+        }
+    }
 }

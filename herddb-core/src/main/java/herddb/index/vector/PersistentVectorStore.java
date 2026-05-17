@@ -33,6 +33,7 @@ import herddb.utils.ByteBufDataOutput;
 import herddb.utils.Bytes;
 import herddb.utils.VectorSearchRequestContext;
 import herddb.utils.VisibleByteArrayOutputStream;
+import io.github.jbellis.jvector.disk.RandomAccessReader;
 import io.github.jbellis.jvector.disk.ReaderSupplier;
 import io.github.jbellis.jvector.graph.GraphIndexBuilder;
 import io.github.jbellis.jvector.graph.GraphSearcher;
@@ -64,10 +65,12 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.AbstractMap;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.EnumMap;
@@ -5164,7 +5167,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
      * @param approxBytesPerNode estimated bytes per graph node, used to cap the BFS
      * @param pinBytesPerSegment frontier budget; nodes visited = min(size, budget / bpn)
      */
-    private void pinSegmentBfs(VectorSegment seg, OnDiskGraphIndex odg,
+    void pinSegmentBfs(VectorSegment seg, OnDiskGraphIndex odg,
                                long approxBytesPerNode, long pinBytesPerSegment) {
         io.github.jbellis.jvector.disk.ReaderSupplier rs = seg.onDiskReaderSupplier;
         if (!(rs instanceof PinModeReaderSupplier)) {
@@ -5176,18 +5179,18 @@ public class PersistentVectorStore extends AbstractVectorStore {
             // Frontier region not configured: skip (no benefit, avoid wasted reads).
             return;
         }
-        io.github.jbellis.jvector.disk.ReaderSupplier pinSupplier = pinCapable.withPinMode();
+        ReaderSupplier pinSupplier = pinCapable.withPinMode();
         int idUpperBound = odg.getIdUpperBound();
         int nodeLimit = (int) Math.min(
                 idUpperBound,
                 Math.max(1L, pinBytesPerSegment / approxBytesPerNode));
         try {
-            io.github.jbellis.jvector.disk.RandomAccessReader pinReader = pinSupplier.get();
+            RandomAccessReader pinReader = pinSupplier.get();
             OnDiskGraphIndex.View pinView = odg.new View(pinReader);
             try {
                 ImmutableGraphIndex.NodeAtLevel entry = pinView.entryNode();
-                java.util.Set<Integer> visited = new java.util.HashSet<>();
-                java.util.ArrayDeque<Integer> queue = new java.util.ArrayDeque<>();
+                Set<Integer> visited = new HashSet<>();
+                ArrayDeque<Integer> queue = new ArrayDeque<>();
                 queue.add(entry.node);
                 visited.add(entry.node);
                 while (!queue.isEmpty() && visited.size() < nodeLimit) {
@@ -5212,7 +5215,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
             LOGGER.log(Level.WARNING,
                     "pinSegmentBfs {0}: I/O error pinning segment {1}: {2}",
                     new Object[]{indexName, seg.segmentId, e.getMessage()});
-        } catch (java.io.UncheckedIOException e) {
+        } catch (UncheckedIOException e) {
             LOGGER.log(Level.WARNING,
                     "pinSegmentBfs {0}: I/O error pinning segment {1}: {2}",
                     new Object[]{indexName, seg.segmentId,
