@@ -807,6 +807,23 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
      */
     public CompletableFuture<Void> writeFileBlockAsync(String path, long blockIndex, byte[] content) {
         Runnable releaseOnce = reserveInflightWriteBytes(content.length);
+        return writeFileBlockAsyncPreacquired(path, blockIndex, content, releaseOnce);
+    }
+
+    /**
+     * Internal helper used by {@link #writeMultipartFile}: writes one block
+     * using an already-acquired inflight-write reservation.
+     *
+     * <p>The caller acquires the reservation via {@link #reserveInflightWriteBytes}
+     * and tracks the returned {@code releaseOnce} runnable in its own list so that,
+     * when {@code writeMultipartFile} catches an exception, it can immediately
+     * release permits for every block that was dispatched but not yet complete
+     * (issue #575). The runnable is idempotent (backed by {@link
+     * java.util.concurrent.atomic.AtomicBoolean}): calling it again in the
+     * {@code whenComplete} hook of the returned future is a safe no-op.
+     */
+    private CompletableFuture<Void> writeFileBlockAsyncPreacquired(
+            String path, long blockIndex, byte[] content, Runnable releaseOnce) {
         ServerChannel ch;
         try {
             ch = writeChannelForBlock(path, blockIndex);
@@ -1028,11 +1045,22 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
      * {@code blockSizeArg}-sized blocks and dispatches each as a parallel
      * {@link #writeFileBlockAsync(String, long, byte[])} call. Returns the
      * total bytes written.
+     *
+     * <p>Issue #575: each block's inflight-write permit is acquired in this
+     * loop and tracked in {@code blockReleasers}. On any exception the catch
+     * blocks immediately call every tracked releaser so that permits are
+     * returned right away, instead of waiting for the individual block futures
+     * to time out (which can take up to {@code clientTimeoutSeconds} — up to
+     * 30 min by default). Each releaser is idempotent, so a later call from
+     * the {@code whenComplete} hook of a block future is a safe no-op.
      */
     public long writeMultipartFile(String path, InputStream in, int blockSizeArg) throws IOException {
         long total = 0;
         long blockIndex = 0;
         List<CompletableFuture<Void>> futures = new ArrayList<>();
+        // Track one releaser per dispatched block so we can return all permits
+        // immediately on failure (issue #575).
+        List<Runnable> blockReleasers = new ArrayList<>();
         byte[] buf = new byte[blockSizeArg];
         while (true) {
             int read = readFully(in, buf, 0, blockSizeArg);
@@ -1041,7 +1069,11 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
             }
             byte[] block = new byte[read];
             System.arraycopy(buf, 0, block, 0, read);
-            futures.add(writeFileBlockAsync(path, blockIndex, block));
+            // Acquire the reservation here so the caller can release it
+            // immediately on failure (see catch blocks below).
+            Runnable releaseOnce = reserveInflightWriteBytes(block.length);
+            blockReleasers.add(releaseOnce);
+            futures.add(writeFileBlockAsyncPreacquired(path, blockIndex, block, releaseOnce));
             blockIndex++;
             total += read;
             if (read < blockSizeArg) {
@@ -1052,8 +1084,17 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
             CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get();
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+            // Release permits for every block that was dispatched but has not
+            // yet completed its network call (issue #575). Releasers already
+            // fired via whenComplete are idempotent no-ops.
+            releaseBlockPermits(blockReleasers);
             throw new IOException("Interrupted while writing multipart " + path, e);
         } catch (ExecutionException e) {
+            // Release permits for every still-pending block immediately so the
+            // inflight-write semaphore is not held for the full network timeout
+            // (issue #575). Releasers that already fired via whenComplete are
+            // idempotent no-ops.
+            releaseBlockPermits(blockReleasers);
             Throwable cause = e.getCause();
             if (cause instanceof IOException) {
                 throw (IOException) cause;
@@ -1061,6 +1102,18 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
             throw new IOException("multipart write failed for " + path, cause);
         }
         return total;
+    }
+
+    /**
+     * Releases the inflight-write permits for all dispatched blocks after a
+     * {@link #writeMultipartFile} failure (issue #575). Each runnable is
+     * idempotent: if a block's {@code whenComplete} already fired and released
+     * its permits, calling the runnable again is a safe no-op.
+     */
+    private static void releaseBlockPermits(List<Runnable> blockReleasers) {
+        for (Runnable r : blockReleasers) {
+            r.run();
+        }
     }
 
     private static int readFully(InputStream in, byte[] buf, int off, int len) throws IOException {
@@ -1352,7 +1405,13 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
                 // unsolicited inbound PDUs are not expected from the server.
             };
             int socketTimeoutSeconds = 0; // disabled — request-level timeouts are enforced via sendRequestWithAsyncReply
-            Channel ch = NettyConnector.connectUsingNetwork(host, port, false,
+            // Use NettyConnector.connect (not connectUsingNetwork) so that JVM-local
+            // servers registered via LocalServerRegistry are preferred over TCP when
+            // socketTimeout <= 0. In production the remote file server runs in a
+            // separate process, so LocalServerRegistry is always empty and the call
+            // falls through to TCP. In-process tests (e.g., RemoteFileServiceClient*Test)
+            // benefit from zero-latency JVM channels without any production impact.
+            Channel ch = NettyConnector.connect(host, port, false,
                     CONNECT_TIMEOUT_MS, socketTimeoutSeconds,
                     listener, callbackExecutor, eventLoopGroup);
             try {
