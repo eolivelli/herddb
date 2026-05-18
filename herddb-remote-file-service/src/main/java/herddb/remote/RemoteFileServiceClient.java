@@ -699,6 +699,56 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
     }
 
     /**
+     * Parses a {@code ReadFile} response PDU into a new direct {@code ByteBuf}
+     * allocated from {@code allocator}. Returns {@code null} if the file was
+     * not found ({@code found == 0}). The caller owns the returned buffer and
+     * must release it when done.
+     *
+     * <p>No-leak guarantee (issue #582): if any exception is thrown after
+     * {@code buf = allocator.directBuffer(len)} has been executed, {@code buf}
+     * is released in the {@code finally} block before the exception propagates.
+     * This covers:
+     * <ul>
+     *   <li>{@code len > 0} path: {@code readContent(pdu)} calls
+     *       {@code retainedSlice(offset, len)} which throws
+     *       {@link IndexOutOfBoundsException} when the response is truncated.
+     *   <li>{@code len == 0} path: the allocation succeeds and we return
+     *       immediately; no exception can be thrown after allocation, so no
+     *       special handling is needed — but the {@code finally} guard is still
+     *       in place for completeness.
+     *   <li>{@code found == false} path: {@code buf} is never allocated;
+     *       no release is needed.
+     * </ul>
+     *
+     * <p>Package-private for direct unit testing (see
+     * {@code RemoteFileServiceClientReadFileRangeByteBufLeakTest}).
+     */
+    static ByteBuf parseReadFileResponse(Pdu pdu, PooledByteBufAllocator allocator) {
+        if (!PduCodec.ReadFileResponse.readFound(pdu)) {
+            return null;
+        }
+        int len = PduCodec.ReadFileResponse.readContentLength(pdu);
+        ByteBuf buf = allocator.directBuffer(len);
+        boolean success = false;
+        try {
+            if (len > 0) {
+                ByteBuf slice = PduCodec.ReadFileResponse.readContent(pdu);
+                try {
+                    buf.writeBytes(slice);
+                } finally {
+                    slice.release();
+                }
+            }
+            success = true;
+            return buf;
+        } finally {
+            if (!success) {
+                buf.release();
+            }
+        }
+    }
+
+    /**
      * Reads a file into a pooled ByteBuf. Returns null if the file is not
      * found. Caller must release the ByteBuf after use.
      */
@@ -727,31 +777,7 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
         }
         CompletableFuture<ByteBuf> result = sendRequest(ch,
                 requestId -> PduCodec.ReadFileRequest.write(requestId, path),
-                pdu -> {
-                    if (!PduCodec.ReadFileResponse.readFound(pdu)) {
-                        return (ByteBuf) null;
-                    }
-                    int len = PduCodec.ReadFileResponse.readContentLength(pdu);
-                    ByteBuf buf = PooledByteBufAllocator.DEFAULT.directBuffer(len);
-                    // issue #582: release buf on any exception so it is never leaked.
-                    boolean success = false;
-                    try {
-                        if (len > 0) {
-                            ByteBuf slice = PduCodec.ReadFileResponse.readContent(pdu);
-                            try {
-                                buf.writeBytes(slice);
-                            } finally {
-                                slice.release();
-                            }
-                        }
-                        success = true;
-                        return buf;
-                    } finally {
-                        if (!success) {
-                            buf.release();
-                        }
-                    }
-                });
+                pdu -> parseReadFileResponse(pdu, PooledByteBufAllocator.DEFAULT));
         return result.whenComplete((buf, err) -> releaseOnce.run());
     }
 
@@ -1010,6 +1036,49 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
         });
     }
 
+    /**
+     * Parses a {@code ReadFileRange} response PDU into a new direct
+     * {@code ByteBuf} allocated from {@code allocator}. Returns {@code null}
+     * if the requested range was not found ({@code found == 0}). The caller
+     * owns the returned buffer and must release it when done.
+     *
+     * <p>No-leak guarantee (issue #582): mirrors the contract documented on
+     * {@link #parseReadFileResponse(Pdu, PooledByteBufAllocator)}. Any
+     * exception thrown after {@code buf} is allocated — in particular
+     * {@link IndexOutOfBoundsException} from
+     * {@code PduCodec.ReadFileRangeResponse.readContent(pdu)} when the server
+     * sends a truncated response — causes the {@code finally} block to call
+     * {@code buf.release()}, preventing the buffer from leaking into the
+     * pooled allocator's unreachable set.
+     *
+     * <p>Package-private for direct unit testing (see
+     * {@code RemoteFileServiceClientReadFileRangeByteBufLeakTest}).
+     */
+    static ByteBuf parseReadFileRangeResponse(Pdu pdu, PooledByteBufAllocator allocator) {
+        if (!PduCodec.ReadFileRangeResponse.readFound(pdu)) {
+            return null;
+        }
+        int len = PduCodec.ReadFileRangeResponse.readContentLength(pdu);
+        ByteBuf buf = allocator.directBuffer(len);
+        boolean success = false;
+        try {
+            if (len > 0) {
+                ByteBuf slice = PduCodec.ReadFileRangeResponse.readContent(pdu);
+                try {
+                    buf.writeBytes(slice);
+                } finally {
+                    slice.release();
+                }
+            }
+            success = true;
+            return buf;
+        } finally {
+            if (!success) {
+                buf.release();
+            }
+        }
+    }
+
     private CompletableFuture<ByteBuf> doReadFileRangeAsByteBufAsync(String path, long offset,
                                                                      int length, int blockSizeArg) {
         // Reserve precisely the requested length (issue #246).
@@ -1030,31 +1099,7 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
         }
         CompletableFuture<ByteBuf> result = sendRequest(ch,
                 requestId -> PduCodec.ReadFileRangeRequest.write(requestId, path, offset, length, blockSizeArg),
-                pdu -> {
-                    if (!PduCodec.ReadFileRangeResponse.readFound(pdu)) {
-                        return (ByteBuf) null;
-                    }
-                    int len = PduCodec.ReadFileRangeResponse.readContentLength(pdu);
-                    ByteBuf buf = PooledByteBufAllocator.DEFAULT.directBuffer(len);
-                    // issue #582: release buf on any exception so it is never leaked.
-                    boolean success = false;
-                    try {
-                        if (len > 0) {
-                            ByteBuf slice = PduCodec.ReadFileRangeResponse.readContent(pdu);
-                            try {
-                                buf.writeBytes(slice);
-                            } finally {
-                                slice.release();
-                            }
-                        }
-                        success = true;
-                        return buf;
-                    } finally {
-                        if (!success) {
-                            buf.release();
-                        }
-                    }
-                });
+                pdu -> parseReadFileRangeResponse(pdu, PooledByteBufAllocator.DEFAULT));
         return result.whenComplete((buf, err) -> releaseOnce.run());
     }
 
