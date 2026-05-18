@@ -41,8 +41,11 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.logging.Level;
 import java.util.logging.Logger;
 import org.apache.bookkeeper.stats.NullStatsLogger;
 import org.apache.bookkeeper.stats.StatsLogger;
@@ -68,6 +71,7 @@ public class HDBClient implements AutoCloseable {
     private final boolean allowReadsFromFollowers;
     private volatile OidcTokenProvider oidcTokenProvider;
     private final Object oidcTokenProviderLock = new Object();
+    private final ScheduledExecutorService idleCheckScheduler;
 
     public HDBClient(ClientConfiguration configuration) {
         this(configuration, NullStatsLogger.INSTANCE);
@@ -130,6 +134,25 @@ public class HDBClient implements AutoCloseable {
             default:
                 throw new IllegalStateException(mode);
         }
+
+        // Schedule a periodic channelIdle() heartbeat so that per-request deadlines
+        // registered by sendRequestWithAsyncReply are actually checked.  Without this
+        // heartbeat, AbstractChannel.processPendingReplyMessagesDeadline() is never
+        // invoked and a silently-dead TCP channel hangs every in-flight CompletableFuture
+        // returned by executeUpdateAsync / executeUpdatesAsync forever (issue #586).
+        long idleCheckIntervalMs = configuration.getLong(
+                ClientConfiguration.PROPERTY_IDLE_CHECK_INTERVAL_MS,
+                ClientConfiguration.PROPERTY_IDLE_CHECK_INTERVAL_MS_DEFAULT);
+        ScheduledThreadPoolExecutor scheduler = new ScheduledThreadPoolExecutor(1, r -> {
+            Thread t = new Thread(r, "hdb-client-idle-check");
+            t.setDaemon(true);
+            return t;
+        });
+        scheduler.setRemoveOnCancelPolicy(true);
+        this.idleCheckScheduler = scheduler;
+        this.idleCheckScheduler.scheduleAtFixedRate(
+                this::tickAllConnections,
+                idleCheckIntervalMs, idleCheckIntervalMs, TimeUnit.MILLISECONDS);
     }
 
     private static MultithreadEventLoopGroup buildNetworkGroup(boolean connectRemoteServers) {
@@ -171,6 +194,7 @@ public class HDBClient implements AutoCloseable {
 
     @Override
     public void close() {
+        idleCheckScheduler.shutdown();
         List<HDBConnection> connectionsAtClose = new ArrayList<>(this.connections.values());
         for (HDBConnection connection : connectionsAtClose) {
             connection.close();
@@ -180,6 +204,33 @@ public class HDBClient implements AutoCloseable {
         }
         if (thredpool != null) {
             thredpool.shutdown();
+        }
+    }
+
+    /**
+     * Periodic heartbeat task: calls {@code channelIdle()} on every open channel owned by
+     * every open {@link HDBConnection}.  This activates
+     * {@code AbstractChannel.processPendingReplyMessagesDeadline()}, which scans
+     * {@code pendingReplyMessagesDeadline} and fails expired async-reply callbacks with
+     * IOException, preventing a silently-dead TCP channel from permanently hanging
+     * {@code executeUpdateAsync} / {@code executeUpdatesAsync} futures (issue #586).
+     *
+     * <p>The method catches {@link RuntimeException} broadly so that one misbehaving
+     * {@code channelIdle()} call cannot permanently cancel the
+     * {@code scheduleAtFixedRate} heartbeat.
+     */
+    private void tickAllConnections() {
+        try {
+            for (HDBConnection conn : connections.values()) {
+                conn.tickChannels();
+            }
+        } catch (RuntimeException e) {
+            // Catching RuntimeException broadly: if this runnable throws, scheduleAtFixedRate
+            // cancels the recurring task permanently.  Log and swallow so the heartbeat
+            // survives any single misbehaving channelIdle() invocation.
+            LOG.log(Level.WARNING,
+                    "tickAllConnections: unexpected error during idle-check tick "
+                            + "(skipping this tick; heartbeat continues on next interval)", e);
         }
     }
 

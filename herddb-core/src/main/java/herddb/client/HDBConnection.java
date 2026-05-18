@@ -106,6 +106,23 @@ public class HDBConnection implements AutoCloseable {
 
     private static final Logger LOGGER = Logger.getLogger(HDBConnection.class.getName());
 
+    /**
+     * Called by {@link HDBClient#tickAllConnections()} on every heartbeat tick.
+     * Invokes {@code channelIdle()} on every open channel so that
+     * {@code AbstractChannel.processPendingReplyMessagesDeadline()} scans for expired
+     * async-reply callbacks and fails them with IOException (issue #586).
+     */
+    void tickChannels() {
+        for (ClientSideConnectionPeer[] peers : routes.values()) {
+            for (ClientSideConnectionPeer peer : peers) {
+                herddb.network.Channel ch = peer.getChannel();
+                if (ch != null) {
+                    ch.channelIdle();
+                }
+            }
+        }
+    }
+
     public boolean waitForTableSpace(String tableSpace, int timeout) throws HDBException, ClientSideMetadataProviderException {
         long start = System.currentTimeMillis();
         while (!closed) {
