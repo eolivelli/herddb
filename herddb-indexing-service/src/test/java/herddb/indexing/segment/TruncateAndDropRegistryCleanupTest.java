@@ -24,7 +24,7 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 import herddb.core.MemoryManager;
 import herddb.file.FileDataStorageManager;
-import herddb.index.vector.PersistentVectorStore;
+import herddb.indexing.vector.PersistentVectorStore;
 import herddb.log.LogSequenceNumber;
 import herddb.utils.Bytes;
 import java.nio.file.Path;

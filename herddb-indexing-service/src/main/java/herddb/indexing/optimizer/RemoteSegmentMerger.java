@@ -19,7 +19,7 @@
  */
 package herddb.indexing.optimizer;
 
-import herddb.index.vector.RemoteSegmentGraphMerger;
+import herddb.indexing.vector.RemoteSegmentGraphMerger;
 import herddb.indexing.segment.SegmentMetadata;
 import herddb.indexing.segment.SegmentState;
 import herddb.indexing.segment.TombstoneOverlay;

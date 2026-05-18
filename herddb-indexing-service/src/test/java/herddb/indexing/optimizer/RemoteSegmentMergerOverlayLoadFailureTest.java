@@ -76,13 +76,13 @@ public class RemoteSegmentMergerOverlayLoadFailureTest {
         tmpDir = tmp.newFolder("merger-tmp").toPath();
         // Issue #485: this suite uses synthetic inputs with no real graph
         // multipart file. Force the legacy in-memory rebuild path.
-        savedStreamingFlag = herddb.index.vector.PersistentVectorStore.isStreamingCompactionEnabled();
-        herddb.index.vector.PersistentVectorStore.setStreamingCompactionEnabled(false);
+        savedStreamingFlag = herddb.indexing.vector.PersistentVectorStore.isStreamingCompactionEnabled();
+        herddb.indexing.vector.PersistentVectorStore.setStreamingCompactionEnabled(false);
     }
 
     @org.junit.After
     public void tearDown() {
-        herddb.index.vector.PersistentVectorStore.setStreamingCompactionEnabled(savedStreamingFlag);
+        herddb.indexing.vector.PersistentVectorStore.setStreamingCompactionEnabled(savedStreamingFlag);
     }
 
     private SegmentMetadata writeInput(String segUuid, long segId, int seed,

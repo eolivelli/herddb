@@ -46,7 +46,7 @@ import org.junit.Test;
  * {@link OwnershipTransfer}, and asserts that the watchers fire the right
  * events in the right order. Simulates the "open segment locally" / "close
  * segment locally" actions with simple counters rather than real
- * {@link herddb.index.vector.PersistentVectorStore} integration — that wiring
+ * {@link herddb.indexing.vector.PersistentVectorStore} integration — that wiring
  * is exercised in step 5+.
  */
 public class SegmentOwnershipTransferTest {

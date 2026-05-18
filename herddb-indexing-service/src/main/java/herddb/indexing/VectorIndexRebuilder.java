@@ -20,8 +20,8 @@
 package herddb.indexing;
 
 import herddb.codec.DataAccessorForFullRecord;
-import herddb.index.vector.AbstractVectorStore;
-import herddb.index.vector.PersistentVectorStore;
+import herddb.indexing.vector.AbstractVectorStore;
+import herddb.indexing.vector.PersistentVectorStore;
 import herddb.index.vector.VectorIndexManager;
 import herddb.log.LogSequenceNumber;
 import herddb.model.Index;

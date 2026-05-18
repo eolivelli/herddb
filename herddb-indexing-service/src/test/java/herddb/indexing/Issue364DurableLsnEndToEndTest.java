@@ -26,7 +26,7 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 import herddb.codec.RecordSerializer;
 import herddb.core.MemoryManager;
-import herddb.index.vector.PersistentVectorStore;
+import herddb.indexing.vector.PersistentVectorStore;
 import herddb.log.LogEntry;
 import herddb.log.LogEntryFactory;
 import herddb.log.LogSequenceNumber;

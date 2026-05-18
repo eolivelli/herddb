@@ -233,7 +233,7 @@ public class IndexOptimizerMainConfigTest {
     @Test
     public void optimizerHonorsStreamingCompactionConfigKey() throws Exception {
         boolean originalFlag =
-                herddb.index.vector.PersistentVectorStore.isStreamingCompactionEnabled();
+                herddb.indexing.vector.PersistentVectorStore.isStreamingCompactionEnabled();
         try {
             // Set the key to false and assert the static was flipped after start().
             Properties propsOff = baseProps();
@@ -245,7 +245,7 @@ public class IndexOptimizerMainConfigTest {
                 mainOff.start();
                 assertEquals("streaming flag must be false after start() with config key=false",
                         false,
-                        herddb.index.vector.PersistentVectorStore.isStreamingCompactionEnabled());
+                        herddb.indexing.vector.PersistentVectorStore.isStreamingCompactionEnabled());
             } finally {
                 mainOff.shutdown();
             }
@@ -260,7 +260,7 @@ public class IndexOptimizerMainConfigTest {
                 mainOn.start();
                 assertEquals("streaming flag must be true after start() with config key=true",
                         true,
-                        herddb.index.vector.PersistentVectorStore.isStreamingCompactionEnabled());
+                        herddb.indexing.vector.PersistentVectorStore.isStreamingCompactionEnabled());
             } finally {
                 mainOn.shutdown();
             }
@@ -274,12 +274,12 @@ public class IndexOptimizerMainConfigTest {
                 mainDefault.start();
                 assertEquals("streaming flag must default to true when key is absent",
                         true,
-                        herddb.index.vector.PersistentVectorStore.isStreamingCompactionEnabled());
+                        herddb.indexing.vector.PersistentVectorStore.isStreamingCompactionEnabled());
             } finally {
                 mainDefault.shutdown();
             }
         } finally {
-            herddb.index.vector.PersistentVectorStore.setStreamingCompactionEnabled(originalFlag);
+            herddb.indexing.vector.PersistentVectorStore.setStreamingCompactionEnabled(originalFlag);
         }
     }
 }

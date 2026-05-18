@@ -24,7 +24,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertTrue;
 import herddb.core.MemoryManager;
-import herddb.index.vector.PersistentVectorStore;
+import herddb.indexing.vector.PersistentVectorStore;
 import herddb.log.LogSequenceNumber;
 import herddb.mem.MemoryDataStorageManager;
 import herddb.storage.IndexStatus;

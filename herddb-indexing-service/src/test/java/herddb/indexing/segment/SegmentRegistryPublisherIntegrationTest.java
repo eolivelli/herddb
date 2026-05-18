@@ -25,7 +25,7 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 import herddb.core.MemoryManager;
 import herddb.file.FileDataStorageManager;
-import herddb.index.vector.PersistentVectorStore;
+import herddb.indexing.vector.PersistentVectorStore;
 import herddb.utils.Bytes;
 import java.nio.file.Path;
 import java.util.List;
@@ -207,14 +207,14 @@ public class SegmentRegistryPublisherIntegrationTest {
         dsm.initTablespace(TABLE_SPACE);
 
         // A publisher that always blows up. The checkpoint must still succeed.
-        herddb.index.vector.SegmentPublisher faulty = new herddb.index.vector.SegmentPublisher() {
+        herddb.indexing.vector.SegmentPublisher faulty = new herddb.indexing.vector.SegmentPublisher() {
             @Override
-            public void stageNewSegments(java.util.List<herddb.index.vector.NewSegmentInfo> segments) {
+            public void stageNewSegments(java.util.List<herddb.indexing.vector.NewSegmentInfo> segments) {
                 throw new RuntimeException("simulated publisher failure");
             }
 
             @Override
-            public void commitStagedSegments(java.util.List<herddb.index.vector.NewSegmentInfo> segments) {
+            public void commitStagedSegments(java.util.List<herddb.indexing.vector.NewSegmentInfo> segments) {
                 throw new RuntimeException("simulated publisher failure");
             }
         };

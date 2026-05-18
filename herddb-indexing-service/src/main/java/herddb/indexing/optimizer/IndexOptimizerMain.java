@@ -288,7 +288,7 @@ public final class IndexOptimizerMain {
         boolean streamingEnabled = configuration.getBoolean(
                 OptimizerConfiguration.PROPERTY_MERGE_STREAMING_ENABLED,
                 OptimizerConfiguration.PROPERTY_MERGE_STREAMING_ENABLED_DEFAULT);
-        herddb.index.vector.PersistentVectorStore.setStreamingCompactionEnabled(streamingEnabled);
+        herddb.indexing.vector.PersistentVectorStore.setStreamingCompactionEnabled(streamingEnabled);
         LOGGER.log(Level.INFO,
                 "optimizer-pod streaming compaction: enabled={0} (config key {1})",
                 new Object[]{streamingEnabled,

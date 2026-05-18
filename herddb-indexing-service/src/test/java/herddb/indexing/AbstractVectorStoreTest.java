@@ -23,7 +23,7 @@ package herddb.indexing;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertTrue;
-import herddb.index.vector.AbstractVectorStore;
+import herddb.indexing.vector.AbstractVectorStore;
 import herddb.utils.Bytes;
 import java.util.List;
 import java.util.Map;

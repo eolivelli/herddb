@@ -31,7 +31,7 @@ import java.util.function.Predicate;
 /**
  * Decides which {@code ACTIVE} segments to merge on a given tick.
  *
- * <p>Mirrors the logic of {@code herddb.index.vector.VectorIndexCompactor#chooseSegmentsToMerge}
+ * <p>Mirrors the logic of {@code herddb.indexing.vector.VectorIndexCompactor#chooseSegmentsToMerge}
  * but operates on {@link VersionedSegmentMetadata} from the registry (no
  * in-memory {@code VectorSegment}s, since the optimizer doesn't have those).
  *

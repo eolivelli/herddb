@@ -25,7 +25,7 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 import herddb.core.MemoryManager;
-import herddb.index.vector.PersistentVectorStore;
+import herddb.indexing.vector.PersistentVectorStore;
 import herddb.mem.MemoryDataStorageManager;
 import herddb.storage.DataStorageManagerException;
 import herddb.utils.Bytes;

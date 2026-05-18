@@ -30,7 +30,7 @@ import java.util.List;
  *
  * <p>Implementations:
  * <ul>
- *   <li>The production implementation will reuse {@link herddb.index.vector.VectorIndexCompactor}
+ *   <li>The production implementation will reuse {@link herddb.indexing.vector.VectorIndexCompactor}
  *       once that code path is extracted from PersistentVectorStore (out of
  *       scope for the initial step 5 MVP).</li>
  *   <li>{@link InMemorySegmentMerger} (in tests) performs no graph work but

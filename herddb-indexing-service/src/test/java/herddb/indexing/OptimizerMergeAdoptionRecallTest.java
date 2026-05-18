@@ -24,7 +24,7 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 import herddb.core.MemoryManager;
 import herddb.file.FileDataStorageManager;
-import herddb.index.vector.PersistentVectorStore;
+import herddb.indexing.vector.PersistentVectorStore;
 import herddb.indexing.optimizer.IndexMergeConfig;
 import herddb.indexing.optimizer.IndexOptimizerEngine;
 import herddb.indexing.optimizer.MergePolicy;

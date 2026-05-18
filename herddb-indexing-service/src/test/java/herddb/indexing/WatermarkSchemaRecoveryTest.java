@@ -25,7 +25,7 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import herddb.codec.RecordSerializer;
-import herddb.index.vector.AbstractVectorStore;
+import herddb.indexing.vector.AbstractVectorStore;
 import herddb.log.LogEntry;
 import herddb.log.LogEntryFactory;
 import herddb.log.LogSequenceNumber;
@@ -473,7 +473,7 @@ public class WatermarkSchemaRecoveryTest {
      * An {@link InMemoryVectorStore} subclass that reports a fixed UUID via
      * {@link AbstractVectorStore#getStoreUUID()}.  Used to test the
      * {@link IndexingServiceEngine#PROP_IS_STORE_UUID} embedding path without
-     * requiring a full {@link herddb.index.vector.PersistentVectorStore}.
+     * requiring a full {@link herddb.indexing.vector.PersistentVectorStore}.
      */
     private static final class UUIDReportingVectorStore extends InMemoryVectorStore {
         private final String uuid;
@@ -500,7 +500,7 @@ public class WatermarkSchemaRecoveryTest {
      *       {@code indexProperties}.  The recorded UUID must equal the one
      *       embedded in the snapshot by Engine A — proving that a restarting
      *       engine passes the persisted UUID to the vector store factory so
-     *       that a {@link herddb.index.vector.PersistentVectorStore} can
+     *       that a {@link herddb.indexing.vector.PersistentVectorStore} can
      *       locate its existing S3 checkpoint.</li>
      * </ol>
      */

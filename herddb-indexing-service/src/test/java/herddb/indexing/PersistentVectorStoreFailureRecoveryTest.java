@@ -26,7 +26,7 @@ import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 import herddb.core.MemoryManager;
-import herddb.index.vector.PersistentVectorStore;
+import herddb.indexing.vector.PersistentVectorStore;
 import herddb.mem.MemoryDataStorageManager;
 import herddb.storage.DataStorageManagerException;
 import herddb.utils.Bytes;
@@ -463,7 +463,7 @@ public class PersistentVectorStoreFailureRecoveryTest {
                 } catch (Exception expected) {
                 }
                 assertEquals(i, store.getConsecutiveCheckpointFailures());
-                long backoff = herddb.index.vector.PersistentVectorStore.computeBackoffMs(
+                long backoff = herddb.indexing.vector.PersistentVectorStore.computeBackoffMs(
                         60_000L, store.getConsecutiveCheckpointFailures(),
                         30L * 60 * 1000);
                 assertTrue("backoff must grow across failures (was " + prevBackoff

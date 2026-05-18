@@ -19,8 +19,8 @@
  */
 package herddb.indexing.segment;
 
-import herddb.index.vector.NewSegmentInfo;
-import herddb.index.vector.SegmentPublisher;
+import herddb.indexing.vector.NewSegmentInfo;
+import herddb.indexing.vector.SegmentPublisher;
 import java.util.List;
 import java.util.Objects;
 import java.util.function.LongSupplier;
@@ -29,12 +29,12 @@ import java.util.logging.Logger;
 
 /**
  * Adapter that wires {@link SegmentPublisher} (called by
- * {@link herddb.index.vector.PersistentVectorStore} after each successful
+ * {@link herddb.indexing.vector.PersistentVectorStore} after each successful
  * checkpoint) to a {@link SegmentRegistryClient}, registering every freshly-emitted
  * segment as ACTIVE owned by the local IS instance.
  *
  * <p>The UUID is taken from {@link NewSegmentInfo#getSegmentUuid()} — it must already
- * have been stamped by {@link herddb.index.vector.PersistentVectorStore} during Phase B
+ * have been stamped by {@link herddb.indexing.vector.PersistentVectorStore} during Phase B
  * BEFORE IndexStatus is persisted, so the same UUID survives a restart and we cannot
  * double-register the same physical segment file (review item A2). The publisher never
  * mints UUIDs of its own.

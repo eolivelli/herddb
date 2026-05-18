@@ -22,7 +22,7 @@ package herddb.indexing;
 
 import static org.junit.Assert.assertTrue;
 import herddb.core.MemoryManager;
-import herddb.index.vector.PersistentVectorStore;
+import herddb.indexing.vector.PersistentVectorStore;
 import herddb.mem.MemoryDataStorageManager;
 import herddb.utils.Bytes;
 import io.github.jbellis.jvector.vector.VectorSimilarityFunction;
@@ -35,7 +35,7 @@ import org.junit.rules.TemporaryFolder;
 /**
  * Verifies that {@link PersistentVectorStore#getOnDiskSegmentsEstimatedMemoryBytes()}
  * (and by extension {@link PersistentVectorStore#estimatedMemoryUsageBytes()}) includes
- * the in-memory footprint of on-disk {@link herddb.index.vector.VectorSegment} objects
+ * the in-memory footprint of on-disk {@link herddb.indexing.vector.VectorSegment} objects
  * after a checkpoint (issue #360).
  *
  * <p>Before the fix, {@code estimatedMemoryUsageBytes()} only summed the live /
