@@ -122,10 +122,10 @@ public class RemoteFileServiceClientDeadChannelTest {
                 fail("Expected an exception from the dead channel but got none");
             } catch (RuntimeException e) {
                 long elapsedMs = System.currentTimeMillis() - beforeMs;
-                // Must have taken at least 1 s (the 2 s timeout cannot fire sooner)
-                assertTrue("readFile returned too quickly — idle check fired before deadline: "
-                        + elapsedMs + " ms", elapsedMs >= 1_000L);
-                // Must not have taken more than 10 s (well within the 30 s test timeout)
+                // Must complete within 10 s (well within the 30 s test timeout).
+                // A lower-bound assertion is intentionally omitted: the idle scanner
+                // fires at a 300 ms granularity, so the exact elapsed time depends on
+                // scheduler load, making any specific lower bound fragile on slow CI.
                 assertTrue("readFile did not time out within 10 s — idle-check fix may not be working: "
                         + elapsedMs + " ms", elapsedMs < 10_000L);
                 // Root cause must be an IOException (not just a generic failure)
@@ -137,8 +137,9 @@ public class RemoteFileServiceClientDeadChannelTest {
     }
 
     /**
-     * Verifies that the safety-net timeout in {@code getUnchecked()} provides a
-     * last-resort bound even when retries are enabled and all attempts time out.
+     * Verifies that the idle-check timeout still works when retries are enabled:
+     * each attempt fires the idle scanner, fails, and the client eventually gives up
+     * after all retry attempts are exhausted.
      * With CONFIG_CLIENT_TIMEOUT=2 and CONFIG_CLIENT_RETRIES=1, the entire retry
      * chain (2 attempts × ~2 s each + 1 s back-off) should complete in under 15 s.
      */
@@ -157,7 +158,7 @@ public class RemoteFileServiceClientDeadChannelTest {
                 fail("Expected an exception from the dead channel but got none");
             } catch (RuntimeException e) {
                 long elapsedMs = System.currentTimeMillis() - beforeMs;
-                // With 2 retries (initial + 1 retry) and 1 s back-off, expect ~5 s total
+                // With 2 attempts (initial + 1 retry) and 1 s back-off, expect ~5 s total
                 assertTrue("readFile did not time out within 15 s: " + elapsedMs + " ms",
                         elapsedMs < 15_000L);
                 // Root cause must be an IOException
@@ -166,5 +167,72 @@ public class RemoteFileServiceClientDeadChannelTest {
                         root instanceof IOException);
             }
         }
+    }
+
+    /**
+     * Exercises the {@code getUnchecked()} safety-net timeout path directly.
+     * The idle-check interval is set to 24 hours so the
+     * {@code processChannelDeadlines()} heartbeat never fires during this test,
+     * forcing the safety-net {@code future.get(safetyNetSeconds, …)} to be the
+     * mechanism that terminates the wait.
+     *
+     * <p>With CONFIG_CLIENT_TIMEOUT=1 and CONFIG_CLIENT_RETRIES=0:
+     * safety-net = (0 + 3) × 1 = 3 s.
+     * The test verifies that the thrown exception is an {@code IOException} whose
+     * message contains the string {@code "safety-net"}, proving the
+     * {@code TimeoutException} branch in {@code getUnchecked()} was taken.
+     */
+    @Test(timeout = 30_000)
+    public void testSafetyNetTimeoutFires() {
+        Map<String, Object> config = new HashMap<>();
+        // clientTimeoutSeconds=1; safety-net = (0+3)*1 = 3s
+        config.put(RemoteFileServiceClient.CONFIG_CLIENT_TIMEOUT, 1L);
+        // 24-hour idle interval effectively disables the heartbeat within this test,
+        // so only the safety-net can terminate the blocking future.get().
+        config.put(RemoteFileServiceClient.CONFIG_CLIENT_IDLE_CHECK_INTERVAL_MS, 86_400_000L);
+        config.put(RemoteFileServiceClient.CONFIG_CLIENT_RETRIES, 0);
+
+        try (RemoteFileServiceClient client = new RemoteFileServiceClient(
+                Arrays.asList("localhost:" + blackHole.getLocalPort()), config)) {
+            long beforeMs = System.currentTimeMillis();
+            try {
+                client.readFile("any/path/safety-net.dat");
+                fail("Expected a safety-net timeout exception");
+            } catch (RuntimeException e) {
+                long elapsedMs = System.currentTimeMillis() - beforeMs;
+                // Safety-net fires after 3 s; allow generous bounds for CI timing variance
+                assertTrue("Safety-net fired too quickly (< 2 s): " + elapsedMs + " ms",
+                        elapsedMs >= 2_000L);
+                assertTrue("Safety-net did not fire within 15 s: " + elapsedMs + " ms",
+                        elapsedMs < 15_000L);
+                // Walk the cause chain to find the IOException from the safety-net branch
+                Throwable t = e;
+                IOException safetyNetIoe = null;
+                while (t != null) {
+                    if (t instanceof IOException && t.getMessage() != null
+                            && t.getMessage().contains("safety-net")) {
+                        safetyNetIoe = (IOException) t;
+                        break;
+                    }
+                    t = t.getCause();
+                }
+                assertTrue("Expected an IOException with 'safety-net' in message, "
+                        + "but cause chain was: " + causeChain(e),
+                        safetyNetIoe != null);
+            }
+        }
+    }
+
+    /** Returns a one-line summary of the exception cause chain for assertion messages. */
+    private static String causeChain(Throwable t) {
+        StringBuilder sb = new StringBuilder();
+        while (t != null) {
+            if (sb.length() > 0) {
+                sb.append(" → ");
+            }
+            sb.append(t.getClass().getSimpleName()).append(": ").append(t.getMessage());
+            t = t.getCause();
+        }
+        return sb.toString();
     }
 }

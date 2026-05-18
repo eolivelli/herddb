@@ -1683,23 +1683,42 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
      * <p>The {@code current} channel field is read with a volatile load (no lock).
      * If the channel is swapped or nulled concurrently, the worst case is a
      * no-op call on a closed channel, which is safe.
+     *
+     * <p><b>Exception handling:</b> the body is wrapped in a broad {@code RuntimeException}
+     * catch. This is required because {@code scheduleAtFixedRate} permanently cancels a
+     * recurring task when its {@code Runnable} throws any unchecked exception. A single
+     * rogue {@code channelIdle()} call (e.g. due to an internal Netty bug or a race
+     * during channel close) must not silently kill the heartbeat for the lifetime of this
+     * client, as that would re-introduce the indefinite-hang of issue #584.
      */
     private void processChannelDeadlines() {
-        ServerSnapshot s = snapshot;
-        if (s == null) {
-            return;
-        }
-        for (ServerChannel sc : s.readChannels.values()) {
-            Channel ch = sc.current; // volatile read
-            if (ch != null) {
-                ch.channelIdle();
+        try {
+            ServerSnapshot s = snapshot;
+            if (s == null) {
+                return;
             }
-        }
-        for (ServerChannel sc : s.writeChannels.values()) {
-            Channel ch = sc.current; // volatile read
-            if (ch != null) {
-                ch.channelIdle();
+            for (ServerChannel sc : s.readChannels.values()) {
+                Channel ch = sc.current; // volatile read
+                if (ch != null) {
+                    ch.channelIdle();
+                }
             }
+            for (ServerChannel sc : s.writeChannels.values()) {
+                Channel ch = sc.current; // volatile read
+                if (ch != null) {
+                    ch.channelIdle();
+                }
+            }
+        } catch (RuntimeException e) {
+            // Catching RuntimeException broadly so that a single failing channelIdle()
+            // invocation does not permanently cancel the scheduleAtFixedRate heartbeat.
+            // Any such failure means one idle-check tick is skipped; the scanner resumes
+            // on the next interval. A broad catch is required because Channel.channelIdle()
+            // internally closes channels and fires callbacks whose exception behaviour is
+            // implementation-defined (see AbstractChannel.processPendingReplyMessagesDeadline).
+            LOGGER.log(Level.WARNING,
+                    "processChannelDeadlines: unexpected error during idle-check tick "
+                            + "(skipping this tick, heartbeat continues on next interval)", e);
         }
     }
 
@@ -1758,21 +1777,36 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
     /**
      * Synchronously unwraps the result of a {@link CompletableFuture}.
      *
-     * <p>A safety-net deadline of {@code (maxRetries + 2) × clientTimeoutSeconds} is applied to
-     * prevent an indefinite block when the underlying async machinery fails to complete the future
-     * (e.g. if the idle-check mechanism were somehow bypassed or disabled). The primary per-request
-     * timeout is enforced by the periodic {@link #processChannelDeadlines()} task through
-     * {@link herddb.network.netty.AbstractChannel#processPendingReplyMessagesDeadline()}; the
-     * safety-net timeout is intentionally generous so it never fires under normal operating
-     * conditions, including full retry chains with exponential back-off (issue #584).
+     * <p>A safety-net deadline is applied to prevent an indefinite block when the underlying
+     * async machinery fails to complete the future (e.g. if the idle-check mechanism were
+     * somehow bypassed or disabled). The primary per-request timeout is enforced by the periodic
+     * {@link #processChannelDeadlines()} task through
+     * {@link herddb.network.netty.AbstractChannel#processPendingReplyMessagesDeadline()}
+     * (issue #584).
+     *
+     * <p>Safety-net formula: {@code (maxRetries + 3) × clientTimeoutSeconds}.
+     * The multiplier {@code (maxRetries + 3)} comfortably exceeds the worst-case full retry
+     * chain cost of {@code (maxRetries + 1) × (clientTimeoutSeconds + idleCheckIntervalMs/1000s)}
+     * plus exponential back-off {@code (2^maxRetries − 1) s}, provided
+     * {@code idleCheckIntervalMs} is tuned to a reasonable fraction of {@code clientTimeoutSeconds}
+     * (the default 30 s interval is well below the default 1800 s timeout). The safety net is
+     * intentionally generous so it never fires during normal retry chains; it is a last-resort
+     * guard only.
      */
     private <T> T getUnchecked(CompletableFuture<T> future) {
+        // Compute once outside try/catch so both branches use the same value.
+        long safetyNetSeconds = (maxRetries + 3L) * clientTimeoutSeconds;
         try {
-            long safetyNetSeconds = (maxRetries + 2L) * clientTimeoutSeconds;
             return future.get(safetyNetSeconds, TimeUnit.SECONDS);
         } catch (TimeoutException e) {
+            // future.cancel(true) marks the outer CompletableFuture as cancelled but does NOT
+            // interrupt the in-flight Netty request or any pending retryScheduler retry tasks;
+            // cleanup of those is delegated to the processChannelDeadlines() heartbeat which will
+            // eventually close the dead channel and complete orphaned futures exceptionally.
+            // No ByteBuf leak: request ByteBufs are consumed by Channel.writeAndFlush; response
+            // ByteBufs are released in the sendRequest() callback's finally block regardless of
+            // the outer future's cancellation state.
             future.cancel(true);
-            long safetyNetSeconds = (maxRetries + 2L) * clientTimeoutSeconds;
             throw new CompletionException(
                     new IOException("remote file operation did not complete within the safety-net "
                             + "timeout of " + safetyNetSeconds + "s — per-request deadline "
