@@ -58,6 +58,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
@@ -119,6 +120,16 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
      */
     public static final String CONFIG_CLIENT_MAX_INFLIGHT_WRITE_BYTES =
             "remote.file.client.max.inflight.write.bytes";
+    /**
+     * Configuration key for the interval (in milliseconds) between periodic
+     * {@link herddb.network.Channel#channelIdle()} calls that drive
+     * {@link herddb.network.netty.AbstractChannel#processPendingReplyMessagesDeadline()}.
+     * Without this heartbeat, per-request deadlines registered by
+     * {@link herddb.network.Channel#sendRequestWithAsyncReply} are never
+     * checked and a silently-dead TCP channel hangs forever (issue #584).
+     */
+    public static final String CONFIG_CLIENT_IDLE_CHECK_INTERVAL_MS =
+            "remote.file.client.idle.check.interval.ms";
 
     private static final long DEFAULT_CLIENT_TIMEOUT_SECONDS = 1800; // 30 minutes
     private static final int DEFAULT_CLIENT_RETRIES = 10;
@@ -138,6 +149,16 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
      * {@code acquireUninterruptibly} call.
      */
     public static final long DEFAULT_CLIENT_MAX_INFLIGHT_WRITE_BYTES = 256L * 1024 * 1024;
+    /**
+     * Default idle-check interval: 30 seconds.
+     * <p>The idle check calls {@link herddb.network.Channel#channelIdle()} on
+     * every open channel, which triggers deadline scanning in
+     * {@link herddb.network.netty.AbstractChannel#processPendingReplyMessagesDeadline()}.
+     * Setting this shorter speeds up detection of dead channels at the cost of
+     * a tiny periodic wakeup on the retry scheduler thread.
+     */
+    private static final long DEFAULT_IDLE_CHECK_INTERVAL_MS = 30_000L;
+
     /**
      * Emit a WARNING log line if acquiring the in-flight reservation
      * blocks for longer than this threshold.
@@ -180,6 +201,12 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
     private final Semaphore inflightWriteBytes;
     private final ScheduledExecutorService retryScheduler;
     private final Supplier<String> oidcTokenSupplier;
+
+    /**
+     * Interval in milliseconds between periodic {@link #processChannelDeadlines()} calls.
+     * Configurable via {@link #CONFIG_CLIENT_IDLE_CHECK_INTERVAL_MS}.
+     */
+    private final long idleCheckIntervalMs;
 
     // Netty plumbing reused across all ServerChannels.
     private final MultithreadEventLoopGroup eventLoopGroup;
@@ -248,11 +275,21 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
                 ? Integer.MAX_VALUE
                 : (int) maxInflightWriteBytes;
         this.inflightWriteBytes = new Semaphore(this.writePermits);
+        this.idleCheckIntervalMs = longConfig(configuration, CONFIG_CLIENT_IDLE_CHECK_INTERVAL_MS,
+                DEFAULT_IDLE_CHECK_INTERVAL_MS);
         this.retryScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
             FastThreadLocalThread t = new FastThreadLocalThread(r, "remote-file-retry");
             t.setDaemon(true);
             return t;
         });
+        // Schedule periodic channelIdle() calls so that per-request deadlines registered by
+        // sendRequestWithAsyncReply are actually checked. Without this heartbeat,
+        // AbstractChannel.processPendingReplyMessagesDeadline() is never invoked and a
+        // silently-dead TCP channel (no FIN/RST from the peer) hangs every in-flight
+        // CompletableFuture forever (issue #584).
+        this.retryScheduler.scheduleAtFixedRate(
+                this::processChannelDeadlines,
+                idleCheckIntervalMs, idleCheckIntervalMs, TimeUnit.MILLISECONDS);
         this.eventLoopGroup = buildEventLoopGroup();
         this.callbackExecutor = buildCallbackExecutor();
 
@@ -1632,6 +1669,59 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
         CompletableFuture<T> execute();
     }
 
+    /**
+     * Calls {@link Channel#channelIdle()} on every currently-open channel so that
+     * {@link herddb.network.netty.AbstractChannel#processPendingReplyMessagesDeadline()}
+     * runs and can expire any requests that have exceeded their per-request deadline.
+     *
+     * <p>This method is invoked periodically by the retry scheduler (every
+     * {@link #idleCheckIntervalMs} milliseconds). Before this fix (issue #584),
+     * {@code channelIdle()} was never called from anywhere, making the deadline
+     * mechanism dead code and allowing a silently-dead TCP channel to block
+     * CompletableFutures forever.
+     *
+     * <p>The {@code current} channel field is read with a volatile load (no lock).
+     * If the channel is swapped or nulled concurrently, the worst case is a
+     * no-op call on a closed channel, which is safe.
+     *
+     * <p><b>Exception handling:</b> the body is wrapped in a broad {@code RuntimeException}
+     * catch. This is required because {@code scheduleAtFixedRate} permanently cancels a
+     * recurring task when its {@code Runnable} throws any unchecked exception. A single
+     * rogue {@code channelIdle()} call (e.g. due to an internal Netty bug or a race
+     * during channel close) must not silently kill the heartbeat for the lifetime of this
+     * client, as that would re-introduce the indefinite-hang of issue #584.
+     */
+    private void processChannelDeadlines() {
+        try {
+            ServerSnapshot s = snapshot;
+            if (s == null) {
+                return;
+            }
+            for (ServerChannel sc : s.readChannels.values()) {
+                Channel ch = sc.current; // volatile read
+                if (ch != null) {
+                    ch.channelIdle();
+                }
+            }
+            for (ServerChannel sc : s.writeChannels.values()) {
+                Channel ch = sc.current; // volatile read
+                if (ch != null) {
+                    ch.channelIdle();
+                }
+            }
+        } catch (RuntimeException e) {
+            // Catching RuntimeException broadly so that a single failing channelIdle()
+            // invocation does not permanently cancel the scheduleAtFixedRate heartbeat.
+            // Any such failure means one idle-check tick is skipped; the scanner resumes
+            // on the next interval. A broad catch is required because Channel.channelIdle()
+            // internally closes channels and fires callbacks whose exception behaviour is
+            // implementation-defined (see AbstractChannel.processPendingReplyMessagesDeadline).
+            LOGGER.log(Level.WARNING,
+                    "processChannelDeadlines: unexpected error during idle-check tick "
+                            + "(skipping this tick, heartbeat continues on next interval)", e);
+        }
+    }
+
     private <T> CompletableFuture<T> retryAsync(AsyncAction<T> action, String opName, String path, int attempt) {
         CompletableFuture<T> result = new CompletableFuture<>();
         CompletableFuture<T> actionResult;
@@ -1684,9 +1774,43 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
     // Internal helpers
     // ---------------------------------------------------------------------
 
-    private static <T> T getUnchecked(CompletableFuture<T> future) {
+    /**
+     * Synchronously unwraps the result of a {@link CompletableFuture}.
+     *
+     * <p>A safety-net deadline is applied to prevent an indefinite block when the underlying
+     * async machinery fails to complete the future (e.g. if the idle-check mechanism were
+     * somehow bypassed or disabled). The primary per-request timeout is enforced by the periodic
+     * {@link #processChannelDeadlines()} task through
+     * {@link herddb.network.netty.AbstractChannel#processPendingReplyMessagesDeadline()}
+     * (issue #584).
+     *
+     * <p>Safety-net formula: {@code (maxRetries + 3) × clientTimeoutSeconds}.
+     * The multiplier {@code (maxRetries + 3)} comfortably exceeds the worst-case full retry
+     * chain cost of {@code (maxRetries + 1) × (clientTimeoutSeconds + idleCheckIntervalMs/1000s)}
+     * plus exponential back-off {@code (2^maxRetries − 1) s}, provided
+     * {@code idleCheckIntervalMs} is tuned to a reasonable fraction of {@code clientTimeoutSeconds}
+     * (the default 30 s interval is well below the default 1800 s timeout). The safety net is
+     * intentionally generous so it never fires during normal retry chains; it is a last-resort
+     * guard only.
+     */
+    private <T> T getUnchecked(CompletableFuture<T> future) {
+        // Compute once outside try/catch so both branches use the same value.
+        long safetyNetSeconds = (maxRetries + 3L) * clientTimeoutSeconds;
         try {
-            return future.get();
+            return future.get(safetyNetSeconds, TimeUnit.SECONDS);
+        } catch (TimeoutException e) {
+            // future.cancel(true) marks the outer CompletableFuture as cancelled but does NOT
+            // interrupt the in-flight Netty request or any pending retryScheduler retry tasks;
+            // cleanup of those is delegated to the processChannelDeadlines() heartbeat which will
+            // eventually close the dead channel and complete orphaned futures exceptionally.
+            // No ByteBuf leak: request ByteBufs are consumed by Channel.writeAndFlush; response
+            // ByteBufs are released in the sendRequest() callback's finally block regardless of
+            // the outer future's cancellation state.
+            future.cancel(true);
+            throw new CompletionException(
+                    new IOException("remote file operation did not complete within the safety-net "
+                            + "timeout of " + safetyNetSeconds + "s — per-request deadline "
+                            + "mechanism may be impaired", e));
         } catch (ExecutionException e) {
             Throwable cause = e.getCause();
             if (cause instanceof RuntimeException) {
