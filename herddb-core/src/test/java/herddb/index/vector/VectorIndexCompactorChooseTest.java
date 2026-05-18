@@ -261,11 +261,13 @@ public class VectorIndexCompactorChooseTest {
     }
 
     /**
-     * The cap also applies to the micro-segment fast-path result (issue #570):
-     * a large set of micro-segments is truncated to {@code maxInputs}.
+     * The cap deliberately does NOT apply to the micro-segment fast path
+     * (issue #570): that path must stay a fast slot-reclaiming cycle, so a
+     * large set of micro-segments is returned in full even when it exceeds
+     * {@code maxInputs}.
      */
     @Test
-    public void maxInputsCapsMicroSegmentPath() {
+    public void microSegmentPathIsNotCapped() {
         List<VectorSegment> cand = new ArrayList<>();
         // 30 micro-segments (liveCount 10 << microSegmentMaxNodes 1000).
         for (int i = 1; i <= 30; i++) {
@@ -274,11 +276,30 @@ public class VectorIndexCompactorChooseTest {
         List<VectorSegment> picked = VectorIndexCompactor.chooseSegmentsToMerge(
                 cand, /*minCount*/ 2, /*minBytes*/ 1L, /*maxBytes*/ Long.MAX_VALUE,
                 /*maxCount*/ 10, /*microSegmentMaxNodes*/ 1000L, /*maxInputs*/ 16);
-        assertEquals("micro-segment fast path result must also be capped",
-                16, picked.size());
+        assertEquals("micro-segment fast path must NOT be capped by maxInputs",
+                30, picked.size());
         for (VectorSegment s : picked) {
             assertTrue("micro path must merge only micro-segments", s.size() < 1000L);
         }
+    }
+
+    /**
+     * When the picked set is already at or below {@code maxInputs}, the cap is
+     * a no-op and the full selection is returned (covers the
+     * {@code maxInputs >= picked.size()} branch of {@code capInputs}).
+     */
+    @Test
+    public void maxInputsNoOpWhenPickedFitsUnderCap() {
+        List<VectorSegment> cand = new ArrayList<>();
+        for (int i = 1; i <= 5; i++) {
+            cand.add(seg(i, i));
+        }
+        List<VectorSegment> picked = VectorIndexCompactor.chooseSegmentsToMerge(
+                cand, /*minCount*/ 2, /*minBytes*/ 1L, /*maxBytes*/ Long.MAX_VALUE,
+                /*maxCount*/ Integer.MAX_VALUE, /*microSegmentMaxNodes*/ 0L,
+                /*maxInputs*/ 16);
+        assertEquals("a picked set within the cap must be returned untruncated",
+                5, picked.size());
     }
 
     /**

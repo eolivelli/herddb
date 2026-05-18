@@ -297,9 +297,12 @@ public final class IndexingServerConfiguration {
      * cost scales with the input count — an unbounded selection of small
      * segments can stall a cycle for hours. Compaction still fires on the same
      * triggers; it merges at most this many segments per cycle (smallest-first)
-     * and the rest are merged by subsequent cycles. Unlike the byte/count caps,
-     * this cap is <em>not</em> tier-scaled — bounding worst-case per-cycle I/O
-     * is its purpose. Default is {@code 16}. Set to {@code 0} to disable.
+     * and the rest are merged by subsequent cycles. Like the byte/count caps,
+     * this base value is tier-scaled (2×/4×/8× at 100/300/500 segments) when
+     * tiered compaction is enabled, so the per-cycle drain rate keeps pace with
+     * the backlog and the cap cannot starve the tailer. The cap never applies
+     * to the micro-segment fast path. Default is {@code 16}. Set to {@code 0}
+     * to disable.
      */
     public static final String PROPERTY_VECTOR_INDEX_COMPACTION_MAX_INPUTS =
             "vector.index.compaction.maxInputs";

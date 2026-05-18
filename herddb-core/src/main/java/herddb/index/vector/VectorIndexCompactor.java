@@ -363,11 +363,29 @@ final class VectorIndexCompactor {
      * cycle compacts, only how many segments a single cycle merges; the
      * leftover segments are picked up by subsequent cycles.
      *
+     * <p><b>The cap does NOT apply to the micro-segment fast path (#570).</b>
+     * The fast path exists to reclaim segment-count slots <em>quickly</em>
+     * under memory-pressure checkpoint storms; micro-segment merges are cheap
+     * by construction (bounded by {@code microSegmentMaxNodes} live nodes), so
+     * the PQ-retraining-I/O concern that motivates the cap does not apply to
+     * them, and capping the fast path would directly throttle the back-pressure
+     * relief valve. The cap therefore truncates only the normal byte-capped
+     * selection.
+     *
+     * <p><b>Starvation safety.</b> The caller
+     * ({@link PersistentVectorStore#runCompactionCycle}) tier-scales
+     * {@code maxInputs} via {@link #computeTieredMaxInputs} exactly as it scales
+     * {@code maxTotalBytes} and {@code maxCount} (issue #354), so the per-cycle
+     * drain rate rises with the backlog. A flat cap therefore cannot starve the
+     * tailer: by the time the segment count approaches the back-pressure
+     * threshold the effective cap has scaled up with it.
+     *
      * <p>Package-private for unit tests.
      *
      * @param maxInputs maximum number of input segments a single compaction
      *     cycle may merge; {@code 0} (or negative) disables the cap. Values are
-     *     expected to be pre-normalised via {@link #clampMaxInputs}.
+     *     expected to be pre-normalised via {@link #clampMaxInputs} and, where
+     *     tiered scaling is enabled, already tier-scaled by the caller.
      */
     static List<VectorSegment> chooseSegmentsToMerge(
             List<VectorSegment> candidates,
@@ -435,7 +453,10 @@ final class VectorIndexCompactor {
                 microTotal += seg.estimatedSizeBytes;
             }
             if (microPicked.size() >= 2) {
-                return capInputs(microPicked, maxInputs);
+                // Deliberately NOT capped — see method javadoc: the
+                // micro-segment fast path must stay a fast slot-reclaiming
+                // cycle (issue #570).
+                return microPicked;
             }
         }
         return capInputs(picked, maxInputs);
@@ -510,6 +531,37 @@ final class VectorIndexCompactor {
             return Integer.MAX_VALUE;
         }
         return baseMaxCount * multiplier;
+    }
+
+    /**
+     * Returns the effective per-cycle input-segment cap (issue #587) after
+     * applying the tiered scaling factor for {@code totalSegmentCount}.
+     *
+     * <p>Tier-scaling the cap is what makes it starvation-safe: the per-cycle
+     * drain rate rises with the backlog (2×/4×/8× at 100/300/500 segments),
+     * mirroring {@link #computeTieredMaxCount}, so the cap can never let the
+     * segment count grow unboundedly toward the back-pressure threshold while
+     * still bounding worst-case per-cycle PQ-retraining I/O at each tier.
+     *
+     * <p>A disabled cap ({@code baseMaxInputs <= 0}) is returned unchanged so
+     * it stays disabled. The result is capped at {@link Integer#MAX_VALUE} to
+     * avoid overflow.
+     *
+     * <p>Package-private for unit tests.
+     */
+    static int computeTieredMaxInputs(int totalSegmentCount, int baseMaxInputs) {
+        if (baseMaxInputs <= 0) {
+            return baseMaxInputs;
+        }
+        int multiplier = tieredMultiplier(totalSegmentCount);
+        if (multiplier == 1) {
+            return baseMaxInputs;
+        }
+        // Guard against overflow.
+        if (baseMaxInputs > Integer.MAX_VALUE / multiplier) {
+            return Integer.MAX_VALUE;
+        }
+        return baseMaxInputs * multiplier;
     }
 
     /**
