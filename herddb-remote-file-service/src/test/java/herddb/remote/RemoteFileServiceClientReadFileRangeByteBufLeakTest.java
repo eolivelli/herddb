@@ -21,12 +21,11 @@
 package herddb.remote;
 
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.fail;
 import herddb.proto.Pdu;
 import io.netty.buffer.ByteBuf;
-import io.netty.buffer.PoolArenaMetric;
 import io.netty.buffer.PooledByteBufAllocator;
 import org.junit.Rule;
 import org.junit.Test;
@@ -42,7 +41,7 @@ import org.junit.rules.Timeout;
  * <h3>How the leak is triggered</h3>
  * Both parsers follow the pattern:
  * <pre>
- *   ByteBuf buf = allocator.directBuffer(len);   // ← allocation
+ *   ByteBuf buf = allocator.directBuffer(len);     // ← allocation
  *   ByteBuf slice = PduCodec.Xxx.readContent(pdu); // ← may throw IOOBE
  *   buf.writeBytes(slice);
  *   return buf;
@@ -55,17 +54,26 @@ import org.junit.rules.Timeout;
  * {@code boolean success + try/finally} guard that calls {@code buf.release()}
  * whenever an exception propagates, irrespective of its type.
  *
- * <h3>Test strategy — deterministic direct unit tests</h3>
- * The tests call the package-private static parser methods directly, passing
- * a fresh {@link PooledByteBufAllocator} that is exclusively used by the test.
- * After the parser throws, {@link PoolArenaMetric#numActiveAllocations()} on
- * that fresh allocator must be exactly {@code 0} — a strict equality that is
- * sound because no background thread can interact with the fresh allocator.
- *
- * <p>This avoids the timing-race that made the previous metric-delta approach
- * unreliable: the old {@code assertTrue(after - before < N)} check could
- * produce a false-negative when {@code N} genuine leaks coincided with a
- * near-equal count of background releases from other allocators.
+ * <h3>Test strategy — spy allocator + {@code refCnt()} check</h3>
+ * Each test passes a thin {@link PooledByteBufAllocator} subclass (the
+ * "spy") that overrides {@code directBuffer(int)} to record the
+ * last-returned {@code ByteBuf} reference. After the parser throws, the test
+ * asserts {@code captured.refCnt() == 0}. This is deterministic:
+ * <ul>
+ *   <li>With the fix: the {@code finally} block calls {@code buf.release()},
+ *       decrementing the reference count from 1 to 0 regardless of whether the
+ *       underlying memory goes into the allocator's thread-local cache or back
+ *       to the arena. {@code refCnt()} reflects the logical reference count on
+ *       the object, not the allocator's deallocation counters.
+ *   <li>Without the fix: {@code buf.release()} is never called, leaving
+ *       {@code refCnt() == 1}.
+ * </ul>
+ * Note: {@link io.netty.buffer.PoolArenaMetric#numActiveAllocations()} is
+ * intentionally <em>not</em> used here. When a pooled buffer is freed it is
+ * returned to the {@code PoolThreadCache} rather than the arena, and
+ * {@code deallocations} counters are not incremented — so
+ * {@code numActiveAllocations()} stays at 1 even after a correct
+ * {@code release()}, making it an unreliable leak-detection signal.
  */
 public class RemoteFileServiceClientReadFileRangeByteBufLeakTest {
 
@@ -79,24 +87,28 @@ public class RemoteFileServiceClientReadFileRangeByteBufLeakTest {
 
     /**
      * Verifies that {@code parseReadFileRangeResponse} releases its allocated
-     * {@code ByteBuf} when {@link IndexOutOfBoundsException} is thrown by
-     * {@code PduCodec.ReadFileRangeResponse.readContent(pdu)} on a truncated
-     * response (reported path in issue #582).
+     * {@code ByteBuf} (refCnt → 0) when {@link IndexOutOfBoundsException} is
+     * thrown by {@code PduCodec.ReadFileRangeResponse.readContent(pdu)} on a
+     * truncated response (the production failure path from issue #582).
      *
      * <p>The PDU claims {@code contentLength=1000} but only carries 5 bytes of
-     * payload. {@code readContent} calls {@code retainedSlice(16, 1000)} on
-     * a 21-byte buffer, which immediately throws. Before the fix, the
-     * {@code directBuffer(1000)} allocation was leaked.
+     * payload. {@code readContent} calls {@code retainedSlice(16, 1000)} on a
+     * 21-byte buffer, which immediately throws. Before the fix, the
+     * {@code directBuffer(1000)} allocation was leaked (refCnt remained 1).
      *
-     * <p>Repeated {@code ITERATIONS} times: with the bug, each iteration leaves
-     * one un-released buffer; with the fix the count always returns to 0.
+     * <p>Repeated {@code ITERATIONS} times to confirm no accumulation across
+     * multiple calls (the allocator may recycle object instances, but each
+     * cycle must start with a fresh refCnt = 1 and end at 0).
      */
     @Test
     public void testParseReadFileRangeResponse_releasesBufOnParseError() {
-        PooledByteBufAllocator freshAllocator = new PooledByteBufAllocator(true);
+        final ByteBuf[] captured = {null};
+        PooledByteBufAllocator spy = spyAllocator(captured);
 
         int iterations = 10;
         for (int i = 0; i < iterations; i++) {
+            captured[0] = null;
+
             // Build a malformed ReadFileRange response PDU:
             // VERSION(1)+FLAGS(1)+TYPE(1)+MSGID(8)+found(1)+contentLen(4)+data(5) = 21 bytes.
             // contentLength claims 1000 but only 5 bytes follow → retainedSlice(16,1000) throws.
@@ -111,33 +123,33 @@ public class RemoteFileServiceClientReadFileRangeByteBufLeakTest {
 
             Pdu pdu = Pdu.newPdu(wire, Pdu.TYPE_FS_READ_FILE_RANGE, Pdu.FLAGS_ISRESPONSE, 42L);
             try {
-                RemoteFileServiceClient.parseReadFileRangeResponse(pdu, freshAllocator);
+                RemoteFileServiceClient.parseReadFileRangeResponse(pdu, spy);
                 fail("Expected IndexOutOfBoundsException from retainedSlice on truncated buffer");
             } catch (IndexOutOfBoundsException e) {
                 // Expected: retainedSlice(16, 1000) on a 21-byte buffer throws immediately.
             } finally {
-                pdu.close(); // releases the 'wire' ByteBuf (allocated from DEFAULT, not freshAllocator)
+                pdu.close(); // releases the 'wire' ByteBuf (allocated from DEFAULT)
             }
 
-            // KEY ASSERTION: the directBuffer(1000) from freshAllocator must have
-            // been released by the fix's finally block. With the bug it would be
-            // leaked (refCnt=1), raising numActiveAllocations by 1 each iteration.
-            long active = activeDirectAllocs(freshAllocator);
+            assertNotNull("spy must have been asked to allocate a directBuffer", captured[0]);
+            // KEY ASSERTION: the fix's finally block must have called buf.release(),
+            // decrementing refCnt from 1 to 0. Without the fix refCnt stays at 1.
             assertEquals(
-                    "iteration " + (i + 1) + ": directBuffer(1000) was not released "
-                            + "by parseReadFileRangeResponse on IndexOutOfBoundsException "
-                            + "(issue #582 regression)",
-                    0L, active);
+                    "iteration " + (i + 1) + ": directBuffer(1000) refCnt must be 0 after "
+                            + "parseReadFileRangeResponse threw IndexOutOfBoundsException "
+                            + "(issue #582 regression: missing release in finally block)",
+                    0, captured[0].refCnt());
         }
     }
 
     /**
      * Verifies that {@code parseReadFileRangeResponse} returns {@code null}
-     * (without allocating any buffer) when {@code found == 0}.
+     * without allocating any buffer when {@code found == 0}.
      */
     @Test
     public void testParseReadFileRangeResponse_notFound_returnsNull() {
-        PooledByteBufAllocator freshAllocator = new PooledByteBufAllocator(true);
+        final ByteBuf[] captured = {null};
+        PooledByteBufAllocator spy = spyAllocator(captured);
 
         ByteBuf wire = PooledByteBufAllocator.DEFAULT.directBuffer(16);
         wire.writeByte(3);                             // VERSION_3
@@ -149,103 +161,26 @@ public class RemoteFileServiceClientReadFileRangeByteBufLeakTest {
 
         Pdu pdu = Pdu.newPdu(wire, Pdu.TYPE_FS_READ_FILE_RANGE, Pdu.FLAGS_ISRESPONSE, 1L);
         try {
-            ByteBuf result = RemoteFileServiceClient.parseReadFileRangeResponse(pdu, freshAllocator);
+            ByteBuf result = RemoteFileServiceClient.parseReadFileRangeResponse(pdu, spy);
             assertNull("not-found response must return null", result);
-            assertEquals("no allocation must occur for not-found response",
-                    0L, activeDirectAllocs(freshAllocator));
-        } finally {
-            pdu.close();
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // parseReadFileResponse — proactive fix for the same latent bug
-    // -------------------------------------------------------------------------
-
-    /**
-     * Verifies that {@code parseReadFileResponse} releases its allocated
-     * {@code ByteBuf} when {@link IndexOutOfBoundsException} is thrown by
-     * {@code PduCodec.ReadFileResponse.readContent(pdu)} on a truncated
-     * response (same latent bug as issue #582, fixed proactively).
-     *
-     * <p>Same assertion strategy as
-     * {@link #testParseReadFileRangeResponse_releasesBufOnParseError()}.
-     */
-    @Test
-    public void testParseReadFileResponse_releasesBufOnParseError() {
-        PooledByteBufAllocator freshAllocator = new PooledByteBufAllocator(true);
-
-        int iterations = 10;
-        for (int i = 0; i < iterations; i++) {
-            // Build a malformed ReadFile response PDU:
-            // VERSION(1)+FLAGS(1)+TYPE(1)+MSGID(8)+found(1)+contentLen(4)+data(5) = 21 bytes.
-            // contentLength claims 1000 but only 5 bytes follow → retainedSlice(16,1000) throws.
-            ByteBuf wire = PooledByteBufAllocator.DEFAULT.directBuffer(21);
-            wire.writeByte(3);                         // VERSION_3
-            wire.writeByte(Pdu.FLAGS_ISRESPONSE);
-            wire.writeByte(Pdu.TYPE_FS_READ_FILE);
-            wire.writeLong(99L);                       // message id
-            wire.writeByte(1);                         // found = true
-            wire.writeInt(1000);                       // contentLength = 1000 (lie)
-            wire.writeBytes(new byte[5]);              // truncated: only 5 bytes
-
-            Pdu pdu = Pdu.newPdu(wire, Pdu.TYPE_FS_READ_FILE, Pdu.FLAGS_ISRESPONSE, 99L);
-            try {
-                RemoteFileServiceClient.parseReadFileResponse(pdu, freshAllocator);
-                fail("Expected IndexOutOfBoundsException from retainedSlice on truncated buffer");
-            } catch (IndexOutOfBoundsException e) {
-                // Expected: retainedSlice(16, 1000) on a 21-byte buffer throws immediately.
-            } finally {
-                pdu.close();
-            }
-
-            long active = activeDirectAllocs(freshAllocator);
-            assertEquals(
-                    "iteration " + (i + 1) + ": directBuffer(1000) was not released "
-                            + "by parseReadFileResponse on IndexOutOfBoundsException "
-                            + "(issue #582 regression — proactive fix)",
-                    0L, active);
-        }
-    }
-
-    /**
-     * Verifies that {@code parseReadFileResponse} returns {@code null} (without
-     * allocating) when {@code found == 0}.
-     */
-    @Test
-    public void testParseReadFileResponse_notFound_returnsNull() {
-        PooledByteBufAllocator freshAllocator = new PooledByteBufAllocator(true);
-
-        ByteBuf wire = PooledByteBufAllocator.DEFAULT.directBuffer(16);
-        wire.writeByte(3);
-        wire.writeByte(Pdu.FLAGS_ISRESPONSE);
-        wire.writeByte(Pdu.TYPE_FS_READ_FILE);
-        wire.writeLong(2L);
-        wire.writeByte(0);                             // found = false
-        wire.writeInt(0);
-
-        Pdu pdu = Pdu.newPdu(wire, Pdu.TYPE_FS_READ_FILE, Pdu.FLAGS_ISRESPONSE, 2L);
-        try {
-            ByteBuf result = RemoteFileServiceClient.parseReadFileResponse(pdu, freshAllocator);
-            assertNull("not-found response must return null", result);
-            assertEquals("no allocation must occur for not-found response",
-                    0L, activeDirectAllocs(freshAllocator));
+            assertNull("spy must not have been asked to allocate for not-found response",
+                    captured[0]);
         } finally {
             pdu.close();
         }
     }
 
     /**
-     * Verifies that {@code parseReadFileRangeResponse} returns a valid
-     * {@code ByteBuf} containing the expected content when the PDU is
-     * well-formed ({@code contentLength} matches the actual payload length).
+     * Verifies that {@code parseReadFileRangeResponse} returns a valid buffer
+     * whose refCnt tracks correctly through use and release.
      */
     @Test
     public void testParseReadFileRangeResponse_validResponse_returnsBuf() {
-        PooledByteBufAllocator freshAllocator = new PooledByteBufAllocator(true);
+        final ByteBuf[] captured = {null};
+        PooledByteBufAllocator spy = spyAllocator(captured);
 
         byte[] content = "hello world".getBytes();
-        // VERSION(1)+FLAGS(1)+TYPE(1)+MSGID(8)+found(1)+contentLen(4)+content(N)
+        // VERSION(1)+FLAGS(1)+TYPE(1)+MSGID(8)+found(1)+contentLen(4)+content(N) = 16+N bytes
         ByteBuf wire = PooledByteBufAllocator.DEFAULT.directBuffer(16 + content.length);
         wire.writeByte(3);
         wire.writeByte(Pdu.FLAGS_ISRESPONSE);
@@ -258,34 +193,162 @@ public class RemoteFileServiceClientReadFileRangeByteBufLeakTest {
         Pdu pdu = Pdu.newPdu(wire, Pdu.TYPE_FS_READ_FILE_RANGE, Pdu.FLAGS_ISRESPONSE, 7L);
         ByteBuf result = null;
         try {
-            result = RemoteFileServiceClient.parseReadFileRangeResponse(pdu, freshAllocator);
+            result = RemoteFileServiceClient.parseReadFileRangeResponse(pdu, spy);
             assertNotNull("well-formed response must return a non-null ByteBuf", result);
-            assertEquals("returned ByteBuf must contain exactly the payload",
+            assertEquals("returned ByteBuf must contain exactly the payload bytes",
                     content.length, result.readableBytes());
-            // One active allocation: the returned buf (held by the test).
-            assertEquals("exactly one allocation must be live while result is held",
-                    1L, activeDirectAllocs(freshAllocator));
+            assertNotNull("spy must have been asked to allocate", captured[0]);
+            assertEquals("returned buffer must have refCnt == 1 while caller holds it",
+                    1, captured[0].refCnt());
         } finally {
             if (result != null) {
                 result.release();
             }
             pdu.close();
         }
-        assertEquals("no active allocations after result is released",
-                0L, activeDirectAllocs(freshAllocator));
+        assertEquals("refCnt must drop to 0 after caller releases the buffer",
+                0, captured[0].refCnt());
     }
 
     // -------------------------------------------------------------------------
-    // Helpers
+    // parseReadFileResponse — proactive fix for the same latent bug
     // -------------------------------------------------------------------------
 
     /**
-     * Returns the sum of {@link PoolArenaMetric#numActiveAllocations()} across
-     * all direct arenas of {@code allocator}.
+     * Verifies that {@code parseReadFileResponse} releases its allocated
+     * {@code ByteBuf} (refCnt → 0) when {@link IndexOutOfBoundsException} is
+     * thrown by {@code PduCodec.ReadFileResponse.readContent(pdu)} on a
+     * truncated response (same latent bug as issue #582, fixed proactively).
+     *
+     * <p>Same spy-allocator strategy as
+     * {@link #testParseReadFileRangeResponse_releasesBufOnParseError()}.
      */
-    private static long activeDirectAllocs(PooledByteBufAllocator allocator) {
-        return allocator.metric().directArenas().stream()
-                .mapToLong(PoolArenaMetric::numActiveAllocations)
-                .sum();
+    @Test
+    public void testParseReadFileResponse_releasesBufOnParseError() {
+        final ByteBuf[] captured = {null};
+        PooledByteBufAllocator spy = spyAllocator(captured);
+
+        int iterations = 10;
+        for (int i = 0; i < iterations; i++) {
+            captured[0] = null;
+
+            // Build a malformed ReadFile response PDU (same layout as ReadFileRange).
+            ByteBuf wire = PooledByteBufAllocator.DEFAULT.directBuffer(21);
+            wire.writeByte(3);                         // VERSION_3
+            wire.writeByte(Pdu.FLAGS_ISRESPONSE);
+            wire.writeByte(Pdu.TYPE_FS_READ_FILE);
+            wire.writeLong(99L);                       // message id
+            wire.writeByte(1);                         // found = true
+            wire.writeInt(1000);                       // contentLength = 1000 (lie)
+            wire.writeBytes(new byte[5]);              // truncated: only 5 bytes
+
+            Pdu pdu = Pdu.newPdu(wire, Pdu.TYPE_FS_READ_FILE, Pdu.FLAGS_ISRESPONSE, 99L);
+            try {
+                RemoteFileServiceClient.parseReadFileResponse(pdu, spy);
+                fail("Expected IndexOutOfBoundsException from retainedSlice on truncated buffer");
+            } catch (IndexOutOfBoundsException e) {
+                // Expected.
+            } finally {
+                pdu.close();
+            }
+
+            assertNotNull("spy must have been asked to allocate", captured[0]);
+            assertEquals(
+                    "iteration " + (i + 1) + ": directBuffer(1000) refCnt must be 0 after "
+                            + "parseReadFileResponse threw IndexOutOfBoundsException "
+                            + "(issue #582 regression — proactive fix)",
+                    0, captured[0].refCnt());
+        }
+    }
+
+    /**
+     * Verifies that {@code parseReadFileResponse} returns {@code null} without
+     * allocating when {@code found == 0}.
+     */
+    @Test
+    public void testParseReadFileResponse_notFound_returnsNull() {
+        final ByteBuf[] captured = {null};
+        PooledByteBufAllocator spy = spyAllocator(captured);
+
+        ByteBuf wire = PooledByteBufAllocator.DEFAULT.directBuffer(16);
+        wire.writeByte(3);
+        wire.writeByte(Pdu.FLAGS_ISRESPONSE);
+        wire.writeByte(Pdu.TYPE_FS_READ_FILE);
+        wire.writeLong(2L);
+        wire.writeByte(0);                             // found = false
+        wire.writeInt(0);
+
+        Pdu pdu = Pdu.newPdu(wire, Pdu.TYPE_FS_READ_FILE, Pdu.FLAGS_ISRESPONSE, 2L);
+        try {
+            ByteBuf result = RemoteFileServiceClient.parseReadFileResponse(pdu, spy);
+            assertNull("not-found response must return null", result);
+            assertNull("spy must not have been asked to allocate for not-found response",
+                    captured[0]);
+        } finally {
+            pdu.close();
+        }
+    }
+
+    /**
+     * Verifies that {@code parseReadFileResponse} returns a valid buffer whose
+     * refCnt tracks correctly through use and release.
+     */
+    @Test
+    public void testParseReadFileResponse_validResponse_returnsBuf() {
+        final ByteBuf[] captured = {null};
+        PooledByteBufAllocator spy = spyAllocator(captured);
+
+        byte[] content = "hello".getBytes();
+        ByteBuf wire = PooledByteBufAllocator.DEFAULT.directBuffer(16 + content.length);
+        wire.writeByte(3);
+        wire.writeByte(Pdu.FLAGS_ISRESPONSE);
+        wire.writeByte(Pdu.TYPE_FS_READ_FILE);
+        wire.writeLong(3L);
+        wire.writeByte(1);                             // found = true
+        wire.writeInt(content.length);
+        wire.writeBytes(content);
+
+        Pdu pdu = Pdu.newPdu(wire, Pdu.TYPE_FS_READ_FILE, Pdu.FLAGS_ISRESPONSE, 3L);
+        ByteBuf result = null;
+        try {
+            result = RemoteFileServiceClient.parseReadFileResponse(pdu, spy);
+            assertNotNull("well-formed response must return a non-null ByteBuf", result);
+            assertEquals("returned ByteBuf must contain exactly the payload bytes",
+                    content.length, result.readableBytes());
+            assertNotNull("spy must have been asked to allocate", captured[0]);
+            assertEquals("returned buffer must have refCnt == 1 while caller holds it",
+                    1, captured[0].refCnt());
+        } finally {
+            if (result != null) {
+                result.release();
+            }
+            pdu.close();
+        }
+        assertEquals("refCnt must drop to 0 after caller releases the buffer",
+                0, captured[0].refCnt());
+    }
+
+    // -------------------------------------------------------------------------
+    // Helper
+    // -------------------------------------------------------------------------
+
+    /**
+     * Creates a {@link PooledByteBufAllocator} subclass that records the last
+     * {@code ByteBuf} returned by {@code directBuffer(int)} into
+     * {@code captureSlot[0]}.
+     *
+     * <p>Used so tests can assert {@code captureSlot[0].refCnt() == 0} after
+     * a parser method throws, verifying the {@code finally} block's
+     * {@code buf.release()} call without relying on arena-level counters.
+     */
+    private static PooledByteBufAllocator spyAllocator(ByteBuf[] captureSlot) {
+        return new PooledByteBufAllocator(true) {
+            @Override
+            public ByteBuf directBuffer(int initialCapacity) {
+                ByteBuf buf = super.directBuffer(initialCapacity);
+                captureSlot[0] = buf;
+                return buf;
+            }
+        };
     }
 }
