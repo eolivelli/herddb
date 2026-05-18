@@ -127,6 +127,16 @@ public class ClientConfiguration {
     public static final String PROPERTY_ALLOW_READS_FROM_FOLLOWERS = "client.allowReadsFromFollowers";
     public static final boolean PROPERTY_ALLOW_READS_FROM_FOLLOWERS_DEFAULT = false;
 
+    /**
+     * Interval (in milliseconds) between successive {@code channelIdle()} heartbeat ticks.
+     * Each tick scans every open channel for expired per-request deadlines registered by
+     * {@code sendRequestWithAsyncReply} and fails them with IOException, preventing a
+     * silently-dead TCP connection from hanging {@code executeUpdateAsync} /
+     * {@code executeUpdatesAsync} calls forever (issue #586).
+     */
+    public static final String PROPERTY_IDLE_CHECK_INTERVAL_MS = "client.idle.check.interval.ms";
+    public static final long PROPERTY_IDLE_CHECK_INTERVAL_MS_DEFAULT = 30_000L;
+
 
     public ClientConfiguration(Properties properties) {
         this.properties = new Properties();
