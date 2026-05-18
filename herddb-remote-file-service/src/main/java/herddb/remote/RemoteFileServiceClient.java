@@ -733,15 +733,24 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
                     }
                     int len = PduCodec.ReadFileResponse.readContentLength(pdu);
                     ByteBuf buf = PooledByteBufAllocator.DEFAULT.directBuffer(len);
-                    if (len > 0) {
-                        ByteBuf slice = PduCodec.ReadFileResponse.readContent(pdu);
-                        try {
-                            buf.writeBytes(slice);
-                        } finally {
-                            slice.release();
+                    // issue #582: release buf on any exception so it is never leaked.
+                    boolean success = false;
+                    try {
+                        if (len > 0) {
+                            ByteBuf slice = PduCodec.ReadFileResponse.readContent(pdu);
+                            try {
+                                buf.writeBytes(slice);
+                            } finally {
+                                slice.release();
+                            }
+                        }
+                        success = true;
+                        return buf;
+                    } finally {
+                        if (!success) {
+                            buf.release();
                         }
                     }
-                    return buf;
                 });
         return result.whenComplete((buf, err) -> releaseOnce.run());
     }
@@ -1027,15 +1036,24 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
                     }
                     int len = PduCodec.ReadFileRangeResponse.readContentLength(pdu);
                     ByteBuf buf = PooledByteBufAllocator.DEFAULT.directBuffer(len);
-                    if (len > 0) {
-                        ByteBuf slice = PduCodec.ReadFileRangeResponse.readContent(pdu);
-                        try {
-                            buf.writeBytes(slice);
-                        } finally {
-                            slice.release();
+                    // issue #582: release buf on any exception so it is never leaked.
+                    boolean success = false;
+                    try {
+                        if (len > 0) {
+                            ByteBuf slice = PduCodec.ReadFileRangeResponse.readContent(pdu);
+                            try {
+                                buf.writeBytes(slice);
+                            } finally {
+                                slice.release();
+                            }
+                        }
+                        success = true;
+                        return buf;
+                    } finally {
+                        if (!success) {
+                            buf.release();
                         }
                     }
-                    return buf;
                 });
         return result.whenComplete((buf, err) -> releaseOnce.run());
     }
