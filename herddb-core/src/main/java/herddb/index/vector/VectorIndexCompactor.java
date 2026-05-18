@@ -305,6 +305,78 @@ final class VectorIndexCompactor {
             long maxTotalBytes,
             int maxCount,
             long microSegmentMaxNodes) {
+        return chooseSegmentsToMerge(candidates, minCount, minTotalBytes,
+                maxTotalBytes, maxCount, microSegmentMaxNodes, /*maxInputs*/ 0);
+    }
+
+    /**
+     * Hard cap on the number of input segments per compaction (issue #587):
+     * value below which a positive {@code maxInputs} is clamped. A single-input
+     * "merge" is degenerate, so any enabled cap is forced to at least 2.
+     *
+     * <p>Package-private for unit tests.
+     */
+    static final int MIN_MAX_INPUTS = 2;
+
+    /**
+     * Normalises a configured {@code maxInputs} value: {@code <= 0} disables the
+     * cap (returns {@code 0}); {@code 1} is clamped up to {@link #MIN_MAX_INPUTS}
+     * because a one-segment merge does no useful work; any larger value is
+     * returned unchanged.
+     *
+     * <p>Package-private for unit tests.
+     */
+    static int clampMaxInputs(int maxInputs) {
+        if (maxInputs <= 0) {
+            return 0;
+        }
+        return Math.max(MIN_MAX_INPUTS, maxInputs);
+    }
+
+    /**
+     * Truncates {@code picked} to at most {@code maxInputs} segments when a
+     * positive cap is configured (issue #587). The list is already sorted
+     * smallest-bytes-first, so truncation keeps the smallest segments — which
+     * maximises the contraction ratio and bounds the per-cycle remote I/O of
+     * the downstream PQ-retraining step (whose cost scales with the number of
+     * input segments). A no-op when the cap is disabled or not exceeded.
+     *
+     * <p>Package-private for unit tests.
+     */
+    static List<VectorSegment> capInputs(List<VectorSegment> picked, int maxInputs) {
+        if (maxInputs > 0 && picked.size() > maxInputs) {
+            LOGGER.log(Level.INFO,
+                    "compaction: capping merge inputs from {0} to {1} segments "
+                            + "(vector.index.compaction.maxInputs); remaining segments "
+                            + "compact in subsequent cycles",
+                    new Object[]{picked.size(), maxInputs});
+            return new ArrayList<>(picked.subList(0, maxInputs));
+        }
+        return picked;
+    }
+
+    /**
+     * Full entry point adding a hard cap on the number of input segments per
+     * compaction cycle (issue #587). See the 6-arg overload for the trigger and
+     * micro-segment semantics — they are unchanged. The cap is applied
+     * <em>after</em> the fire/no-fire decision, so it never changes whether a
+     * cycle compacts, only how many segments a single cycle merges; the
+     * leftover segments are picked up by subsequent cycles.
+     *
+     * <p>Package-private for unit tests.
+     *
+     * @param maxInputs maximum number of input segments a single compaction
+     *     cycle may merge; {@code 0} (or negative) disables the cap. Values are
+     *     expected to be pre-normalised via {@link #clampMaxInputs}.
+     */
+    static List<VectorSegment> chooseSegmentsToMerge(
+            List<VectorSegment> candidates,
+            int minCount,
+            long minTotalBytes,
+            long maxTotalBytes,
+            int maxCount,
+            long microSegmentMaxNodes,
+            int maxInputs) {
         if (candidates == null || candidates.size() < minCount) {
             return new ArrayList<>();
         }
@@ -363,10 +435,10 @@ final class VectorIndexCompactor {
                 microTotal += seg.estimatedSizeBytes;
             }
             if (microPicked.size() >= 2) {
-                return microPicked;
+                return capInputs(microPicked, maxInputs);
             }
         }
-        return picked;
+        return capInputs(picked, maxInputs);
     }
 
     // -------------------------------------------------------------------------

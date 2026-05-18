@@ -168,6 +168,10 @@ public class Issue354TieredCompactionTest {
         store.setTieredCompactionEnabled(true);
         // Disable backpressure so we can build lots of segments freely.
         store.setCompactionBackpressureThreshold(Integer.MAX_VALUE);
+        // Disable the issue #587 input-count cap: it is orthogonal to tiered
+        // scaling, and this test verifies that tiered fan-in lets a cycle merge
+        // more than the un-tiered backlog in one shot.
+        store.setCompactionMaxInputs(0);
 
         try (store) {
             store.start();
@@ -246,6 +250,10 @@ public class Issue354TieredCompactionTest {
                 /*retentionMs*/ 0);
         store.setTieredCompactionEnabled(false);
         store.setCompactionBackpressureThreshold(Integer.MAX_VALUE);
+        // Disable the issue #587 input-count cap so the whole backlog drains in
+        // one cycle, as this test's premise (below) requires. The cap is
+        // exercised separately by VectorIndexCompactorChooseTest.
+        store.setCompactionMaxInputs(0);
 
         try (store) {
             store.start();

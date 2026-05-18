@@ -36,6 +36,12 @@ public class VectorIndexCompactorChooseTest {
         return s;
     }
 
+    private static VectorSegment seg(int id, long sizeBytes, int liveNodes) {
+        VectorSegment s = seg(id, sizeBytes);
+        s.liveCount.set(liveNodes);
+        return s;
+    }
+
     @Test
     public void belowMinCountYieldsEmpty() {
         List<VectorSegment> cand = new ArrayList<>();
@@ -179,5 +185,113 @@ public class VectorIndexCompactorChooseTest {
             assertTrue("no huge segment should be in the result",
                     s.estimatedSizeBytes <= 10L);
         }
+    }
+
+    // ---- Tests for the input-count cap (issue #587) ----
+
+    /**
+     * With a positive {@code maxInputs}, a picked set larger than the cap is
+     * truncated to exactly {@code maxInputs} segments, keeping the smallest
+     * (the list is sorted smallest-bytes-first).
+     */
+    @Test
+    public void maxInputsTruncatesPickedSmallestFirst() {
+        List<VectorSegment> cand = new ArrayList<>();
+        // 53 segments — the incident's candidate count. Size == id so the
+        // smallest-first sort yields ids 1..53 in ascending order.
+        for (int i = 1; i <= 53; i++) {
+            cand.add(seg(i, i));
+        }
+        List<VectorSegment> picked = VectorIndexCompactor.chooseSegmentsToMerge(
+                cand, /*minCount*/ 4, /*minBytes*/ 1L, /*maxBytes*/ Long.MAX_VALUE,
+                /*maxCount*/ Integer.MAX_VALUE, /*microSegmentMaxNodes*/ 0L,
+                /*maxInputs*/ 16);
+        assertEquals("picked set must be truncated to maxInputs", 16, picked.size());
+        for (int i = 0; i < 16; i++) {
+            assertEquals("must keep the 16 smallest segments, in order",
+                    i + 1, picked.get(i).segmentId);
+        }
+    }
+
+    /**
+     * {@code maxInputs == 0} disables the cap: the full byte-capped selection
+     * is returned even when it is very large.
+     */
+    @Test
+    public void maxInputsZeroDisablesCap() {
+        List<VectorSegment> cand = new ArrayList<>();
+        for (int i = 1; i <= 53; i++) {
+            cand.add(seg(i, i));
+        }
+        List<VectorSegment> picked = VectorIndexCompactor.chooseSegmentsToMerge(
+                cand, /*minCount*/ 4, /*minBytes*/ 1L, /*maxBytes*/ Long.MAX_VALUE,
+                /*maxCount*/ Integer.MAX_VALUE, /*microSegmentMaxNodes*/ 0L,
+                /*maxInputs*/ 0);
+        assertEquals("disabled cap must return the full selection", 53, picked.size());
+    }
+
+    /**
+     * The cap is applied AFTER the fire/no-fire decision: it never makes a
+     * non-compacting cycle compact, and never suppresses a cycle that the
+     * triggers would fire. Here the count trigger fires on 20 segments and the
+     * cap merely limits how many of them this cycle merges.
+     */
+    @Test
+    public void maxInputsDoesNotChangeTriggerDecision() {
+        // Below minCount: no trigger — cap must not resurrect the cycle.
+        List<VectorSegment> tooFew = new ArrayList<>();
+        tooFew.add(seg(1, 100L));
+        tooFew.add(seg(2, 100L));
+        assertTrue(VectorIndexCompactor.chooseSegmentsToMerge(
+                tooFew, /*minCount*/ 4, /*minBytes*/ 1L, /*maxBytes*/ Long.MAX_VALUE,
+                /*maxCount*/ Integer.MAX_VALUE, /*microSegmentMaxNodes*/ 0L,
+                /*maxInputs*/ 16).isEmpty());
+
+        // Count trigger fires (20 >= maxCount 10) although bytes are tiny;
+        // the cap then limits the merge to 16 of the 20 segments.
+        List<VectorSegment> many = new ArrayList<>();
+        for (int i = 1; i <= 20; i++) {
+            many.add(seg(i, i));
+        }
+        List<VectorSegment> picked = VectorIndexCompactor.chooseSegmentsToMerge(
+                many, /*minCount*/ 2, /*minBytes*/ 1L * 1024 * 1024,
+                /*maxBytes*/ Long.MAX_VALUE, /*maxCount*/ 10,
+                /*microSegmentMaxNodes*/ 0L, /*maxInputs*/ 16);
+        assertEquals("count trigger fires, capped to maxInputs", 16, picked.size());
+    }
+
+    /**
+     * The cap also applies to the micro-segment fast-path result (issue #570):
+     * a large set of micro-segments is truncated to {@code maxInputs}.
+     */
+    @Test
+    public void maxInputsCapsMicroSegmentPath() {
+        List<VectorSegment> cand = new ArrayList<>();
+        // 30 micro-segments (liveCount 10 << microSegmentMaxNodes 1000).
+        for (int i = 1; i <= 30; i++) {
+            cand.add(seg(i, i, /*liveNodes*/ 10));
+        }
+        List<VectorSegment> picked = VectorIndexCompactor.chooseSegmentsToMerge(
+                cand, /*minCount*/ 2, /*minBytes*/ 1L, /*maxBytes*/ Long.MAX_VALUE,
+                /*maxCount*/ 10, /*microSegmentMaxNodes*/ 1000L, /*maxInputs*/ 16);
+        assertEquals("micro-segment fast path result must also be capped",
+                16, picked.size());
+        for (VectorSegment s : picked) {
+            assertTrue("micro path must merge only micro-segments", s.size() < 1000L);
+        }
+    }
+
+    /**
+     * {@link VectorIndexCompactor#clampMaxInputs} normalises configured values:
+     * non-positive disables (0); 1 is clamped up to 2; larger values pass
+     * through.
+     */
+    @Test
+    public void clampMaxInputsBehaviour() {
+        assertEquals(0, VectorIndexCompactor.clampMaxInputs(0));
+        assertEquals(0, VectorIndexCompactor.clampMaxInputs(-5));
+        assertEquals(2, VectorIndexCompactor.clampMaxInputs(1));
+        assertEquals(2, VectorIndexCompactor.clampMaxInputs(2));
+        assertEquals(16, VectorIndexCompactor.clampMaxInputs(16));
     }
 }
