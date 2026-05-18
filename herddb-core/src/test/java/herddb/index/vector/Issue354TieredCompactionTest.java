@@ -125,6 +125,32 @@ public class Issue354TieredCompactionTest {
         assertEquals("should cap at Integer.MAX_VALUE on overflow", Integer.MAX_VALUE, result);
     }
 
+    @Test
+    public void tieredMaxInputsScalesCorrectly() {
+        // Issue #587: the input cap is tier-scaled like the byte/count caps so
+        // the per-cycle drain rate keeps pace with the backlog.
+        int base = 16;
+        assertEquals(base, VectorIndexCompactor.computeTieredMaxInputs(50, base));
+        assertEquals(base * 2, VectorIndexCompactor.computeTieredMaxInputs(100, base));
+        assertEquals(base * 4, VectorIndexCompactor.computeTieredMaxInputs(300, base));
+        assertEquals(base * 8, VectorIndexCompactor.computeTieredMaxInputs(500, base));
+    }
+
+    @Test
+    public void tieredMaxInputsDoesNotOverflow() {
+        int nearMax = Integer.MAX_VALUE / 8 + 1;
+        int result = VectorIndexCompactor.computeTieredMaxInputs(500, nearMax);
+        assertEquals("should cap at Integer.MAX_VALUE on overflow", Integer.MAX_VALUE, result);
+    }
+
+    @Test
+    public void tieredMaxInputsKeepsDisabledCapDisabled() {
+        // A disabled cap (0) must stay 0 at every tier — never scaled into a
+        // positive (active) cap.
+        assertEquals(0, VectorIndexCompactor.computeTieredMaxInputs(50, 0));
+        assertEquals(0, VectorIndexCompactor.computeTieredMaxInputs(500, 0));
+    }
+
     // -------------------------------------------------------------------------
     // Integration test: tiered compaction merges more segments when count is high
     // -------------------------------------------------------------------------
@@ -168,6 +194,10 @@ public class Issue354TieredCompactionTest {
         store.setTieredCompactionEnabled(true);
         // Disable backpressure so we can build lots of segments freely.
         store.setCompactionBackpressureThreshold(Integer.MAX_VALUE);
+        // Disable the issue #587 input-count cap: it is orthogonal to tiered
+        // scaling, and this test verifies that tiered fan-in lets a cycle merge
+        // more than the un-tiered backlog in one shot.
+        store.setCompactionMaxInputs(0);
 
         try (store) {
             store.start();
@@ -246,6 +276,10 @@ public class Issue354TieredCompactionTest {
                 /*retentionMs*/ 0);
         store.setTieredCompactionEnabled(false);
         store.setCompactionBackpressureThreshold(Integer.MAX_VALUE);
+        // Disable the issue #587 input-count cap so the whole backlog drains in
+        // one cycle, as this test's premise (below) requires. The cap is
+        // exercised separately by VectorIndexCompactorChooseTest.
+        store.setCompactionMaxInputs(0);
 
         try (store) {
             store.start();

@@ -291,6 +291,24 @@ public final class IndexingServerConfiguration {
             1000L;
 
     /**
+     * Hard cap on the number of input segments a single compaction cycle may
+     * merge (issue #587). The downstream PQ-retraining step samples training
+     * vectors per input segment with random remote-storage reads, so its I/O
+     * cost scales with the input count — an unbounded selection of small
+     * segments can stall a cycle for hours. Compaction still fires on the same
+     * triggers; it merges at most this many segments per cycle (smallest-first)
+     * and the rest are merged by subsequent cycles. Like the byte/count caps,
+     * this base value is tier-scaled (2×/4×/8× at 100/300/500 segments) when
+     * tiered compaction is enabled, so the per-cycle drain rate keeps pace with
+     * the backlog and the cap cannot starve the tailer. The cap never applies
+     * to the micro-segment fast path. Default is {@code 16}. Set to {@code 0}
+     * to disable.
+     */
+    public static final String PROPERTY_VECTOR_INDEX_COMPACTION_MAX_INPUTS =
+            "vector.index.compaction.maxInputs";
+    public static final int PROPERTY_VECTOR_INDEX_COMPACTION_MAX_INPUTS_DEFAULT = 16;
+
+    /**
      * How long old segment files remain on-disk after a compaction swap
      * before the reaper may physically delete them. Also gated by
      * {@code shadowAckedGeneration}: reclaim waits for the later of the

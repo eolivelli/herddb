@@ -587,6 +587,18 @@ public class PersistentVectorStore extends AbstractVectorStore {
      */
     public static final long DEFAULT_VECTOR_INDEX_COMPACTION_MICROSEGMENT_MAX_NODES = 1000L;
 
+    /**
+     * Default hard cap on the number of input segments a single compaction
+     * cycle may merge (issue #587). The downstream PQ-retraining step samples
+     * training vectors per input segment with random remote-storage reads, so
+     * its I/O cost scales with the input count; an unbounded selection of small
+     * segments (53 in the incident) could stall a cycle for hours. The cap
+     * bounds per-cycle I/O — leftover segments are merged by later cycles.
+     * Configurable in production via {@code vector.index.compaction.maxInputs};
+     * {@code 0} disables the cap.
+     */
+    public static final int DEFAULT_VECTOR_INDEX_COMPACTION_MAX_INPUTS = 16;
+
     /** Compaction policy knobs — defaults match IndexingServerConfiguration. */
     private volatile long vectorIndexCompactionIntervalMs = 5L * 60_000L;
     private volatile long vectorIndexCompactionMinBytes = 256L * 1024 * 1024;
@@ -607,6 +619,16 @@ public class PersistentVectorStore extends AbstractVectorStore {
      */
     private volatile long vectorIndexCompactionMicroSegmentMaxNodes =
             DEFAULT_VECTOR_INDEX_COMPACTION_MICROSEGMENT_MAX_NODES;
+    /**
+     * Base hard cap on the number of input segments per compaction cycle
+     * (issue #587). When tiered compaction is enabled this base value is
+     * tier-scaled (2×/4×/8×) per cycle by {@link VectorIndexCompactor#computeTieredMaxInputs}
+     * so the per-cycle drain rate keeps pace with the backlog and the cap
+     * cannot starve the tailer. {@code 0} disables the cap. Pre-normalised by
+     * {@link #setCompactionMaxInputs}.
+     */
+    private volatile int vectorIndexCompactionMaxInputs =
+            DEFAULT_VECTOR_INDEX_COMPACTION_MAX_INPUTS;
     private volatile long vectorIndexCompactionRetentionMs = 10L * 60_000L;
     /**
      * When {@code true} (the default), the per-cycle byte cap and segment
@@ -1952,6 +1974,31 @@ public class PersistentVectorStore extends AbstractVectorStore {
     }
 
     /**
+     * Sets the hard cap on the number of input segments a single compaction
+     * cycle may merge (issue #587). A compaction cycle still fires on the same
+     * triggers, but merges at most {@code maxInputs} segments per cycle
+     * (smallest-first); any remaining segments are merged by subsequent cycles.
+     * This bounds the per-cycle remote I/O of the downstream PQ-retraining
+     * step, whose cost scales with the number of input segments.
+     *
+     * <p>The value is normalised via {@link VectorIndexCompactor#clampMaxInputs}:
+     * {@code 0} (or negative) disables the cap; {@code 1} is clamped up to 2.
+     * Can be called at any time to re-tune a running store.
+     */
+    public void setCompactionMaxInputs(int maxInputs) {
+        this.vectorIndexCompactionMaxInputs =
+                VectorIndexCompactor.clampMaxInputs(maxInputs);
+    }
+
+    /**
+     * Returns the current compaction input cap (issue #587); {@code 0} means
+     * the cap is disabled.
+     */
+    public int getCompactionMaxInputs() {
+        return vectorIndexCompactionMaxInputs;
+    }
+
+    /**
      * Sets the segment-count back-pressure threshold (issue #354).
      * {@link #addVectorInternal} will block when {@code segments.size()}
      * exceeds this value, waking the compaction thread first.
@@ -2390,6 +2437,10 @@ public class PersistentVectorStore extends AbstractVectorStore {
             // throughput stays proportional to the ingest rate.
             long effectiveMaxBytes = vectorIndexCompactionMaxBytes;
             int effectiveMaxCount = vectorIndexCompactionMaxCount;
+            // Issue #587: the input-segment cap is tier-scaled together with the
+            // byte/count caps so the per-cycle drain rate rises with the backlog
+            // — that is what keeps the flat cap from starving the tailer.
+            int effectiveMaxInputs = vectorIndexCompactionMaxInputs;
             if (vectorIndexCompactionTieredEnabled) {
                 int tier = VectorIndexCompactor.tieredMultiplier(snapshot.size());
                 if (tier > 1) {
@@ -2397,11 +2448,15 @@ public class PersistentVectorStore extends AbstractVectorStore {
                             snapshot.size(), vectorIndexCompactionMaxBytes);
                     effectiveMaxCount = VectorIndexCompactor.computeTieredMaxCount(
                             snapshot.size(), vectorIndexCompactionMaxCount);
+                    effectiveMaxInputs = VectorIndexCompactor.computeTieredMaxInputs(
+                            snapshot.size(), vectorIndexCompactionMaxInputs);
                     LOGGER.log(Level.INFO,
                             "vector store {0}: tiered compaction — {1} segments → "
-                                    + "effective maxBytes={2} ({3}×), effective maxCount={4} ({3}×)",
+                                    + "effective maxBytes={2} ({3}×), effective maxCount={4} ({3}×),"
+                                    + " effective maxInputs={5} ({3}×)",
                             new Object[]{indexName, snapshot.size(),
-                                    effectiveMaxBytes, tier, effectiveMaxCount});
+                                    effectiveMaxBytes, tier, effectiveMaxCount,
+                                    effectiveMaxInputs});
                 }
             }
 
@@ -2411,7 +2466,10 @@ public class PersistentVectorStore extends AbstractVectorStore {
                     vectorIndexCompactionMinBytes,
                     effectiveMaxBytes,
                     effectiveMaxCount,
-                    vectorIndexCompactionMicroSegmentMaxNodes);
+                    vectorIndexCompactionMicroSegmentMaxNodes,
+                    // Issue #587: hard cap on input segments per cycle, tier-scaled
+                    // above so the drain rate keeps pace with the backlog.
+                    effectiveMaxInputs);
             if (candidates.isEmpty()) {
                 if (snapshot.size() >= COMPACTION_SEGMENT_COUNT_WARN_THRESHOLD) {
                     LOGGER.log(Level.WARNING,

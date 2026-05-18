@@ -305,6 +305,96 @@ final class VectorIndexCompactor {
             long maxTotalBytes,
             int maxCount,
             long microSegmentMaxNodes) {
+        return chooseSegmentsToMerge(candidates, minCount, minTotalBytes,
+                maxTotalBytes, maxCount, microSegmentMaxNodes, /*maxInputs*/ 0);
+    }
+
+    /**
+     * Hard cap on the number of input segments per compaction (issue #587):
+     * value below which a positive {@code maxInputs} is clamped. A single-input
+     * "merge" is degenerate, so any enabled cap is forced to at least 2.
+     *
+     * <p>Package-private for unit tests.
+     */
+    static final int MIN_MAX_INPUTS = 2;
+
+    /**
+     * Normalises a configured {@code maxInputs} value: {@code <= 0} disables the
+     * cap (returns {@code 0}); {@code 1} is clamped up to {@link #MIN_MAX_INPUTS}
+     * because a one-segment merge does no useful work; any larger value is
+     * returned unchanged.
+     *
+     * <p>Package-private for unit tests.
+     */
+    static int clampMaxInputs(int maxInputs) {
+        if (maxInputs <= 0) {
+            return 0;
+        }
+        return Math.max(MIN_MAX_INPUTS, maxInputs);
+    }
+
+    /**
+     * Truncates {@code picked} to at most {@code maxInputs} segments when a
+     * positive cap is configured (issue #587). The list is already sorted
+     * smallest-bytes-first, so truncation keeps the smallest segments — which
+     * maximises the contraction ratio and bounds the per-cycle remote I/O of
+     * the downstream PQ-retraining step (whose cost scales with the number of
+     * input segments). A no-op when the cap is disabled or not exceeded.
+     *
+     * <p>Package-private for unit tests.
+     */
+    static List<VectorSegment> capInputs(List<VectorSegment> picked, int maxInputs) {
+        if (maxInputs > 0 && picked.size() > maxInputs) {
+            LOGGER.log(Level.INFO,
+                    "compaction: capping merge inputs from {0} to {1} segments "
+                            + "(vector.index.compaction.maxInputs); remaining segments "
+                            + "compact in subsequent cycles",
+                    new Object[]{picked.size(), maxInputs});
+            return new ArrayList<>(picked.subList(0, maxInputs));
+        }
+        return picked;
+    }
+
+    /**
+     * Full entry point adding a hard cap on the number of input segments per
+     * compaction cycle (issue #587). See the 6-arg overload for the trigger and
+     * micro-segment semantics — they are unchanged. The cap is applied
+     * <em>after</em> the fire/no-fire decision, so it never changes whether a
+     * cycle compacts, only how many segments a single cycle merges; the
+     * leftover segments are picked up by subsequent cycles.
+     *
+     * <p><b>The cap does NOT apply to the micro-segment fast path (#570).</b>
+     * The fast path exists to reclaim segment-count slots <em>quickly</em>
+     * under memory-pressure checkpoint storms; micro-segment merges are cheap
+     * by construction (bounded by {@code microSegmentMaxNodes} live nodes), so
+     * the PQ-retraining-I/O concern that motivates the cap does not apply to
+     * them, and capping the fast path would directly throttle the back-pressure
+     * relief valve. The cap therefore truncates only the normal byte-capped
+     * selection.
+     *
+     * <p><b>Starvation safety.</b> The caller
+     * ({@link PersistentVectorStore#runCompactionCycle}) tier-scales
+     * {@code maxInputs} via {@link #computeTieredMaxInputs} exactly as it scales
+     * {@code maxTotalBytes} and {@code maxCount} (issue #354), so the per-cycle
+     * drain rate rises with the backlog. A flat cap therefore cannot starve the
+     * tailer: by the time the segment count approaches the back-pressure
+     * threshold the effective cap has scaled up with it.
+     *
+     * <p>Package-private for unit tests.
+     *
+     * @param maxInputs maximum number of input segments a single compaction
+     *     cycle may merge; {@code 0} (or negative) disables the cap. Values are
+     *     expected to be pre-normalised via {@link #clampMaxInputs} and, where
+     *     tiered scaling is enabled, already tier-scaled by the caller.
+     */
+    static List<VectorSegment> chooseSegmentsToMerge(
+            List<VectorSegment> candidates,
+            int minCount,
+            long minTotalBytes,
+            long maxTotalBytes,
+            int maxCount,
+            long microSegmentMaxNodes,
+            int maxInputs) {
         if (candidates == null || candidates.size() < minCount) {
             return new ArrayList<>();
         }
@@ -363,10 +453,13 @@ final class VectorIndexCompactor {
                 microTotal += seg.estimatedSizeBytes;
             }
             if (microPicked.size() >= 2) {
+                // Deliberately NOT capped — see method javadoc: the
+                // micro-segment fast path must stay a fast slot-reclaiming
+                // cycle (issue #570).
                 return microPicked;
             }
         }
-        return picked;
+        return capInputs(picked, maxInputs);
     }
 
     // -------------------------------------------------------------------------
@@ -438,6 +531,37 @@ final class VectorIndexCompactor {
             return Integer.MAX_VALUE;
         }
         return baseMaxCount * multiplier;
+    }
+
+    /**
+     * Returns the effective per-cycle input-segment cap (issue #587) after
+     * applying the tiered scaling factor for {@code totalSegmentCount}.
+     *
+     * <p>Tier-scaling the cap is what makes it starvation-safe: the per-cycle
+     * drain rate rises with the backlog (2×/4×/8× at 100/300/500 segments),
+     * mirroring {@link #computeTieredMaxCount}, so the cap can never let the
+     * segment count grow unboundedly toward the back-pressure threshold while
+     * still bounding worst-case per-cycle PQ-retraining I/O at each tier.
+     *
+     * <p>A disabled cap ({@code baseMaxInputs <= 0}) is returned unchanged so
+     * it stays disabled. The result is capped at {@link Integer#MAX_VALUE} to
+     * avoid overflow.
+     *
+     * <p>Package-private for unit tests.
+     */
+    static int computeTieredMaxInputs(int totalSegmentCount, int baseMaxInputs) {
+        if (baseMaxInputs <= 0) {
+            return baseMaxInputs;
+        }
+        int multiplier = tieredMultiplier(totalSegmentCount);
+        if (multiplier == 1) {
+            return baseMaxInputs;
+        }
+        // Guard against overflow.
+        if (baseMaxInputs > Integer.MAX_VALUE / multiplier) {
+            return Integer.MAX_VALUE;
+        }
+        return baseMaxInputs * multiplier;
     }
 
     /**

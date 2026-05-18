@@ -312,12 +312,19 @@ public class OptimizerMergeAdoptionRecallTest {
                 // ---------------------------------------------------------------
                 // Wait for watcher events to propagate and the store to settle to
                 // exactly 1 on-disk segment (the merged output) with at least 1
-                // successful adoption. Both conditions must be met: just reaching
-                // count==1 via drops alone (e.g. 2 drops out of 3) is insufficient.
+                // successful adoption and all 3 deprecated segments dropped.
+                //
+                // The drops>=3 condition is required, not just count==1: the
+                // onSegmentReleased callback calls store.dropSegmentByUuid()
+                // (which decrements the on-disk count) BEFORE drops.incrementAndGet(),
+                // so on a slow runner this loop could otherwise observe count==1
+                // after the 3rd drop's dropSegmentByUuid() but before its counter
+                // increment, exit early, and fail the drops>=3 assertion.
                 // ---------------------------------------------------------------
                 long deadline = System.currentTimeMillis() + 30_000L;
                 while (System.currentTimeMillis() < deadline
-                        && (store.getOnDiskSegmentCount() != 1 || adoptions.get() < 1)) {
+                        && (store.getOnDiskSegmentCount() != 1 || adoptions.get() < 1
+                                || drops.get() < 3)) {
                     Thread.sleep(20);
                 }
 
