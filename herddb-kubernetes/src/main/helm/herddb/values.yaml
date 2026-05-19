@@ -164,6 +164,14 @@ minio:
   pdb:
     enabled: false
     minAvailable: 1
+  livenessProbe:
+    periodSeconds: 20
+    timeoutSeconds: 1
+    failureThreshold: 3
+  readinessProbe:
+    periodSeconds: 10
+    timeoutSeconds: 1
+    failureThreshold: 3
   resources:
     requests:
       memory: "512Mi"
