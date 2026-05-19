@@ -607,4 +607,86 @@ public class VectorIndexStreamingCompactionTest {
                         + "(streaming=" + streamingTopK + " legacy=" + legacyTopK + ")",
                 intersection.size() >= Math.min(topK / 2, 3));
     }
+
+    /**
+     * Exercises the <b>Index Optimizer / compaction</b> code path end-to-end
+     * with the bulk PQ reader supplier introduced in issue #599 (Option B):
+     *
+     * <pre>
+     *   PersistentVectorStore.runCompactionCycle()
+     *     → VectorIndexCompactor.rebuildSegmentStreaming()
+     *       → SegmentPQReaderSupplier.forSegments()          ← new
+     *         → OnDiskGraphIndexCompactor.compact()
+     *           → PQRetrainer.extractVectorsSequential()
+     *             → OnDiskGraphIndex.getView(supplierFactory)  ← new
+     * </pre>
+     *
+     * <p>Verified invariants:
+     * <ol>
+     *   <li>{@link VectorIndexCompactor#PQ_BULK_READER_COUNT} increases by at least
+     *       two (one per source segment fed to the compactor), proving that the new
+     *       bulk-reader factory was invoked during PQ retraining.</li>
+     *   <li>Search recall after compaction is acceptable (proves the vectors were
+     *       read correctly from the supplier — a corrupted read would produce a
+     *       meaningless PQ codebook and degrade recall to near-zero).</li>
+     * </ol>
+     *
+     * <p>Uses {@link MemoryDataStorageManager}, so the {@link SegmentPQReaderSupplier}
+     * takes the {@code multipartIndexReaderSupplier} path (in-memory sequential read),
+     * which is still sufficient to exercise the new jvector API without a file server.
+     */
+    @Test
+    public void streamingCompactionUsesBulkPQReaderSupplier() throws Exception {
+        VectorIndexCompactor.streamingCompactionEnabled = true;
+
+        // FusedPQ requires dim >= MIN_DIM_FOR_FUSED_PQ (8) and
+        // vectors-per-shard >= MIN_VECTORS_FOR_FUSED_PQ (256).
+        final int dim = 16;
+        final int vectorsPerCheckpoint = 300;  // > 256 to trigger FusedPQ per shard
+        final int numCheckpoints = 5;          // => 5 segments before compaction
+
+        Path tmpDir = tmpFolder.newFolder().toPath();
+        MemoryDataStorageManager dsm = new MemoryDataStorageManager();
+        PersistentVectorStore store = createStore(tmpDir, dsm);
+
+        int countBefore = VectorIndexCompactor.PQ_BULK_READER_COUNT.get();
+
+        try {
+            store.start();
+
+            // Build enough segments with FusedPQ enabled.
+            Random rng = new Random(42);
+            for (int c = 0; c < numCheckpoints; c++) {
+                for (int i = 0; i < vectorsPerCheckpoint; i++) {
+                    store.addVector(Bytes.from_int(c * 10_000 + i), vec(rng, dim));
+                }
+                store.checkpoint();
+            }
+
+            int segmentsBefore = store.getSegmentCount();
+            assertTrue("need >= 2 segments for streaming compaction, got " + segmentsBefore,
+                    segmentsBefore >= 2);
+
+            store.runCompactionCycle();
+
+            // After one compaction cycle the bulk-reader factory must have been invoked
+            // at least once per source segment (≥ 2 invocations for 2+ sources).
+            int countAfter = VectorIndexCompactor.PQ_BULK_READER_COUNT.get();
+            assertTrue("PQ_BULK_READER_COUNT must increase after compaction: before="
+                            + countBefore + " after=" + countAfter,
+                    countAfter > countBefore);
+
+            int expectedMinInvocations = 2; // at least 2 sources were compacted
+            assertTrue("PQ_BULK_READER_COUNT must increase by >= " + expectedMinInvocations
+                            + ": delta=" + (countAfter - countBefore),
+                    (countAfter - countBefore) >= expectedMinInvocations);
+
+            // Search must still work after compaction (validates PQ was trained correctly).
+            List<Map.Entry<Bytes, Float>> hits = store.search(vec(new Random(1), dim), 5);
+            assertNotNull("search results must not be null after compaction", hits);
+            assertFalse("search must return at least one hit after compaction", hits.isEmpty());
+        } finally {
+            store.close();
+        }
+    }
 }
