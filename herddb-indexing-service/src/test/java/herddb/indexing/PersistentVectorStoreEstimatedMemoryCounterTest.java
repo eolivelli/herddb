@@ -55,12 +55,11 @@ import org.junit.rules.TemporaryFolder;
  * to diverge and the assertion to fail — which is the test contract this
  * class enforces.
  *
- * <p>The cross-check is invoked only at "clean" lifecycle points where no
- * BLink page-cache activity can have shifted a registered segment's
- * {@code estimatedInMemoryBytes()} since registration: immediately after
- * {@code start()}, after each {@code checkpoint()}, after
- * {@code runCompactionCycle()}, after {@code reloadFromStatus()}, and after
- * the all-deleted checkpoint that clears the segment list.
+ * <p>Because BLink is intentionally excluded from
+ * {@code VectorSegment.estimatedInMemoryBytes()} (issue #592), the counter
+ * and the iterated sum always agree: both count only the stable
+ * pkData/pkOffsets/pkLengths arrays.  The cross-check is therefore valid at
+ * any point in the lifecycle, not just at "quiescent BLink" moments.
  */
 public class PersistentVectorStoreEstimatedMemoryCounterTest {
 
@@ -123,8 +122,8 @@ public class PersistentVectorStoreEstimatedMemoryCounterTest {
 
     /**
      * After a single checkpoint the counter must become non-zero (segments
-     * exist now and each one's pkData/pkOffsets/pkLengths arrays plus its
-     * BLink contribute), the live iterated sum must agree exactly, and
+     * exist now and each one's pkData/pkOffsets/pkLengths arrays contribute),
+     * the live iterated sum must agree exactly, and
      * {@code estimatedMemoryUsageBytes()} must be at least the on-disk
      * portion (plus whatever live-shard overhead the empty post-checkpoint
      * shards still report).
@@ -477,6 +476,73 @@ public class PersistentVectorStoreEstimatedMemoryCounterTest {
             assertEquals("shadow segment count must match leader post-compaction",
                     leaderSegmentsPost, shadow.getSegmentCount());
             assertCounterMatchesIteration(shadow, "shadow after second reload");
+        }
+    }
+
+    /**
+     * Regression test for issue #592: verifies that the on-disk memory counter
+     * excludes the BLink pk-to-ordinal tree.
+     *
+     * <p>Before the fix, {@code VectorSegment.estimatedInMemoryBytes()} included
+     * {@code onDiskPkToNode.getUsedMemory()}, which added ≈128 B/vector of phantom
+     * cost (BLink entry overhead for a 4-byte INT key).  The total estimated cost
+     * was ≈140 B/vector instead of the true ≈12 B/vector (pkData 4 B + pkOffsets
+     * 4 B + pkLengths 4 B for INT keys), causing {@code waitForMemoryPressureRelief}
+     * to stall ingestion workers far below the actual memory limit.
+     *
+     * <p>After the fix only the heap arrays are counted.  This test inserts
+     * {@code numVectors} vectors, checkpoints, and then asserts that the per-vector
+     * on-disk cost is between the theoretical minimum (raw array bytes) and 48
+     * bytes — a threshold that is comfortably below the BLink contribution of
+     * ≈128 B/vector.
+     */
+    @Test
+    public void testOnDiskCounterExcludesBLinkPageCache() throws Exception {
+        Path tmpDir = tmpFolder.newFolder("counter-no-blink").toPath();
+        MemoryDataStorageManager dsm = new MemoryDataStorageManager();
+        MemoryManager mm = new MemoryManager(128 * 1024 * 1024, 0, 1024 * 1024, 1024 * 1024);
+
+        int numVectors = 400;
+        int dim = 16;
+        // INT keys (Bytes.from_int): 4 bytes per PK, so raw array cost is:
+        //   pkData:    4 B/vector
+        //   pkOffsets: 4 B/vector
+        //   pkLengths: 4 B/vector
+        //   ────────────────────
+        //   total:    12 B/vector  →  4800 B for 400 vectors
+        //
+        // BLink contribution (ENTRY_CONSTANT_SIZE + Bytes + Long) ≈ 128 B/vector.
+        // If BLink were still included the counter would be ≈ 140 B/vector = 56 000 B.
+        long pkArraysLowerBound = (long) numVectors * Integer.BYTES * 3; // 4800 B
+        // Upper bound: 48 B/vector leaves generous room for array header overhead
+        // while remaining clearly below the BLink contribution of 128 B/vector.
+        long blinkFreeUpperBound = (long) numVectors * 48;               // 19 200 B
+
+        Random rng = new Random(592);
+
+        try (PersistentVectorStore store = createStore(tmpDir, dsm, mm, "uuid-no-blink")) {
+            store.start();
+
+            for (int i = 0; i < numVectors; i++) {
+                store.addVector(Bytes.from_int(i), randomVector(rng, dim));
+            }
+            store.checkpoint();
+
+            assertTrue("checkpoint must have produced at least one segment",
+                    store.getSegmentCount() > 0);
+
+            long onDisk = store.getOnDiskSegmentsEstimatedMemoryBytes();
+
+            assertTrue("on-disk counter must be >= pkArray lower bound ("
+                    + pkArraysLowerBound + " B), got " + onDisk,
+                    onDisk >= pkArraysLowerBound);
+            assertTrue("on-disk counter must be < BLink-free upper bound of "
+                    + blinkFreeUpperBound + " B (≈48 B/vector); got " + onDisk
+                    + " B — if this fails, BLink.getUsedMemory() was re-introduced"
+                    + " into VectorSegment.estimatedInMemoryBytes() (issue #592)",
+                    onDisk <= blinkFreeUpperBound);
+
+            assertCounterMatchesIteration(store, "after checkpoint (BLink-free)");
         }
     }
 }
