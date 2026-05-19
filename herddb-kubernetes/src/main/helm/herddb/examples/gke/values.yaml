@@ -535,6 +535,27 @@ indexOptimizer:
     # 512 MiB write buffer — matches the IS write cap and ensures the optimizer
     # doesn't stall on gRPC back-pressure when uploading large merged graphs.
     maxInflightWriteBytes: "536870912"   # 512 MiB
+  # Direct GCS download for streaming-compaction input segments (issue #609).
+  # Mirrors the indexing-service S3 block above. With this enabled the optimizer
+  # downloads input segment graph/map files directly from GCS instead of
+  # routing every block through the gRPC file-server — same wire-throughput
+  # win that direct S3 gives the IS for cold-start recovery, applied to merge
+  # I/O. Required when the optimizer drives steady-state compaction on a
+  # bucket with thousands of segments.
+  s3:
+    directEnabled: true
+    # GCS S3-compatible endpoint — same as fileServer.s3.endpoint and
+    # indexingService.s3.endpoint.
+    endpoint: "https://storage.googleapis.com"
+    region: "auto"
+    # Must match fileServer.s3.bucket (override with --set on install).
+    bucket: "herddb-pages"
+    # Enable GCS-compatibility tweaks on the S3 client
+    # (path-style addressing + WHEN_REQUIRED SDK checksums) — required for GCS.
+    gcsCompatibility: true
+    # Reuse the same Kubernetes Secret as the file server and the IS
+    # (S3_ACCESS_KEY / S3_SECRET_KEY).
+    credentialsSecret: "herddb-gcs-credentials"
   # JVM budget matched to the indexing-service budget (same node class, same
   # memory envelope).
   #   -Xms28g -Xmx28g: same heap as the IS — large enough for PQ codebook

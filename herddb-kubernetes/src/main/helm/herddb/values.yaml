@@ -460,6 +460,29 @@ indexOptimizer:
     retries: 3
     maxInflightReadBytes: "268435456"   # 256 MiB
     maxInflightWriteBytes: "268435456"  # 256 MiB
+  # Direct S3/GCS access for streaming compaction (issue #609). Mirrors
+  # indexingService.s3 above. When enabled, the optimizer downloads input
+  # segment graph/map files directly from object storage instead of routing
+  # every block through the gRPC file-server, lifting merge throughput on
+  # large segments and removing wire-level contention against the
+  # file-server's bounded max.inflight.read.bytes semaphore.
+  s3:
+    # Set to true to enable direct object-storage downloads during merges.
+    directEnabled: false
+    # S3 endpoint URL — leave empty for AWS S3, set for GCS or MinIO.
+    # When fileServer.storageMode=s3 this should match fileServer.s3.endpoint.
+    endpoint: ""
+    # Bucket containing the segment data. Should match fileServer.s3.bucket.
+    bucket: ""
+    region: "us-east-1"
+    # Optional key prefix within the bucket. Should match fileServer.s3.prefix.
+    prefix: ""
+    # Enable GCS-compatibility tweaks (path-style addressing, WHEN_REQUIRED checksums).
+    # Set to true for GCS and MinIO. Should match fileServer.s3.gcsCompatibility.
+    gcsCompatibility: false
+    # Name of a Kubernetes Secret with S3_ACCESS_KEY and S3_SECRET_KEY entries.
+    # When set, the env vars are injected into the optimizer pods from this secret.
+    credentialsSecret: ""
   zkSessionTimeout: 40000
   # JVM options for the optimizer process. The optimizer needs enough heap and
   # direct memory to execute PQ retraining + graph-merge in a single JVM:

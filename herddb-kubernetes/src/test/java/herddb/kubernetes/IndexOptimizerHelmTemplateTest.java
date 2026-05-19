@@ -127,6 +127,77 @@ public class IndexOptimizerHelmTemplateTest {
         assertTrue(r.stdout.contains("storageClassName: \"fast-ssd\""));
     }
 
+    /**
+     * Issue #609: with the chart's default {@code indexOptimizer.s3.directEnabled=false}
+     * the configmap must NOT emit {@code indexoptimizer.s3.direct.enabled=true},
+     * and the statefulset must NOT mount {@code S3_ACCESS_KEY} /
+     * {@code S3_SECRET_KEY} env vars. This guards against an accidental regression
+     * where the helm template would unconditionally render those keys and force
+     * every deployment to ship a credentials Secret.
+     */
+    @Test
+    public void s3DirectDisabledByDefault_noS3KeysOrEnvVars() throws Exception {
+        ProcessResult r = runHelm("template", "test", chartDir.toString(),
+                "--set", "indexOptimizer.enabled=true",
+                "--set", "indexOptimizer.tablespaceName=herd");
+        assertEquals("helm template failed:\n" + r.stderr, 0, r.exitCode);
+        String yaml = r.stdout;
+        assertFalse("default render must not enable direct S3:\n" + yaml,
+                yaml.contains("indexoptimizer.s3.direct.enabled=true"));
+        assertFalse("default render must not inject S3_ACCESS_KEY env var:\n" + yaml,
+                yaml.contains("name: S3_ACCESS_KEY"));
+        assertFalse("default render must not inject S3_SECRET_KEY env var:\n" + yaml,
+                yaml.contains("name: S3_SECRET_KEY"));
+    }
+
+    /**
+     * Issue #609: with {@code indexOptimizer.s3.directEnabled=true} plus a
+     * complete GCS-style configuration (endpoint + bucket + gcsCompatibility +
+     * credentialsSecret), the configmap must emit every
+     * {@code indexoptimizer.s3.*} property and the statefulset must inject the
+     * {@code S3_ACCESS_KEY} / {@code S3_SECRET_KEY} env vars sourced from the
+     * configured Secret. Mirrors the indexing-service direct-S3 contract from
+     * issue #381.
+     */
+    @Test
+    public void s3DirectEnabled_rendersPropertiesAndCredentialEnvVars()
+            throws Exception {
+        ProcessResult r = runHelm("template", "test", chartDir.toString(),
+                "--set", "indexOptimizer.enabled=true",
+                "--set", "indexOptimizer.tablespaceName=herd",
+                "--set", "indexOptimizer.s3.directEnabled=true",
+                "--set", "indexOptimizer.s3.endpoint=https://storage.googleapis.com",
+                "--set", "indexOptimizer.s3.bucket=test-bucket",
+                "--set", "indexOptimizer.s3.region=auto",
+                "--set", "indexOptimizer.s3.prefix=herddb/",
+                "--set", "indexOptimizer.s3.gcsCompatibility=true",
+                "--set", "indexOptimizer.s3.credentialsSecret=test-gcs-creds");
+        assertEquals("helm template failed:\n" + r.stderr, 0, r.exitCode);
+        String yaml = r.stdout;
+
+        // ConfigMap rendering.
+        assertTrue("missing indexoptimizer.s3.direct.enabled=true:\n" + yaml,
+                yaml.contains("indexoptimizer.s3.direct.enabled=true"));
+        assertTrue("missing indexoptimizer.s3.endpoint:\n" + yaml,
+                yaml.contains("indexoptimizer.s3.endpoint=https://storage.googleapis.com"));
+        assertTrue("missing indexoptimizer.s3.bucket:\n" + yaml,
+                yaml.contains("indexoptimizer.s3.bucket=test-bucket"));
+        assertTrue("missing indexoptimizer.s3.region:\n" + yaml,
+                yaml.contains("indexoptimizer.s3.region=auto"));
+        assertTrue("missing indexoptimizer.s3.prefix:\n" + yaml,
+                yaml.contains("indexoptimizer.s3.prefix=herddb/"));
+        assertTrue("missing indexoptimizer.s3.gcs.compatibility=true:\n" + yaml,
+                yaml.contains("indexoptimizer.s3.gcs.compatibility=true"));
+
+        // StatefulSet env-var injection from the Secret.
+        assertTrue("S3_ACCESS_KEY env var must be injected:\n" + yaml,
+                yaml.contains("name: S3_ACCESS_KEY"));
+        assertTrue("S3_SECRET_KEY env var must be injected:\n" + yaml,
+                yaml.contains("name: S3_SECRET_KEY"));
+        assertTrue("S3 env vars must reference the credentials Secret name:\n" + yaml,
+                yaml.contains("name: test-gcs-creds"));
+    }
+
     /* ------------------- helpers ------------------- */
 
     private static boolean helmAvailable() {
