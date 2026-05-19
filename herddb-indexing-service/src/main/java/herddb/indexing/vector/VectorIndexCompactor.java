@@ -1289,19 +1289,23 @@ final class VectorIndexCompactor {
                 // a fork-join pool inside compact() iff it owns one. We hand in
                 // PhysicalCoreExecutor.pool() so the compactor never owns its executor.
                 // Pass pqReaderFactory so PQRetrainer reads from local files (issue #602).
-                OnDiskGraphIndexCompactor compactor = new OnDiskGraphIndexCompactor(
-                        localSources, liveBitsets, mappers, store.compactionSimilarity(),
-                        PhysicalCoreExecutor.pool(),
-                        pqReaderFactory);
+                // Constructor and compact() are in the same try/catch: the jvector
+                // constructor also runs validateFeatures/validateLiveNodesBounds and can
+                // throw RuntimeException on mismatched inputs (issue #602 round-3 review).
                 try {
+                    OnDiskGraphIndexCompactor compactor = new OnDiskGraphIndexCompactor(
+                            localSources, liveBitsets, mappers, store.compactionSimilarity(),
+                            PhysicalCoreExecutor.pool(),
+                            pqReaderFactory);
                     compactor.compact(graphTemp);
                 } catch (java.io.FileNotFoundException | RuntimeException e) {
                     // jvector boundary — wrap unchecked OR FileNotFoundException
                     // (declared on compact()) failures so they never reach the
-                    // outer cycle's orphan-blind catch (IOException) arm. No
-                    // orphans yet: this fires before any upload.
+                    // outer cycle's orphan-blind catch (IOException) arm. Covers both
+                    // constructor-side (validateFeatures / validateLiveNodesBounds) and
+                    // compact()-side failures. No orphans yet: this fires before any upload.
                     throw new CompactionException(FailureReason.WRITE_IO,
-                            "OnDiskGraphIndexCompactor.compact failed for segment "
+                            "OnDiskGraphIndexCompactor constructor/compact failed for segment "
                                     + segmentId, e);
                 }
 
