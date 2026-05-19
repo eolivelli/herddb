@@ -624,8 +624,10 @@ public class VectorIndexStreamingCompactionTest {
      * <p>Verified invariants:
      * <ol>
      *   <li>{@link VectorIndexCompactor#PQ_BULK_READER_COUNT} increases by at least
-     *       two (one per source segment fed to the compactor), proving that the new
-     *       bulk-reader factory was invoked during PQ retraining.</li>
+     *       two (one per source segment fed to the compactor), proving that each
+     *       bulk-reader supplier was <em>successfully obtained</em> from the factory
+     *       during PQ retraining (the counter is incremented after the factory
+     *       returns, not before).</li>
      *   <li>Search recall after compaction is acceptable (proves the vectors were
      *       read correctly from the supplier — a corrupted read would produce a
      *       meaningless PQ codebook and degrade recall to near-zero).</li>

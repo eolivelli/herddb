@@ -148,8 +148,7 @@ final class VectorIndexCompactor {
      * <p>Tests may read this counter to verify that the bulk-reader path was
      * exercised. Reset between tests if needed.
      */
-    static final java.util.concurrent.atomic.AtomicInteger PQ_BULK_READER_COUNT =
-            new java.util.concurrent.atomic.AtomicInteger(0);
+    static final AtomicInteger PQ_BULK_READER_COUNT = new AtomicInteger(0);
 
     /** Reasons a compaction run can fail; carried through to metrics. */
     enum FailureReason {
@@ -1154,8 +1153,12 @@ final class VectorIndexCompactor {
                     sources, liveBitsets, mappers, store.compactionSimilarity(),
                     PhysicalCoreExecutor.pool(),
                     odg -> {
+                        // Build the reader first; only count it after the supplier is
+                        // successfully obtained so the counter accurately reflects
+                        // successful bulk-reader acquisitions (not just invocations).
+                        ReaderSupplier supplier = pqReaderFactory.apply(odg);
                         PQ_BULK_READER_COUNT.incrementAndGet();
-                        return pqReaderFactory.apply(odg);
+                        return supplier;
                     });
             try {
                 compactor.compact(graphTemp);

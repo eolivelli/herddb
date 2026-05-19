@@ -98,6 +98,13 @@ final class SegmentPQReaderSupplier {
             List<VectorSegment> candidates,
             List<OnDiskGraphIndex> sources) {
 
+        if (candidates.size() != sources.size()) {
+            throw new IllegalArgumentException(
+                    "SegmentPQReaderSupplier: candidates.size()=" + candidates.size()
+                            + " != sources.size()=" + sources.size()
+                            + "; both lists must be positionally aligned");
+        }
+
         DataStorageManager dsm = store.dataStorageManager();
         String tsUUID = store.tableSpaceUUID();
         Path downloadDir = store.tmpDirectory();
@@ -119,6 +126,13 @@ final class SegmentPQReaderSupplier {
             String segUuid = store.segmentStorageKey(seg);
             long graphFileSize = seg.graphFileSize;
 
+            if (graphFileSize <= 0) {
+                throw new IllegalStateException(
+                        "SegmentPQReaderSupplier: graphFileSize=" + graphFileSize
+                                + " for segment " + segUuid + " — segment graph has not been"
+                                + " persisted yet or was not populated correctly");
+            }
+
             if (dsm.supportsDirectMultipartDownload()) {
                 // Fast path: download directly from object storage (S3/GCS/MinIO),
                 // bypassing the gRPC file-server. The temp file lives in the IS data
@@ -133,17 +147,19 @@ final class SegmentPQReaderSupplier {
                     success = true;
                     return new DeleteOnCloseReaderSupplier(mmap, tempFile);
                 } catch (IOException e) {
-                    deleteSilently(tempFile);
                     throw new UncheckedIOException(
                             "SegmentPQReaderSupplier: failed to download segment graph for PQ retraining"
                                     + " (tsUUID=" + tsUUID + ", segUuid=" + segUuid + ")", e);
                 } catch (DataStorageManagerException e) {
-                    deleteSilently(tempFile);
-                    throw new RuntimeException(
+                    throw new IllegalStateException(
                             "SegmentPQReaderSupplier: storage error while downloading segment graph for PQ retraining"
                                     + " (tsUUID=" + tsUUID + ", segUuid=" + segUuid + ")", e);
                 } finally {
                     if (!success) {
+                        // Clean up the temp file on any failure path — the catch blocks
+                        // above re-throw without deleting, so the finally is the sole
+                        // cleanup point. deleteSilently is idempotent; if the file was
+                        // never created (null) it is a no-op.
                         deleteSilently(tempFile);
                     }
                 }
@@ -152,10 +168,12 @@ final class SegmentPQReaderSupplier {
                 // MemoryDataStorageManager). Still avoids per-node block-cache reads
                 // because the whole file is served by a single ReaderSupplier whose
                 // get() returns a reader over the complete file content.
+                // The compactor (jvector OnDiskGraphIndexCompactor) calls close() on
+                // every factory-produced supplier after use, so no leak occurs here.
                 try {
                     return dsm.multipartIndexReaderSupplier(tsUUID, segUuid, "graph", graphFileSize);
                 } catch (DataStorageManagerException e) {
-                    throw new RuntimeException(
+                    throw new IllegalStateException(
                             "SegmentPQReaderSupplier: failed to open multipart reader for PQ retraining"
                                     + " (tsUUID=" + tsUUID + ", segUuid=" + segUuid + ")", e);
                 }
