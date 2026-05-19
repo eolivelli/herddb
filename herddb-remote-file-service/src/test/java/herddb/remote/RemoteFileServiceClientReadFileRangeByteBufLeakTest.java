@@ -27,16 +27,32 @@ import static org.junit.Assert.fail;
 import herddb.proto.Pdu;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.PooledByteBufAllocator;
+import java.io.IOException;
+import java.util.concurrent.CompletableFuture;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.Timeout;
 
 /**
- * Regression tests for issue #582:
+ * Regression tests for issue #582 and issue #596.
+ *
+ * <h3>Issue #582 — exception-path leak</h3>
  * {@link RemoteFileServiceClient#parseReadFileRangeResponse} and
  * {@link RemoteFileServiceClient#parseReadFileResponse} must release the
  * allocated direct {@code ByteBuf buf} when the PDU-content read throws
  * after the allocation but before returning the buffer to the caller.
+ *
+ * <h3>Issue #596 — normal-path leak (future-cancellation race)</h3>
+ * When the parser returns a {@code ByteBuf} successfully but
+ * {@code CompletableFuture.complete(value)} returns {@code false} — because
+ * the future was already cancelled or completed exceptionally by a concurrent
+ * timeout / channel-idle event — the {@code ByteBuf} is abandoned with
+ * refcount = 1. {@link RemoteFileServiceClient#completeOrRelease} fixes this
+ * by calling {@link io.netty.util.ReferenceCountUtil#safeRelease} whenever
+ * {@code complete()} returns {@code false}. Tests for this fix verify that
+ * pre-cancelled or already-exceptionally-completed futures cause the buffer
+ * to be released, while a normally-completing future leaves the buffer owned
+ * by the caller.
  *
  * <h3>How the leak is triggered</h3>
  * Both parsers follow the pattern:
@@ -324,6 +340,99 @@ public class RemoteFileServiceClientReadFileRangeByteBufLeakTest {
             }
             pdu.close();
         }
+        assertEquals("refCnt must drop to 0 after caller releases the buffer",
+                0, captured[0].refCnt());
+    }
+
+    // -------------------------------------------------------------------------
+    // completeOrRelease — issue #596: normal-path future-cancellation leak
+    // -------------------------------------------------------------------------
+
+    /**
+     * Regression test for issue #596 (primary scenario):
+     * {@link RemoteFileServiceClient#completeOrRelease} must release the
+     * {@code ByteBuf} when the target future is already cancelled.
+     *
+     * <p>This simulates the production race: the safety-net timeout in
+     * {@code getUnchecked()} cancels the outer {@link CompletableFuture}
+     * while the network response is in flight.  When the callback finally
+     * fires, {@code parser.parse()} allocates a {@code ByteBuf} successfully,
+     * but {@code future.complete(buf)} returns {@code false}.  Before the fix,
+     * {@code buf} was abandoned (refCnt = 1, never released).  The fix calls
+     * {@code ReferenceCountUtil.safeRelease(buf)}, dropping refCnt to 0.
+     */
+    @Test
+    public void testCompleteOrRelease_releasesWhenFutureCancelled() {
+        final ByteBuf[] captured = {null};
+        PooledByteBufAllocator spy = spyAllocator(captured);
+
+        ByteBuf buf = spy.directBuffer(16);
+        assertEquals("precondition: freshly allocated buffer must have refCnt == 1",
+                1, buf.refCnt());
+
+        CompletableFuture<ByteBuf> future = new CompletableFuture<>();
+        future.cancel(false);  // simulate safety-net timeout
+
+        RemoteFileServiceClient.completeOrRelease(future, buf);
+
+        assertEquals(
+                "completeOrRelease must release the ByteBuf when future.complete() returns false"
+                        + " due to cancellation (issue #596 regression)",
+                0, captured[0].refCnt());
+    }
+
+    /**
+     * Issue #596, error-race variant: {@code completeOrRelease} must release
+     * the {@code ByteBuf} when the future was already completed exceptionally
+     * (e.g., a concurrent channel-idle error completed it before the parsed
+     * response arrived).
+     */
+    @Test
+    public void testCompleteOrRelease_releasesWhenFutureAlreadyCompletedExceptionally() {
+        final ByteBuf[] captured = {null};
+        PooledByteBufAllocator spy = spyAllocator(captured);
+
+        ByteBuf buf = spy.directBuffer(16);
+        assertEquals("precondition: freshly allocated buffer must have refCnt == 1",
+                1, buf.refCnt());
+
+        CompletableFuture<ByteBuf> future = new CompletableFuture<>();
+        future.completeExceptionally(new IOException("channel closed"));
+
+        RemoteFileServiceClient.completeOrRelease(future, buf);
+
+        assertEquals(
+                "completeOrRelease must release the ByteBuf when future is already "
+                        + "completed exceptionally (issue #596 race variant)",
+                0, captured[0].refCnt());
+    }
+
+    /**
+     * Issue #596, normal-completion guard: {@code completeOrRelease} must NOT
+     * release the {@code ByteBuf} when the future accepts the value (i.e., when
+     * {@code future.complete(buf)} returns {@code true}).  The caller is then
+     * responsible for releasing the buffer, exactly as before.
+     */
+    @Test
+    public void testCompleteOrRelease_doesNotReleaseWhenFutureAcceptsValue() {
+        final ByteBuf[] captured = {null};
+        PooledByteBufAllocator spy = spyAllocator(captured);
+
+        ByteBuf buf = spy.directBuffer(16);
+
+        CompletableFuture<ByteBuf> future = new CompletableFuture<>();
+
+        RemoteFileServiceClient.completeOrRelease(future, buf);
+
+        // The buffer must still be alive — the caller (future's dependent) owns it.
+        assertEquals(
+                "completeOrRelease must NOT release the ByteBuf when future.complete() "
+                        + "returns true: caller now owns the refcount (issue #596 guard)",
+                1, captured[0].refCnt());
+        assertEquals("future must hold the buffer", buf, future.getNow(null));
+
+        // Cleanup — simulate the caller releasing the buffer.
+        future.getNow(null).release();
         assertEquals("refCnt must drop to 0 after caller releases the buffer",
                 0, captured[0].refCnt());
     }
