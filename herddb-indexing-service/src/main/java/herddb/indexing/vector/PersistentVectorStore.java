@@ -1134,7 +1134,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
      * that does not fit in {@code int}; their storage key is stored explicitly in
      * {@link VectorSegment#externalStorageKey} during adoption.
      */
-    private String segmentStorageKey(VectorSegment seg) {
+    String segmentStorageKey(VectorSegment seg) {
         return seg.externalStorageKey != null
                 ? seg.externalStorageKey
                 : (indexUUID + "_seg" + seg.segmentId);
@@ -3403,6 +3403,24 @@ public class PersistentVectorStore extends AbstractVectorStore {
      */
     Path tmpDirectory() {
         return tmpDirectory;
+    }
+
+    /**
+     * Package-private accessor for the tablespace UUID. Used by
+     * {@link SegmentPQReaderSupplier} to construct the correct storage key for
+     * downloading segment graph files during PQ retraining (issue #599).
+     */
+    String tableSpaceUUID() {
+        return tableSpaceUUID;
+    }
+
+    /**
+     * Package-private accessor for the data storage manager. Used by
+     * {@link SegmentPQReaderSupplier} to download segment graph files for bulk
+     * sequential vector reads during PQ retraining (issue #599).
+     */
+    herddb.storage.DataStorageManager dataStorageManager() {
+        return dataStorageManager;
     }
 
     SegmentWriteResult writeSyntheticShard(LiveGraphShard syntheticShard,

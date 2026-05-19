@@ -22,6 +22,7 @@ package herddb.indexing.vector;
 import herddb.indexing.vector.PersistentVectorStore.PendingDelete;
 import herddb.storage.DataStorageManagerException;
 import herddb.utils.Bytes;
+import io.github.jbellis.jvector.disk.ReaderSupplier;
 import io.github.jbellis.jvector.graph.GraphIndexBuilder;
 import io.github.jbellis.jvector.graph.disk.OnDiskGraphIndex;
 import io.github.jbellis.jvector.graph.disk.OnDiskGraphIndexCompactor;
@@ -43,6 +44,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Function;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -133,6 +135,20 @@ final class VectorIndexCompactor {
     public static long getStreamingFallbackToLegacyTotal() {
         return STREAMING_FALLBACK_TO_LEGACY_TOTAL.get();
     }
+
+    /**
+     * Process-wide counter incremented each time {@link SegmentPQReaderSupplier}
+     * is invoked for a source segment during PQ retraining in
+     * {@link #rebuildSegmentStreaming} (issue #599 Option B).
+     *
+     * <p>Each invocation corresponds to one segment whose graph file was either
+     * downloaded directly from object storage or opened via the DSM's sequential
+     * reader, bypassing the per-node block-cache path.
+     *
+     * <p>Tests may read this counter to verify that the bulk-reader path was
+     * exercised. Reset between tests if needed.
+     */
+    static final AtomicInteger PQ_BULK_READER_COUNT = new AtomicInteger(0);
 
     /** Reasons a compaction run can fail; carried through to metrics. */
     enum FailureReason {
@@ -1122,12 +1138,28 @@ final class VectorIndexCompactor {
         // side-effect still matters.
         long startNodeId = store.allocateCompactionNodeIds(keptCount);
         try {
+            // Build a bulk reader-supplier factory so PQRetrainer downloads each source
+            // segment's graph file once (to IS data dir or DSM reader) instead of
+            // issuing one gRPC round-trip per sampled node (issue #599 Option B).
+            // The factory is tracked via PQ_BULK_READER_COUNT for test observability.
+            Function<OnDiskGraphIndex, ReaderSupplier> pqReaderFactory =
+                    SegmentPQReaderSupplier.forSegments(store, candidates, sources);
+
             // OnDiskGraphIndexCompactor is not AutoCloseable: it self-shuts-down
             // a fork-join pool inside compact() iff it owns one. We hand in
             // PhysicalCoreExecutor.pool() so the compactor never owns its executor.
+            // Pass the factory so resolvePQFromSources uses bulk reads (issue #599).
             OnDiskGraphIndexCompactor compactor = new OnDiskGraphIndexCompactor(
                     sources, liveBitsets, mappers, store.compactionSimilarity(),
-                    PhysicalCoreExecutor.pool());
+                    PhysicalCoreExecutor.pool(),
+                    odg -> {
+                        // Build the reader first; only count it after the supplier is
+                        // successfully obtained so the counter accurately reflects
+                        // successful bulk-reader acquisitions (not just invocations).
+                        ReaderSupplier supplier = pqReaderFactory.apply(odg);
+                        PQ_BULK_READER_COUNT.incrementAndGet();
+                        return supplier;
+                    });
             try {
                 compactor.compact(graphTemp);
             } catch (java.io.FileNotFoundException | RuntimeException e) {
