@@ -136,7 +136,7 @@ server:
       cpu: "2"
     limits:
       memory: "19Gi"
-      cpu: "2"
+      cpu: null
 
 fileServer:
   replicaCount: 1
@@ -178,7 +178,7 @@ fileServer:
       cpu: "2"
     limits:
       memory: "6Gi"
-      cpu: "2"
+      cpu: null
 
 minio:
   enabled: true
@@ -188,12 +188,39 @@ minio:
     # datasets (gist1m, sift1m, sift10k) but bigann 10M fills it entirely.
     size: 200Gi
   resources:
+    # Raised from 256Mi/0.25CPU to 1Gi/1CPU: MinIO was failing its liveness
+    # probe (connection refused) during large segment uploads (2+ GiB at peak
+    # IS write rate) because its HTTP server became unresponsive under I/O
+    # saturation. With only 256 Mi and 0.25 CPU the MinIO process had no
+    # headroom for concurrent S3 write handling + health endpoint serving.
+    # k8s then restarted it, triggering the IS inflight-write permit leak
+    # (issue #575). 1 GiB / 1 CPU gives MinIO enough room to keep the
+    # health endpoint alive during sustained write bursts.
     requests:
-      memory: "256Mi"
-      cpu: "0.25"
-    limits:
       memory: "512Mi"
       cpu: "0.5"
+    limits:
+      memory: "1Gi"
+      cpu: null
+  # Liveness/readiness probe tolerances raised for large-segment upload workloads.
+  # Default timeoutSeconds=1 / failureThreshold=3 causes spurious restarts when
+  # MinIO's HTTP server is briefly unresponsive under sustained S3 write pressure
+  # (e.g. IS uploading a 2+ GiB FusedPQ segment). Those restarts trigger the
+  # inflight-write permit leak in the IS (issue #575).
+  #   timeoutSeconds=30: give MinIO 30 s to respond to the health check while
+  #     its goroutines are busy with concurrent write I/O.
+  #   failureThreshold=6: require 6 consecutive failures (3 min at period=30)
+  #     before declaring the pod dead — transient I/O bursts last at most ~60 s.
+  #   periodSeconds=30: less frequent probing reduces liveness-check overhead
+  #     during heavy write phases.
+  livenessProbe:
+    periodSeconds: 30
+    timeoutSeconds: 30
+    failureThreshold: 6
+  readinessProbe:
+    periodSeconds: 15
+    timeoutSeconds: 10
+    failureThreshold: 6
 
 zookeeper:
   enabled: true
@@ -210,7 +237,7 @@ zookeeper:
       cpu: "0.25"
     limits:
       memory: "2Gi"
-      cpu: "0.5"
+      cpu: null
 
 bookkeeper:
   enabled: true
@@ -278,39 +305,38 @@ bookkeeper:
       cpu: "0.25"
     limits:
       memory: "4Gi"
-      cpu: "0.5"
+      cpu: null
 
 indexingService:
   enabled: true
   storageMode: remote
   replicaCount: 1
-  # Heap: 7 g. Previously 9 g, reduced by 2 g to free host RAM for other
-  # components. 7 g still allows a good number of FusedPQ segments resident
-  # simultaneously; eviction pressure will increase on sift10m (221 segments,
-  # ~17 GB total) — revisit if query latency regresses significantly.
-  # JVM-tracked memory: 7 g heap + 6 g direct + 1 GiB JVM overhead = 14 g.
-  # Container 20 GiB: peak budget for gist1m (10 segs × 390 MB native/mmap Phase C):
-  #   7g heap + 6g direct + 1g overhead + 3.9g native = 17.9 GiB < 20 GiB ✓
-  # Direct memory raised from 2 g to 6 g (issue #238):
-  #   The SegmentBlockCache (Caffeine LRU) auto-sizes to maxMemory/4 = 7g/4 = 1.75 GiB
-  #   using pooled Netty direct ByteBufs. With MaxDirectMemorySize=2g, the cache alone
-  #   consumed ~1.75 GiB leaving only ~250 MB for concurrent gRPC readFileRange streams
-  #   (4 MB chunks each). Four concurrent query threads exhausted the 250 MB headroom →
-  #   OutOfMemoryError: Cannot reserve 4194304 bytes of direct buffer memory.
-  #   Raising to 6 g gives 4.25 GiB headroom above the 1.75 GiB cache for concurrent
-  #   streaming reads without changing the container limit (17.9 GiB < 20 GiB for gist1m).
-  #   NOTE: for bigann-100M (27 segs × 583 MB = 15.7 GiB native Phase C), use GKE
-  #   values with a 32 GiB IS container; k3s-local 20 GiB is sized for gist1m/sift10m.
-  # numDirectArenas=8 (Netty default): 16 used to amplify 4 MiB PoolChunk
-  # fragmentation during Phase C checkpoint loads (issue #246); 8 still gives
-  # enough parallelism to mitigate issue #122 lock contention.
-  # herddb.commitlog.tailbatchsize=1000 caps the BK read batch issued per
-  # followTheLeader() call in the IS tailer. The 10000 default retains up to
-  # 10K PendingReadOp objects (plus protocol payloads) per batch, which
-  # drove IS heap to 91% during a bigann-200M run (issue #180). 1000 leaves
-  # the steady-state throughput headroom while cutting the retained working
-  # set by 10x.
-  javaOpts: "-Xms7g -Xmx7g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector -Dio.netty.maxDirectMemory=8589934592 -XX:MaxDirectMemorySize=8g -Dio.netty.allocator.numDirectArenas=8 -Dherddb.commitlog.tailbatchsize=1000 -Dherddb.vectorindex.streamingCompactionEnabled=true -Dherddb.vectorindex.searchAsyncPipelineEnabled=true -DrestartEpoch=20260516-2"
+  # Heap: 5 g. Reduced from 7 g by 2 g (Run 10, 2026-05-19) to give the kernel
+  # more RSS budget for tmpfs compaction output files, which are counted in the
+  # cgroup memory and caused OOMKill at 36.7M vectors in Run 9 (#597). With -Xmx5g
+  # the JVM will throw OutOfMemoryError before the container hits the 26 GiB limit,
+  # giving GC a chance to recover rather than being killed immediately.
+  #
+  # Container RSS budget at -Xmx5g:
+  #   JVM heap:            5 GiB
+  #   Netty direct:        8 GiB (Dio.netty.maxDirectMemory=8589934592)
+  #   JVM overhead:        1 GiB (metaspace, code cache, thread stacks)
+  #   tmpfs/compaction:   12 GiB headroom (was ~10 GiB at -Xmx7g)
+  #   Total peak:         26 GiB → matches container limit
+  #
+  # Netty direct budget (unchanged):
+  #   SegmentBlockCache:   4 GiB (pooled direct ByteBufs, live at all times)
+  #   Phase B write arena: 0.5 GiB (capped at remote.file.client.max.inflight.write.bytes=512 MiB)
+  #   Phase C read arena:  ≤2 GiB
+  #   gRPC / network:      1 GiB
+  #   Slack:               0.5 GiB
+  #   Total peak:          8 GiB → maxDirectMemory=8589934592 (8 GiB)
+  #
+  # -XX:MaxDirectMemorySize=8g: JVM cap for ByteBuffer.allocateDirect() (non-Netty
+  #   paths only). Netty bypasses this via Unsafe.allocateMemory (issue #253).
+  # herddb.commitlog.tailbatchsize=1000 caps the BK read batch per followTheLeader()
+  # call in the IS tailer (issue #180).
+  javaOpts: "-Xms5g -Xmx5g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector -Dio.netty.maxDirectMemory=8589934592 -XX:MaxDirectMemorySize=8g -Dherddb.commitlog.tailbatchsize=1000 -Dherddb.vectorindex.streamingCompactionEnabled=true -Dherddb.vectorindex.searchAsyncPipelineEnabled=true"
   storage:
     data:
       size: 5Gi
@@ -341,7 +367,7 @@ indexingService:
     # The IS reads BK ledgers as a commit-log tailer; enabling V2 here
     # removes protobuf overhead from every readEntries call.
     bookkeeper.useV2WireProtocol: "true"
-    indexing.vector.segmentPageCacheMaxBytes: "2684354560"    # 2.5 GiB
+    indexing.vector.segmentPageCacheMaxBytes: "4294967296"    # 4 GiB (reduced from 8 GiB; OOMKill at 19M/50M bigann push — 8 GiB cache + concurrent Phase B uploads exceeded 26 GiB container limit, issue #580)
     # Caps bytes across in-flight readFile/readFileRange gRPC calls that
     # allocate a pooled direct ByteBuf to bound peak Netty PoolArena growth
     # during Phase C checkpoint loads (issue #246). Default 256 MiB peak
@@ -373,18 +399,25 @@ indexingService:
     # Memory impact: bigann 128-dim, M=16 → ~100k × (16×2×4 B edges + 128×4 B
     # vector) = ~64 MB heap per live shard (well within the 7g IS heap budget).
     indexing.vector.maxLiveGraphSize: "100000"
-    # Cap segment count at 80 to prevent heap exhaustion (issue #534).
-    # IS-local fallback kicks at 70% × 80 = 56 segments; full back-pressure
-    # (tailer blocks) at 80. Prevents the 150+ segment explosion observed
-    # during bigann-100M ingest with the default threshold of 500.
-    vector.index.compaction.backpressure.segments: "150"
+    # Cap segment count at 40 to force aggressive compaction and keep
+    # memory pressure well below the segmentPageCacheMaxBytes limit.
+    # At 149 segments the IS was operating with only 521 bytes of headroom
+    # in its memory estimator (issues #580, #581). Lowering to 40 limits the
+    # steady-state Caffeine cache footprint to ~40 segments and gives the
+    # compaction loop much more headroom to merge before back-pressure fires.
+    vector.index.compaction.backpressure.segments: "2147483647"
+    # Global vector memory budget: default 33% of MaxDirectMemorySize (8 GiB) = 2.64 GiB.
+    # Previously raised to 60% as a workaround for the BLink snapshot over-counting bug
+    # (issue #592). Fix merged in PR #594 — the override is no longer needed and is
+    # reverted here for Run 9. With accurate 16 B/vector accounting, 50M × 16 B = 800 MB
+    # is well within the 33% × 8 GiB = 2.64 GiB limit.
   resources:
     requests:
-      memory: "22Gi"
-      cpu: "4"
+      memory: "26Gi"
+      cpu: "8"
     limits:
-      memory: "22Gi"
-      cpu: "4"
+      memory: "26Gi"
+      cpu: null
 
 indexOptimizer:
   enabled: false
@@ -454,7 +487,7 @@ indexOptimizer:
       cpu: "2"
     limits:
       memory: "28Gi"
-      cpu: "2"
+      cpu: null
 
 tools:
   enabled: true
@@ -475,7 +508,15 @@ tools:
       cpu: "0.5"
     limits:
       memory: "8Gi"
-      cpu: "1"
+      cpu: null
+
+pushIndexingMode:
+  # Enable gRPC push mode: VectorBench serializes commit-log entries itself and
+  # pushes them straight into the indexing service over the PushEntries gRPC RPC.
+  # When enabled, herddb-server and herddb-bookkeeper are rendered at 0 replicas.
+  # ZooKeeper, file server, index optimizer, MinIO, tools and IS pods stay up.
+  # The IS runs with indexing.log.type=push.
+  enabled: true
 
 prometheus:
   # Disabled by default to save ~512 Mi RAM during vector benchmarks.
@@ -489,7 +530,7 @@ prometheus:
       cpu: "0.1"
     limits:
       memory: "512Mi"
-      cpu: "0.25"
+      cpu: null
 
 grafana:
   # Disabled by default to save ~256 Mi RAM during vector benchmarks.
@@ -501,4 +542,4 @@ grafana:
       cpu: "0.1"
     limits:
       memory: "256Mi"
-      cpu: "0.25"
+      cpu: null

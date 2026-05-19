@@ -41,13 +41,17 @@ spec:
               path: /minio/health/live
               port: s3-api
             initialDelaySeconds: 10
-            periodSeconds: 20
+            periodSeconds: {{ .Values.minio.livenessProbe.periodSeconds | default 20 }}
+            timeoutSeconds: {{ .Values.minio.livenessProbe.timeoutSeconds | default 1 }}
+            failureThreshold: {{ .Values.minio.livenessProbe.failureThreshold | default 3 }}
           readinessProbe:
             httpGet:
               path: /minio/health/ready
               port: s3-api
             initialDelaySeconds: 5
-            periodSeconds: 10
+            periodSeconds: {{ .Values.minio.readinessProbe.periodSeconds | default 10 }}
+            timeoutSeconds: {{ .Values.minio.readinessProbe.timeoutSeconds | default 1 }}
+            failureThreshold: {{ .Values.minio.readinessProbe.failureThreshold | default 3 }}
           resources:
             {{- toYaml .Values.minio.resources | nindent 12 }}
           volumeMounts:
