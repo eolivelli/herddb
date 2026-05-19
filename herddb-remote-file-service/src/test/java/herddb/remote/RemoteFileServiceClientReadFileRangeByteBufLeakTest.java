@@ -27,6 +27,7 @@ import static org.junit.Assert.fail;
 import herddb.proto.Pdu;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.PooledByteBufAllocator;
+import java.io.IOException;
 import java.util.concurrent.CompletableFuture;
 import org.junit.Rule;
 import org.junit.Test;
@@ -396,7 +397,7 @@ public class RemoteFileServiceClientReadFileRangeByteBufLeakTest {
                 1, buf.refCnt());
 
         CompletableFuture<ByteBuf> future = new CompletableFuture<>();
-        future.completeExceptionally(new java.io.IOException("channel closed"));
+        future.completeExceptionally(new IOException("channel closed"));
 
         RemoteFileServiceClient.completeOrRelease(future, buf);
 
