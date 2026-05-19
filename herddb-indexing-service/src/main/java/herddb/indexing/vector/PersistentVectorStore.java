@@ -5853,9 +5853,9 @@ public class PersistentVectorStore extends AbstractVectorStore {
             //
             // Capture snapshots BEFORE publishing newSegments: if any
             // estimatedInMemoryBytes() call were ever to throw (e.g. an
-            // unforeseen failure inside BLink.getUsedMemory()), unwinding
-            // before the publish leaves both this.segments and the counter
-            // consistent — no half-updated-counter window.
+            // unforeseen runtime failure), unwinding before the publish
+            // leaves both this.segments and the counter consistent —
+            // no half-updated-counter window.
             //
             // Issue #538 pr-reviewer pass-4: ordering is now `reapply →
             // register → publish`, so a throw in the reapply above also

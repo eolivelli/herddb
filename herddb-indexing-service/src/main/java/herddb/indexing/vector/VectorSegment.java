@@ -423,7 +423,8 @@ class VectorSegment implements Closeable {
      * (e.g. before the segment is fully loaded) contribute 0.
      *
      * @return estimated bytes of heap occupied by this segment's pkData /
-     *         pkOffsets / pkLengths arrays (~16 B/vector for BIGINT PKs)
+     *         pkOffsets / pkLengths arrays (~12 B/vector for 4-byte INT PKs,
+     *         ~16 B/vector for 8-byte BIGINT PKs)
      */
     long estimatedInMemoryBytes() {
         long bytes = 0;
