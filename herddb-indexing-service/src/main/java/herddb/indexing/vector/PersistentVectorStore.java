@@ -6593,17 +6593,32 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
         writingGraphActive.incrementAndGet();
         try {
-            // Create a zero-copy view over this shard's per-shard VectorStorage.
-            VectorStorageShardView shardView = new VectorStorageShardView(
-                    shard.vectorStorage, shardSize, snapshotDimension);
-
             // Get the shard's already-built OnHeapGraphIndex (no rebuild!)
             OnHeapGraphIndex shardGraph = (OnHeapGraphIndex) shard.builder.getGraph();
+
+            // Issue #605: use idUpperBound (not shardSize / nodeToPk.size()) as the
+            // VectorStorageShardView size so that pqv.count covers the full original-ordinal
+            // range [0, idUpperBound). When vectors are deleted from a live shard,
+            // markNodeDeleted() is called but vectorStorage.remove() is NOT (that only
+            // happens when builder == null). maxNodeId is monotonically increasing, so
+            // idUpperBound stays at "total ever added" even after deletions.  The jvector
+            // writer calls pqv.get(originalOrdinal) using original graph ordinals, which
+            // can reach idUpperBound-1 even though nodeToPk.size() == idUpperBound-1
+            // (one deletion means live count == total-1 but highest ordinal is still total-1).
+            // Using shardSize here would make pqv.count == shardSize, and
+            // pqv.get(shardSize) would throw IndexOutOfBoundsException.
+            int graphIdUpperBound = shardGraph.getIdUpperBound();
+
+            // Create a zero-copy view over this shard's per-shard VectorStorage.
+            // Size = graphIdUpperBound (not shardSize) — see issue #605 comment above.
+            VectorStorageShardView shardView = new VectorStorageShardView(
+                    shard.vectorStorage, graphIdUpperBound, snapshotDimension);
 
             // Determine whether FusedPQ is used for this shard.
             // Small shards (< MIN_VECTORS_FOR_FUSED_PQ) do not write the FusedPQ
             // feature, so PQ training is skipped entirely for them (it was
             // computed but unused in the original code — issue #281).
+            // Use shardSize (live count) for this check, not graphIdUpperBound.
             int pqSubspaces = Math.max(1, snapshotDimension / 4);
             boolean useFusedPQForShard = shardSize >= MIN_VECTORS_FOR_FUSED_PQ;
             // For FusedPQ-eligible shards, reuse the cached codebook when possible
