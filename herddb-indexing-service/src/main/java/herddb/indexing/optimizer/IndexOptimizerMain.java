@@ -433,12 +433,17 @@ public final class IndexOptimizerMain {
         int kwayMax = configuration.getInt(
                 OptimizerConfiguration.PROPERTY_MERGE_KWAY_MAX,
                 OptimizerConfiguration.PROPERTY_MERGE_KWAY_MAX_DEFAULT);
+        // Issue #602: per-cycle download budget cap.
+        long mergeMaxInputBytes = configuration.getLong(
+                OptimizerConfiguration.PROPERTY_MERGE_MAX_INPUT_BYTES,
+                OptimizerConfiguration.PROPERTY_MERGE_MAX_INPUT_BYTES_DEFAULT);
         MergePolicy policy = new MergePolicy.AggressivePolicy(
-                targetMaxBytes, perCycleMaxBytes, maxCount, kwayMax);
+                targetMaxBytes, perCycleMaxBytes, maxCount, kwayMax, mergeMaxInputBytes);
         LOGGER.log(Level.INFO,
                 "merge policy: AggressivePolicy(targetMaxBytes={0}, perCycleMaxBytes={1},"
-                        + " maxCount={2}, kwayMax={3})",
-                new Object[]{targetMaxBytes, perCycleMaxBytes, maxCount, kwayMax});
+                        + " maxCount={2}, kwayMax={3}, maxInputBytes={4})",
+                new Object[]{targetMaxBytes, perCycleMaxBytes, maxCount, kwayMax,
+                        mergeMaxInputBytes});
 
         // Resolve the merger (SPI override → preconfigured → RemoteSegmentMerger
         // → NoopMerger) and the DataStorageManager that drives it (only when

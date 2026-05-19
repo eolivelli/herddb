@@ -609,36 +609,34 @@ public class VectorIndexStreamingCompactionTest {
     }
 
     /**
-     * Exercises the <b>Index Optimizer / compaction</b> code path end-to-end
-     * with the bulk PQ reader supplier introduced in issue #599 (Option B):
+     * Exercises the streaming compaction code path end-to-end with the
+     * eager source-graph download introduced in issue #602:
      *
      * <pre>
      *   PersistentVectorStore.runCompactionCycle()
      *     → VectorIndexCompactor.rebuildSegmentStreaming()
-     *       → SegmentPQReaderSupplier.forSegments()          ← new
+     *       → eager download of all source graphs to local temp files
      *         → OnDiskGraphIndexCompactor.compact()
      *           → PQRetrainer.extractVectorsSequential()
-     *             → OnDiskGraphIndex.getView(supplierFactory)  ← new
+     *             → OnDiskGraphIndex.getView(pqReaderFactory)
      * </pre>
      *
      * <p>Verified invariants:
      * <ol>
-     *   <li>{@link VectorIndexCompactor#PQ_BULK_READER_COUNT} increases by at least
-     *       two (one per source segment fed to the compactor), proving that each
-     *       bulk-reader supplier was <em>successfully obtained</em> from the factory
-     *       during PQ retraining (the counter is incremented after the factory
-     *       returns, not before).</li>
+     *   <li>{@link VectorIndexCompactor#COMPACTION_EAGER_DOWNLOAD_COUNT} increases
+     *       by at least two (one per source segment), proving that each source
+     *       graph was successfully prepared (downloaded or copied) for local use.</li>
      *   <li>Search recall after compaction is acceptable (proves the vectors were
-     *       read correctly from the supplier — a corrupted read would produce a
-     *       meaningless PQ codebook and degrade recall to near-zero).</li>
+     *       read correctly — a corrupted read would produce a meaningless PQ
+     *       codebook and degrade recall to near-zero).</li>
      * </ol>
      *
-     * <p>Uses {@link MemoryDataStorageManager}, so the {@link SegmentPQReaderSupplier}
-     * takes the {@code multipartIndexReaderSupplier} path (in-memory sequential read),
-     * which is still sufficient to exercise the new jvector API without a file server.
+     * <p>Uses {@link MemoryDataStorageManager}, so the eager-download path
+     * takes the copy-via-multipart-reader fallback (in-memory sequential read),
+     * which is still sufficient to exercise the new code without a file server.
      */
     @Test
-    public void streamingCompactionUsesBulkPQReaderSupplier() throws Exception {
+    public void streamingCompactionUsesEagerDownload() throws Exception {
         VectorIndexCompactor.streamingCompactionEnabled = true;
 
         // FusedPQ requires dim >= MIN_DIM_FOR_FUSED_PQ (8) and
@@ -651,7 +649,7 @@ public class VectorIndexStreamingCompactionTest {
         MemoryDataStorageManager dsm = new MemoryDataStorageManager();
         PersistentVectorStore store = createStore(tmpDir, dsm);
 
-        int countBefore = VectorIndexCompactor.PQ_BULK_READER_COUNT.get();
+        long countBefore = VectorIndexCompactor.COMPACTION_EAGER_DOWNLOAD_COUNT.get();
 
         try {
             store.start();
@@ -671,17 +669,18 @@ public class VectorIndexStreamingCompactionTest {
 
             store.runCompactionCycle();
 
-            // After one compaction cycle the bulk-reader factory must have been invoked
-            // at least once per source segment (≥ 2 invocations for 2+ sources).
-            int countAfter = VectorIndexCompactor.PQ_BULK_READER_COUNT.get();
-            assertTrue("PQ_BULK_READER_COUNT must increase after compaction: before="
+            // After one compaction cycle the eager-download counter must have increased
+            // by at least one per source segment (≥ 2 invocations for 2+ sources).
+            long countAfter = VectorIndexCompactor.COMPACTION_EAGER_DOWNLOAD_COUNT.get();
+            assertTrue("COMPACTION_EAGER_DOWNLOAD_COUNT must increase after compaction: before="
                             + countBefore + " after=" + countAfter,
                     countAfter > countBefore);
 
-            int expectedMinInvocations = 2; // at least 2 sources were compacted
-            assertTrue("PQ_BULK_READER_COUNT must increase by >= " + expectedMinInvocations
+            long expectedMinDownloads = 2; // at least 2 sources were compacted
+            assertTrue("COMPACTION_EAGER_DOWNLOAD_COUNT must increase by >= "
+                            + expectedMinDownloads
                             + ": delta=" + (countAfter - countBefore),
-                    (countAfter - countBefore) >= expectedMinInvocations);
+                    (countAfter - countBefore) >= expectedMinDownloads);
 
             // Search must still work after compaction (validates PQ was trained correctly).
             List<Map.Entry<Bytes, Float>> hits = store.search(vec(new Random(1), dim), 5);

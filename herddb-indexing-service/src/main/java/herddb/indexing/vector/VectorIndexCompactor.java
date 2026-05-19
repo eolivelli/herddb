@@ -20,9 +20,12 @@
 package herddb.indexing.vector;
 
 import herddb.indexing.vector.PersistentVectorStore.PendingDelete;
+import herddb.storage.DataStorageManager;
 import herddb.storage.DataStorageManagerException;
 import herddb.utils.Bytes;
+import io.github.jbellis.jvector.disk.RandomAccessReader;
 import io.github.jbellis.jvector.disk.ReaderSupplier;
+import io.github.jbellis.jvector.disk.ReaderSupplierFactory;
 import io.github.jbellis.jvector.graph.GraphIndexBuilder;
 import io.github.jbellis.jvector.graph.disk.OnDiskGraphIndex;
 import io.github.jbellis.jvector.graph.disk.OnDiskGraphIndexCompactor;
@@ -32,6 +35,8 @@ import io.github.jbellis.jvector.graph.similarity.BuildScoreProvider;
 import io.github.jbellis.jvector.util.FixedBitSet;
 import io.github.jbellis.jvector.util.PhysicalCoreExecutor;
 import io.github.jbellis.jvector.vector.types.VectorFloat;
+import java.io.BufferedOutputStream;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -39,11 +44,13 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Function;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -137,18 +144,33 @@ final class VectorIndexCompactor {
     }
 
     /**
-     * Process-wide counter incremented each time {@link SegmentPQReaderSupplier}
-     * is invoked for a source segment during PQ retraining in
-     * {@link #rebuildSegmentStreaming} (issue #599 Option B).
+     * Process-wide counter of completed single-segment graph-file downloads (or
+     * sequential-reader opens) across all compaction cycles (issue #602).
      *
-     * <p>Each invocation corresponds to one segment whose graph file was either
-     * downloaded directly from object storage or opened via the DSM's sequential
-     * reader, bypassing the per-node block-cache path.
+     * <p>Incremented once per source segment after its graph file has been
+     * successfully written to a local temp file (direct-download path) or
+     * copied via the multipart reader (fallback path). Both paths bypass the
+     * per-node {@code SegmentBlockCache}/gRPC round-trips that previously
+     * caused back-pressure during streaming compaction.
      *
-     * <p>Tests may read this counter to verify that the bulk-reader path was
+     * <p>Tests may read this counter to verify that the eager-download path was
      * exercised. Reset between tests if needed.
      */
-    static final AtomicInteger PQ_BULK_READER_COUNT = new AtomicInteger(0);
+    static final AtomicLong COMPACTION_EAGER_DOWNLOAD_COUNT = new AtomicLong(0);
+
+    /**
+     * Process-wide gauge of source-segment graph downloads currently in
+     * progress across all compaction cycles. Incremented before each download
+     * starts, decremented in the enclosing {@code finally} block.
+     */
+    static final AtomicLong COMPACTION_EAGER_DOWNLOAD_INFLIGHT = new AtomicLong(0);
+
+    /**
+     * Process-wide total of bytes of graph files eagerly downloaded (or copied)
+     * for streaming compaction across all cycles (issue #602). Incremented by
+     * each source segment's {@code graphFileSize} after a successful transfer.
+     */
+    static final AtomicLong COMPACTION_EAGER_DOWNLOAD_BYTES = new AtomicLong(0);
 
     /** Reasons a compaction run can fail; carried through to metrics. */
     enum FailureReason {
@@ -1066,120 +1088,222 @@ final class VectorIndexCompactor {
                     keptCount, filteredCount);
         }
 
-        // Build per-source dense ordinal mappers so the merged segment occupies
-        // exactly keptCount records on disk (no holes for tombstoned/superseded
-        // ordinals). With OffsetMapper the inline level-0 area would be sized
-        // for sum(srcSize) ordinals, wasting up to one record per dead slot.
-        List<OrdinalMapper> mappers = new ArrayList<>(candidates.size());
-        List<OnDiskGraphIndex> sources = new ArrayList<>(candidates.size());
-        int globalBase = 0;
-        for (int s = 0; s < candidates.size(); s++) {
-            VectorSegment seg = candidates.get(s);
-            FixedBitSet live = liveBitsets.get(s);
-            OnDiskGraphIndex odg = seg.onDiskGraph;
-            int sourceSize = odg.size(0);
-            // Defensive: align bitset length with the source's level-0 size, since
-            // OnDiskGraphIndexCompactor's validateLiveNodesBounds rejects any mismatch.
-            FixedBitSet aligned;
-            if (live.length() == sourceSize) {
-                aligned = live;
-            } else {
-                aligned = new FixedBitSet(Math.max(1, sourceSize));
-                int last = Math.min(live.length(), sourceSize);
-                for (int ord = 0; ord < last; ord++) {
-                    if (live.get(ord)) {
-                        aligned.set(ord);
-                    }
-                }
-                liveBitsets.set(s, aligned);
-            }
-            sources.add(odg);
-            DenseLiveOrdinalMapper mapper =
-                    new DenseLiveOrdinalMapper(aligned, sourceSize, globalBase);
-            mappers.add(mapper);
-            globalBase += mapper.liveCount();
-        }
-        if (globalBase != keptCount) {
-            // Must hold by construction; surface as CORRUPTION rather than asserting
-            // so a hypothetical bitset-vs-counter mismatch fails the cycle, not the JVM.
-            throw new CompactionException(FailureReason.CORRUPTION,
-                    "streaming compaction bitset/keptCount mismatch: keptCount="
-                            + keptCount + " bitsetTotal=" + globalBase);
-        }
+        // -----------------------------------------------------------------------
+        // Step 1: Pre-download / eagerly open all source graph files (issue #602).
+        // Bypasses SegmentBlockCache / gRPC for the hot merge path — every read
+        // during OnDiskGraphIndexCompactor.compact() and writeStreamingCompactedMapFile
+        // comes from a local temp file (direct-download path) or a sequential
+        // reader copy, not from per-node block-cache round-trips.
+        // -----------------------------------------------------------------------
+        DataStorageManager dsm = store.dataStorageManager();
+        String tsUUID = store.tableSpaceUUID();
+        Path downloadDir = store.tmpDirectory();
+        boolean supportsDirectDownload = dsm.supportsDirectMultipartDownload();
 
-        // OnDiskGraphIndexCompactor requires at least two sources.  When a single
-        // candidate slips through (e.g., the maxCount trigger fired with a single
-        // residual segment) fall back to the legacy in-memory path: building an
-        // OnDiskGraphIndexCompactor over one source is rejected at construction.
-        if (sources.size() < 2) {
-            STREAMING_FALLBACK_TO_LEGACY_TOTAL.incrementAndGet();
-            LOGGER.log(Level.INFO,
-                    "streaming compaction: only {0} candidate(s); falling back to legacy"
-                            + " in-memory rebuild (fallbackTotal={1})",
-                    new Object[]{sources.size(), STREAMING_FALLBACK_TO_LEGACY_TOTAL.get()});
-            return rebuildSegmentLegacy(store, candidates, authority, dim,
-                    keptCount, filteredCount);
-        }
+        // These lists are parallel: index i corresponds to candidates.get(i).
+        List<Path> downloadedTempFiles = new ArrayList<>(candidates.size());
+        List<ReaderSupplier> openedReaderSuppliers = new ArrayList<>(candidates.size());
+        List<OnDiskGraphIndex> localSources = new ArrayList<>(candidates.size());
 
-        Path graphTemp = Files.createTempFile(
-                store.tmpDirectory(), "herddb-vector-compact-graph-", ".idx");
-        Path mapTemp = Files.createTempFile(
-                store.tmpDirectory(), "herddb-vector-compact-map-", ".tmp");
-        boolean success = false;
-        VectorSegment mergedSegment = null;
-        List<String[]> orphans = new ArrayList<>();
-        int segmentId = store.newSegmentId();
-        // Also reserve a contiguous nodeId range for parity with the legacy path.
-        // Issue #255 (live-shard rotation): the rebuild may run alongside a live
-        // shard append; allocating the range here forces a rotation so the
-        // merged segment's nodeIds never collide with subsequently-allocated
-        // live-shard ones. The streaming path doesn't use the actual reserved
-        // value (all output ordinals are dense 0..keptCount-1), but the rotation
-        // side-effect still matters.
-        long startNodeId = store.allocateCompactionNodeIds(keptCount);
         try {
-            // Build a bulk reader-supplier factory so PQRetrainer downloads each source
-            // segment's graph file once (to IS data dir or DSM reader) instead of
-            // issuing one gRPC round-trip per sampled node (issue #599 Option B).
-            // The factory is tracked via PQ_BULK_READER_COUNT for test observability.
-            Function<OnDiskGraphIndex, ReaderSupplier> pqReaderFactory =
-                    SegmentPQReaderSupplier.forSegments(store, candidates, sources);
+            for (VectorSegment seg : candidates) {
+                String segUuid = store.segmentStorageKey(seg);
+                long graphFileSize = seg.graphFileSize;
+                if (graphFileSize <= 0) {
+                    throw new CompactionException(FailureReason.CORRUPTION,
+                            "streaming compaction: segment " + seg.segmentId
+                                    + " has graphFileSize=" + graphFileSize
+                                    + " — graph not yet persisted or storage key is wrong");
+                }
 
-            // OnDiskGraphIndexCompactor is not AutoCloseable: it self-shuts-down
-            // a fork-join pool inside compact() iff it owns one. We hand in
-            // PhysicalCoreExecutor.pool() so the compactor never owns its executor.
-            // Pass the factory so resolvePQFromSources uses bulk reads (issue #599).
-            OnDiskGraphIndexCompactor compactor = new OnDiskGraphIndexCompactor(
-                    sources, liveBitsets, mappers, store.compactionSimilarity(),
-                    PhysicalCoreExecutor.pool(),
-                    odg -> {
-                        // Build the reader first; only count it after the supplier is
-                        // successfully obtained so the counter accurately reflects
-                        // successful bulk-reader acquisitions (not just invocations).
-                        ReaderSupplier supplier = pqReaderFactory.apply(odg);
-                        PQ_BULK_READER_COUNT.incrementAndGet();
-                        return supplier;
-                    });
-            try {
-                compactor.compact(graphTemp);
-            } catch (java.io.FileNotFoundException | RuntimeException e) {
-                // jvector boundary — wrap unchecked OR FileNotFoundException
-                // (declared on compact()) failures so they never reach the
-                // outer cycle's orphan-blind catch (IOException) arm. No
-                // orphans yet: this fires before any upload.
-                throw new CompactionException(FailureReason.WRITE_IO,
-                        "OnDiskGraphIndexCompactor.compact failed for segment "
-                                + segmentId, e);
+                COMPACTION_EAGER_DOWNLOAD_INFLIGHT.incrementAndGet();
+                long downloadStart = System.nanoTime();
+                try {
+                    Path tmpFile = Files.createTempFile(
+                            downloadDir, "herddb-compact-src-", ".idx");
+                    downloadedTempFiles.add(tmpFile);
+
+                    if (supportsDirectDownload) {
+                        // Fast path: stream directly from object storage (S3/GCS/MinIO).
+                        dsm.downloadMultipartIndexFile(tsUUID, segUuid, "graph",
+                                graphFileSize, tmpFile);
+                    } else {
+                        // Fallback: copy via multipart reader (file-server or in-memory
+                        // for MemoryDataStorageManager) to a local temp file so that
+                        // all subsequent reads during compact() and writeMap are local.
+                        ReaderSupplier src = dsm.multipartIndexReaderSupplier(
+                                tsUUID, segUuid, "graph", graphFileSize);
+                        try (RandomAccessReader reader = src.get();
+                             FileOutputStream fos = new FileOutputStream(tmpFile.toFile());
+                             BufferedOutputStream bos = new BufferedOutputStream(fos,
+                                     4 * 1024 * 1024)) {
+                            reader.seek(0L);
+                            byte[] buf = new byte[4 * 1024 * 1024];
+                            long remaining = graphFileSize;
+                            while (remaining > 0L) {
+                                int toRead = (int) Math.min(buf.length, remaining);
+                                byte[] chunk = (toRead == buf.length) ? buf : new byte[toRead];
+                                reader.readFully(chunk);
+                                bos.write(chunk, 0, toRead);
+                                remaining -= toRead;
+                            }
+                        }
+                    }
+
+                    long elapsedMs = (System.nanoTime() - downloadStart) / 1_000_000L;
+                    double throughputMBps = elapsedMs > 0
+                            ? (graphFileSize / (1024.0 * 1024.0)) / (elapsedMs / 1000.0)
+                            : 0.0;
+                    LOGGER.log(Level.INFO,
+                            "streaming compaction: prepared source segment graph {0}: "
+                                    + "{1} bytes in {2} ms ({3,number,#.#} MB/s)",
+                            new Object[]{segUuid, graphFileSize, elapsedMs, throughputMBps});
+                    COMPACTION_EAGER_DOWNLOAD_COUNT.incrementAndGet();
+                    COMPACTION_EAGER_DOWNLOAD_BYTES.addAndGet(graphFileSize);
+
+                    ReaderSupplier rs = ReaderSupplierFactory.open(tmpFile);
+                    openedReaderSuppliers.add(rs);
+                    localSources.add(OnDiskGraphIndex.load(rs));
+                } catch (DataStorageManagerException e) {
+                    throw new CompactionException(FailureReason.METADATA_IO,
+                            "streaming compaction: failed to prepare source segment graph for "
+                                    + segUuid, e);
+                } catch (IOException e) {
+                    throw new CompactionException(FailureReason.READ_IO,
+                            "streaming compaction: failed to prepare source segment graph for "
+                                    + segUuid, e);
+                } finally {
+                    COMPACTION_EAGER_DOWNLOAD_INFLIGHT.decrementAndGet();
+                }
             }
 
-            try {
-                writeStreamingCompactedMapFile(candidates, liveBitsets, mappers,
-                        mapTemp, dim, keptCount);
-            } catch (RuntimeException e) {
-                throw new CompactionException(FailureReason.WRITE_IO,
-                        "streaming compaction map-file build failed for segment "
-                                + segmentId, e);
+            // -----------------------------------------------------------------------
+            // Step 2: Build per-source dense ordinal mappers using the local graphs.
+            // -----------------------------------------------------------------------
+            // Build per-source dense ordinal mappers so the merged segment occupies
+            // exactly keptCount records on disk (no holes for tombstoned/superseded
+            // ordinals). With OffsetMapper the inline level-0 area would be sized
+            // for sum(srcSize) ordinals, wasting up to one record per dead slot.
+            List<OrdinalMapper> mappers = new ArrayList<>(candidates.size());
+            int globalBase = 0;
+            for (int s = 0; s < candidates.size(); s++) {
+                VectorSegment seg = candidates.get(s);
+                FixedBitSet live = liveBitsets.get(s);
+                OnDiskGraphIndex odg = localSources.get(s);
+                int sourceSize = odg.size(0);
+                // Defensive: align bitset length with the source's level-0 size, since
+                // OnDiskGraphIndexCompactor's validateLiveNodesBounds rejects any mismatch.
+                FixedBitSet aligned;
+                if (live.length() == sourceSize) {
+                    aligned = live;
+                } else {
+                    aligned = new FixedBitSet(Math.max(1, sourceSize));
+                    int last = Math.min(live.length(), sourceSize);
+                    for (int ord = 0; ord < last; ord++) {
+                        if (live.get(ord)) {
+                            aligned.set(ord);
+                        }
+                    }
+                    liveBitsets.set(s, aligned);
+                }
+                DenseLiveOrdinalMapper mapper =
+                        new DenseLiveOrdinalMapper(aligned, sourceSize, globalBase);
+                mappers.add(mapper);
+                globalBase += mapper.liveCount();
             }
+            if (globalBase != keptCount) {
+                // Must hold by construction; surface as CORRUPTION rather than asserting
+                // so a hypothetical bitset-vs-counter mismatch fails the cycle, not the JVM.
+                throw new CompactionException(FailureReason.CORRUPTION,
+                        "streaming compaction bitset/keptCount mismatch: keptCount="
+                                + keptCount + " bitsetTotal=" + globalBase);
+            }
+
+            // OnDiskGraphIndexCompactor requires at least two sources.  When a single
+            // candidate slips through (e.g., the maxCount trigger fired with a single
+            // residual segment) fall back to the legacy in-memory path: building an
+            // OnDiskGraphIndexCompactor over one source is rejected at construction.
+            if (localSources.size() < 2) {
+                STREAMING_FALLBACK_TO_LEGACY_TOTAL.incrementAndGet();
+                LOGGER.log(Level.INFO,
+                        "streaming compaction: only {0} candidate(s); falling back to legacy"
+                                + " in-memory rebuild (fallbackTotal={1})",
+                        new Object[]{localSources.size(), STREAMING_FALLBACK_TO_LEGACY_TOTAL.get()});
+                return rebuildSegmentLegacy(store, candidates, authority, dim,
+                        keptCount, filteredCount);
+            }
+
+            // PQ reader factory: open a FRESH ReaderSupplier from the local temp file for
+            // each PQ-retraining request. We must NOT return the same ReaderSupplier that
+            // was used to load the OnDiskGraphIndex: PQRetrainer closes the supplier it
+            // receives (after extracting vectors), which would close the underlying mmap
+            // Arena and make subsequent graph-node reads in compact() throw
+            // "Already closed". A fresh ReaderSupplier has its own independent Arena, so
+            // PQRetrainer can close it freely without disturbing the main compaction readers.
+            IdentityHashMap<OnDiskGraphIndex, Path> odgToPath = new IdentityHashMap<>();
+            for (int i = 0; i < localSources.size(); i++) {
+                odgToPath.put(localSources.get(i), downloadedTempFiles.get(i));
+            }
+            Function<OnDiskGraphIndex, ReaderSupplier> pqReaderFactory = odg -> {
+                Path path = odgToPath.get(odg);
+                if (path == null) {
+                    throw new IllegalStateException(
+                            "streaming compaction PQ factory: OnDiskGraphIndex not found"
+                                    + " in local-source set");
+                }
+                try {
+                    return ReaderSupplierFactory.open(path);
+                } catch (IOException e) {
+                    throw new java.io.UncheckedIOException(
+                            "streaming compaction PQ factory: failed to open " + path, e);
+                }
+            };
+
+            Path graphTemp = Files.createTempFile(
+                    store.tmpDirectory(), "herddb-vector-compact-graph-", ".idx");
+            Path mapTemp = Files.createTempFile(
+                    store.tmpDirectory(), "herddb-vector-compact-map-", ".tmp");
+            boolean success = false;
+            VectorSegment mergedSegment = null;
+            List<String[]> orphans = new ArrayList<>();
+            int segmentId = store.newSegmentId();
+            // Also reserve a contiguous nodeId range for parity with the legacy path.
+            // Issue #255 (live-shard rotation): the rebuild may run alongside a live
+            // shard append; allocating the range here forces a rotation so the
+            // merged segment's nodeIds never collide with subsequently-allocated
+            // live-shard ones. The streaming path doesn't use the actual reserved
+            // value (all output ordinals are dense 0..keptCount-1), but the rotation
+            // side-effect still matters.
+            long startNodeId = store.allocateCompactionNodeIds(keptCount);
+            try {
+                // OnDiskGraphIndexCompactor is not AutoCloseable: it self-shuts-down
+                // a fork-join pool inside compact() iff it owns one. We hand in
+                // PhysicalCoreExecutor.pool() so the compactor never owns its executor.
+                // Pass pqReaderFactory so PQRetrainer reads from local files (issue #602).
+                OnDiskGraphIndexCompactor compactor = new OnDiskGraphIndexCompactor(
+                        localSources, liveBitsets, mappers, store.compactionSimilarity(),
+                        PhysicalCoreExecutor.pool(),
+                        pqReaderFactory);
+                try {
+                    compactor.compact(graphTemp);
+                } catch (java.io.FileNotFoundException | RuntimeException e) {
+                    // jvector boundary — wrap unchecked OR FileNotFoundException
+                    // (declared on compact()) failures so they never reach the
+                    // outer cycle's orphan-blind catch (IOException) arm. No
+                    // orphans yet: this fires before any upload.
+                    throw new CompactionException(FailureReason.WRITE_IO,
+                            "OnDiskGraphIndexCompactor.compact failed for segment "
+                                    + segmentId, e);
+                }
+
+                try {
+                    writeStreamingCompactedMapFile(candidates, liveBitsets, mappers,
+                            localSources, mapTemp, dim, keptCount);
+                } catch (RuntimeException e) {
+                    throw new CompactionException(FailureReason.WRITE_IO,
+                            "streaming compaction map-file build failed for segment "
+                                    + segmentId, e);
+                }
 
             PersistentVectorStore.SegmentWriteResult swr;
             try {
@@ -1272,6 +1396,32 @@ final class VectorIndexCompactor {
                 }
             }
         }
+        } finally {
+            // Close opened reader suppliers before deleting temp files (mmap release).
+            // Broad catch (IOException | RuntimeException) is required here: the jvector
+            // MemorySegmentReader$Supplier.close() implementation throws IllegalStateException
+            // (a RuntimeException) when the underlying Arena is already closed — which can
+            // happen when OnDiskGraphIndexCompactor closes its sources during or after
+            // compact(). We must swallow both flavors to guarantee that temp-file deletion
+            // in the next loop still runs.
+            for (ReaderSupplier rs : openedReaderSuppliers) {
+                try {
+                    rs.close();
+                } catch (IOException | RuntimeException e) {
+                    LOGGER.log(Level.FINE,
+                            "ignoring source reader-supplier close in streaming compaction", e);
+                }
+            }
+            // Delete all source graph temp files (direct-download or copy path).
+            for (Path tmpFile : downloadedTempFiles) {
+                try {
+                    Files.deleteIfExists(tmpFile);
+                } catch (IOException e) {
+                    LOGGER.log(Level.FINE,
+                            "ignoring source graph temp delete in streaming compaction", e);
+                }
+            }
+        }
     }
 
     /**
@@ -1288,10 +1438,19 @@ final class VectorIndexCompactor {
      * vectors are read sequentially from each source's
      * {@link OnDiskGraphIndex.View} — disk-friendly and reproducible.
      */
+    /**
+     * @param localSources the eagerly-downloaded local-file-backed
+     *                     {@link OnDiskGraphIndex} objects that parallel
+     *                     {@code candidates}; vectors are read from these
+     *                     rather than from {@code seg.onDiskGraph} so that
+     *                     the map-file writer also bypasses the block cache
+     *                     (issue #602).
+     */
     private static void writeStreamingCompactedMapFile(
             List<VectorSegment> candidates,
             List<FixedBitSet> liveBitsets,
             List<OrdinalMapper> mappers,
+            List<OnDiskGraphIndex> localSources,
             Path mapTempFile,
             int dimension,
             int keptCount) throws IOException {
@@ -1311,9 +1470,12 @@ final class VectorIndexCompactor {
                 if (offsets == null || data == null || lengths == null) {
                     continue;
                 }
+                // Use the pre-downloaded local-file graph rather than seg.onDiskGraph
+                // (which is block-cache backed) so vector reads come from local storage.
+                OnDiskGraphIndex localOdg = localSources.get(s);
                 OnDiskGraphIndex.View view;
                 try {
-                    view = (OnDiskGraphIndex.View) seg.onDiskGraph.getView();
+                    view = (OnDiskGraphIndex.View) localOdg.getView();
                 } catch (RuntimeException e) {
                     throw new IOException("failed to open view on candidate segment "
                             + seg.segmentId + " (streaming map writer)", e);

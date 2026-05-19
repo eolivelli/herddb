@@ -309,6 +309,24 @@ public final class IndexingServerConfiguration {
     public static final int PROPERTY_VECTOR_INDEX_COMPACTION_MAX_INPUTS_DEFAULT = 16;
 
     /**
+     * Hard cap on the total bytes of source graph files that a single
+     * streaming compaction cycle may download (issue #602). After candidate
+     * selection via {@link #PROPERTY_VECTOR_INDEX_COMPACTION_MAX_BYTES} /
+     * {@link #PROPERTY_VECTOR_INDEX_COMPACTION_MAX_COUNT}, the largest
+     * candidates are trimmed until the total graph-file download budget is
+     * within this limit. Protects small data-directory PVCs from unexpected
+     * disk exhaustion on tiered-scaling scenarios that can select up to 8×
+     * the base byte cap. At least 2 candidates are always kept so a merge
+     * is still attempted.
+     * Default is 100 GiB ({@code 107374182400}).
+     * Set to {@link Long#MAX_VALUE} to disable.
+     */
+    public static final String PROPERTY_VECTOR_INDEX_COMPACTION_MAX_INPUT_BYTES =
+            "indexing.vector.compaction.maxInputBytes";
+    public static final long PROPERTY_VECTOR_INDEX_COMPACTION_MAX_INPUT_BYTES_DEFAULT =
+            100L * 1024 * 1024 * 1024; // 100 GiB
+
+    /**
      * How long old segment files remain on-disk after a compaction swap
      * before the reaper may physically delete them. Also gated by
      * {@code shadowAckedGeneration}: reclaim waits for the later of the

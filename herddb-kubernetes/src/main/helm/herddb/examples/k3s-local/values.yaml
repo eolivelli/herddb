@@ -130,6 +130,10 @@ server:
     # GKE example so operators can see the effective value at a glance. Set to
     # "false" to fall back to V3.
     bookkeeper.useV2WireProtocol: "true"
+    # Per-cycle download budget for streaming compaction (issue #602).
+    # The IS data PVC is 5 GiB; cap at 4 GiB to leave ~1 GiB for the
+    # compaction output (merged graph + map) and IS working files.
+    indexing.vector.compaction.maxInputBytes: "4294967296"        # 4 GiB
   resources:
     requests:
       memory: "19Gi"
