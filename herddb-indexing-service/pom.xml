@@ -61,6 +61,11 @@
             <version>${project.version}</version>
         </dependency>
         <dependency>
+            <groupId>io.github.jbellis</groupId>
+            <artifactId>jvector</artifactId>
+            <version>4.0.0-rc.9-herddb-SNAPSHOT</version>
+        </dependency>
+        <dependency>
             <groupId>org.herddb</groupId>
             <artifactId>herddb-utils</artifactId>
             <version>${project.version}</version>

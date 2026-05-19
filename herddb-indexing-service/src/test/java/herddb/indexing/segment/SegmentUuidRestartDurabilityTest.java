@@ -25,7 +25,7 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 import herddb.core.MemoryManager;
 import herddb.file.FileDataStorageManager;
-import herddb.index.vector.PersistentVectorStore;
+import herddb.indexing.vector.PersistentVectorStore;
 import herddb.utils.Bytes;
 import java.nio.file.Path;
 import java.util.HashSet;
@@ -218,7 +218,7 @@ public class SegmentUuidRestartDurabilityTest {
     public void publisherRejectsNullUuid() {
         SegmentRegistryPublisher publisher = new SegmentRegistryPublisher(
                 registry, TABLE_SPACE, TABLE_NAME, INDEX_UUID, INDEX_NAME, 0);
-        herddb.index.vector.NewSegmentInfo invalid = new herddb.index.vector.NewSegmentInfo(
+        herddb.indexing.vector.NewSegmentInfo invalid = new herddb.indexing.vector.NewSegmentInfo(
                 42, /* segmentUuid */ null,
                 "g/x", 100L, "m/x", 100L, 200L, 10L, 1L,
                 new herddb.log.LogSequenceNumber(1L, 100L), /* jvectorFeatureIds */ null);
@@ -240,7 +240,7 @@ public class SegmentUuidRestartDurabilityTest {
         SegmentRegistryPublisher publisher = new SegmentRegistryPublisher(
                 registry, TABLE_SPACE, TABLE_NAME, INDEX_UUID, INDEX_NAME, 0);
         String stableUuid = "stable-uuid-1";
-        herddb.index.vector.NewSegmentInfo info = new herddb.index.vector.NewSegmentInfo(
+        herddb.indexing.vector.NewSegmentInfo info = new herddb.indexing.vector.NewSegmentInfo(
                 7, stableUuid,
                 "g/x", 100L, "m/x", 100L, 200L, 10L, 1L,
                 new herddb.log.LogSequenceNumber(1L, 100L), /* jvectorFeatureIds */ null);

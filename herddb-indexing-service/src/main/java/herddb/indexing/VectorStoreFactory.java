@@ -20,7 +20,7 @@
 
 package herddb.indexing;
 
-import herddb.index.vector.AbstractVectorStore;
+import herddb.indexing.vector.AbstractVectorStore;
 import java.nio.file.Path;
 import java.util.Map;
 

@@ -23,7 +23,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 import herddb.codec.RecordSerializer;
 import herddb.core.MemoryManager;
-import herddb.index.vector.PersistentVectorStore;
+import herddb.indexing.vector.PersistentVectorStore;
 import herddb.index.vector.VectorIndexManager;
 import herddb.log.LogSequenceNumber;
 import herddb.mem.MemoryDataStorageManager;

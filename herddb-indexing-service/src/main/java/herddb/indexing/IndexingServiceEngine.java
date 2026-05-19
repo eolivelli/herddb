@@ -25,11 +25,11 @@ import herddb.cluster.ZookeeperMetadataStorageManager;
 import herddb.codec.DataAccessorForFullRecord;
 import herddb.core.MemoryManager;
 import herddb.file.FileMetadataStorageManager;
-import herddb.index.vector.AbstractVectorStore;
-import herddb.index.vector.PersistentVectorStore;
-import herddb.index.vector.ReadOnlyVectorStore;
+import herddb.indexing.vector.AbstractVectorStore;
+import herddb.indexing.vector.PersistentVectorStore;
+import herddb.indexing.vector.ReadOnlyVectorStore;
 import herddb.index.vector.VectorIndexManager;
-import herddb.index.vector.VectorMemoryBudget;
+import herddb.indexing.vector.VectorMemoryBudget;
 import herddb.indexing.segment.SegmentRegistryClient;
 import herddb.indexing.segment.SegmentRegistryException;
 import herddb.indexing.segment.SegmentRegistryPublisher;
@@ -356,8 +356,8 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
      * One {@link herddb.indexing.segment.SegmentAssignmentWatcher} per vector store,
      * keyed by {@link #storeKey}. Each watcher watches the ZK segment-registry subtree
      * for that store's index and calls
-     * {@link herddb.index.vector.AbstractVectorStore#adoptExternalSegment} /
-     * {@link herddb.index.vector.AbstractVectorStore#dropSegmentByUuid} when the
+     * {@link herddb.indexing.vector.AbstractVectorStore#adoptExternalSegment} /
+     * {@link herddb.indexing.vector.AbstractVectorStore#dropSegmentByUuid} when the
      * optimizer produces or deprecates segments (issue #514).
      *
      * <p>Populated by the {@code vectorStoreFactory} lambda and closed in
@@ -829,7 +829,7 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                             .PROPERTY_VECTOR_INDEX_COMPACTION_STREAMING_ENABLED,
                     IndexingServerConfiguration
                             .PROPERTY_VECTOR_INDEX_COMPACTION_STREAMING_ENABLED_DEFAULT);
-            herddb.index.vector.PersistentVectorStore.setStreamingCompactionEnabled(
+            herddb.indexing.vector.PersistentVectorStore.setStreamingCompactionEnabled(
                     vectorCompactionStreamingEnabled);
             LOGGER.log(Level.INFO,
                     "vector index compaction: tieredEnabled={0}, backpressureSegments={1}, "
@@ -849,7 +849,7 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                     IndexingServerConfiguration.PROPERTY_VECTOR_SEARCH_ASYNC_PIPELINE_ENABLED,
                     Boolean.getBoolean(
                             IndexingServerConfiguration.SYSPROP_VECTOR_SEARCH_ASYNC_PIPELINE_ENABLED));
-            herddb.index.vector.PersistentVectorStore.setSearchAsyncPipelineEnabled(
+            herddb.indexing.vector.PersistentVectorStore.setSearchAsyncPipelineEnabled(
                     vectorSearchAsyncPipelineEnabled);
             LOGGER.log(Level.INFO, "vector search async IO pipeline (issue #547): enabled={0}",
                     vectorSearchAsyncPipelineEnabled);
@@ -1021,7 +1021,7 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                 // the initial scan fires.
                 SegmentRegistryClient watcherRegistry = this.segmentRegistry;
                 if (watcherRegistry != null && tableSpaceUUID != null) {
-                    final herddb.index.vector.AbstractVectorStore finalStore = store;
+                    final herddb.indexing.vector.AbstractVectorStore finalStore = store;
                     final String finalIndexUUID = autoIndexUUID;
                     final String finalIndexName = indexName;
                     herddb.indexing.segment.SegmentAssignmentWatcher watcher =

@@ -87,13 +87,13 @@ public class RemoteSegmentMergerLegacyOverlayTest {
         // Issue #485: synthetic inputs with no real graph multipart file —
         // force the legacy in-memory rebuild path.
         savedStreamingFlag =
-                herddb.index.vector.PersistentVectorStore.isStreamingCompactionEnabled();
-        herddb.index.vector.PersistentVectorStore.setStreamingCompactionEnabled(false);
+                herddb.indexing.vector.PersistentVectorStore.isStreamingCompactionEnabled();
+        herddb.indexing.vector.PersistentVectorStore.setStreamingCompactionEnabled(false);
     }
 
     @org.junit.After
     public void tearDown() {
-        herddb.index.vector.PersistentVectorStore.setStreamingCompactionEnabled(
+        herddb.indexing.vector.PersistentVectorStore.setStreamingCompactionEnabled(
                 savedStreamingFlag);
     }
 

@@ -91,13 +91,13 @@ public class RemoteSegmentMergerTest {
         // (default-on as of issue #485) requires a real graph multipart file
         // per input. Force the legacy path here; streaming coverage lives in
         // RemoteSegmentMergerStreamingTest, which produces real graph files.
-        savedStreamingFlag = herddb.index.vector.PersistentVectorStore.isStreamingCompactionEnabled();
-        herddb.index.vector.PersistentVectorStore.setStreamingCompactionEnabled(false);
+        savedStreamingFlag = herddb.indexing.vector.PersistentVectorStore.isStreamingCompactionEnabled();
+        herddb.indexing.vector.PersistentVectorStore.setStreamingCompactionEnabled(false);
     }
 
     @org.junit.After
     public void tearDown() {
-        herddb.index.vector.PersistentVectorStore.setStreamingCompactionEnabled(savedStreamingFlag);
+        herddb.indexing.vector.PersistentVectorStore.setStreamingCompactionEnabled(savedStreamingFlag);
     }
 
     private SegmentMetadata writeInputSegmentToDsm(String uuid, long segmentId,

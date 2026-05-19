@@ -97,13 +97,13 @@ public class RemoteSegmentMergerLegacyMapFileSizeTest {
         // lives in RemoteSegmentGraphMergerStreamingTest, which produces
         // real graphs via PersistentVectorStore.
         savedStreamingFlag =
-                herddb.index.vector.PersistentVectorStore.isStreamingCompactionEnabled();
-        herddb.index.vector.PersistentVectorStore.setStreamingCompactionEnabled(false);
+                herddb.indexing.vector.PersistentVectorStore.isStreamingCompactionEnabled();
+        herddb.indexing.vector.PersistentVectorStore.setStreamingCompactionEnabled(false);
     }
 
     @org.junit.After
     public void tearDown() {
-        herddb.index.vector.PersistentVectorStore.setStreamingCompactionEnabled(
+        herddb.indexing.vector.PersistentVectorStore.setStreamingCompactionEnabled(
                 savedStreamingFlag);
     }
 

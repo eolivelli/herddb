@@ -23,7 +23,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 import herddb.codec.RecordSerializer;
 import herddb.core.MemoryManager;
-import herddb.index.vector.PersistentVectorStore;
+import herddb.indexing.vector.PersistentVectorStore;
 import herddb.log.LogEntry;
 import herddb.log.LogEntryFactory;
 import herddb.log.LogSequenceNumber;
@@ -466,7 +466,7 @@ public class ShadowReplicaRestartTest {
     /**
      * Primary executes DROP_INDEX while a shadow has the same index
      * cached. After the issue #383 cleanup, the on-storage data the
-     * shadow's {@link herddb.index.vector.ReadOnlyVectorStore} reads from
+     * shadow's {@link herddb.indexing.vector.ReadOnlyVectorStore} reads from
      * is gone. The shadow must keep running (no NPE, no infinite reload
      * loop) and any subsequent search on the dropped index must return
      * empty. The primary must not block on the drop.

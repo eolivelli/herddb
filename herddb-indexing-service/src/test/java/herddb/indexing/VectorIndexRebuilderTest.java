@@ -25,7 +25,7 @@ import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 import herddb.codec.RecordSerializer;
-import herddb.index.vector.AbstractVectorStore;
+import herddb.indexing.vector.AbstractVectorStore;
 import herddb.index.vector.VectorIndexManager;
 import herddb.log.LogSequenceNumber;
 import herddb.mem.MemoryDataStorageManager;

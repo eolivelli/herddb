@@ -22,7 +22,7 @@ package herddb.indexing;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 import herddb.core.MemoryManager;
-import herddb.index.vector.PersistentVectorStore;
+import herddb.indexing.vector.PersistentVectorStore;
 import herddb.indexing.admin.IndexingAdminClient;
 import herddb.indexing.proto.DescribeIndexResponse;
 import herddb.mem.MemoryDataStorageManager;

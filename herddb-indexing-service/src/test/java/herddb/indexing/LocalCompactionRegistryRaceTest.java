@@ -22,7 +22,7 @@ package herddb.indexing;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
-import herddb.index.vector.NewSegmentInfo;
+import herddb.indexing.vector.NewSegmentInfo;
 import herddb.indexing.segment.SegmentMetadata;
 import herddb.indexing.segment.SegmentRegistryClient;
 import herddb.indexing.segment.SegmentRegistryPublisher;
@@ -59,7 +59,7 @@ import org.junit.Test;
  *
  * <p>The test exercises {@link SegmentRegistryPublisher} directly (unit-style
  * around the interaction with {@code SegmentRegistryClient}) — the full
- * end-to-end test through {@link herddb.index.vector.PersistentVectorStore}
+ * end-to-end test through {@link herddb.indexing.vector.PersistentVectorStore}
  * lives in the broader integration suite. Keeping this test ZK-only lets us
  * inject the optimizer's win in the precise window between stage and
  * revalidate.
