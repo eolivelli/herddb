@@ -137,11 +137,19 @@ public class Issue605PQVectorsOobTest {
     }
 
     /**
-     * Variant: delete the LAST inserted vector (highest ordinal) instead.
-     * This exercises the no-deletion-before-last-ordinal path — the highest
-     * original ordinal is now below idUpperBound and the issue does not fire,
-     * but the checkpoint must still succeed cleanly (guard against regressions
-     * in the trivial direction).
+     * Variant: delete the LAST inserted vector (highest ordinal = 256) instead
+     * of a low-ordinal one.
+     *
+     * <p>When the highest ordinal is deleted, no live node's original ordinal
+     * reaches {@code idUpperBound-1} (the deleted slot), so the bug does NOT fire
+     * even without the fix. This test guards the trivial direction — checkpointing
+     * after deleting the maximum ordinal must also succeed cleanly.
+     *
+     * <p>Note: {@code maxNodeId} is monotonically increasing and is NOT lowered
+     * by deletion or {@code cleanup()}. idUpperBound stays at 257. The difference
+     * here is that {@code sequentialRenumbering} skips the deleted ordinal 256, so
+     * the highest new ordinal (255) maps to original ordinal 255 — which is within
+     * {@code pqv.count} regardless of whether we use liveCount or idUpperBound.
      */
     @Test
     public void checkpointSucceedsAfterDeletionOfLastInsertedVector() throws Exception {
@@ -157,10 +165,11 @@ public class Issue605PQVectorsOobTest {
                 store.addVector(Bytes.from_int(i), randomVector(rng, dim));
             }
 
-            // Delete the last vector: highest ordinal removed; idUpperBound is reduced
-            // by cleanup() since maxNodeId walks down.  Live count = 256, idUpperBound
-            // now has highest live ordinal = 255 → no IOOBE even without the fix.
-            // Test ensures the fix does not regress this direction.
+            // Delete the last vector (ordinal 256). After cleanup(), the highest
+            // live ordinal is 255. sequentialRenumbering skips ordinal 256 and
+            // maps live ordinals 0..255 → new ordinals 0..255. pqv.get(255) is
+            // always valid (liveCount=256, so pqv.count=256, valid range 0..255).
+            // No IOOBE even without the fix — but checkpoint must still succeed.
             store.removeVector(Bytes.from_int(totalInserted - 1));
             assertEquals(totalInserted - 1, store.size());
 
