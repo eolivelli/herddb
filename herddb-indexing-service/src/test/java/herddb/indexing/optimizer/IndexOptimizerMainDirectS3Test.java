@@ -32,7 +32,6 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Properties;
-import java.util.concurrent.CompletableFuture;
 import org.apache.commons.io.FileUtils;
 import org.junit.After;
 import org.junit.Before;
@@ -256,16 +255,31 @@ public class IndexOptimizerMainDirectS3Test {
         OptimizerConfiguration cfg = configWith(p);
         ObjectStorage storage = IndexOptimizerMain.buildDirectS3ObjectStorage(
                 cfg, "ak", "sk");
-
         DummyRemoteFileDsm dsm = newRemoteFileDsm();
-        assertFalse(dsm.supportsDirectMultipartDownload());
+        try {
+            assertFalse(dsm.supportsDirectMultipartDownload());
 
-        dsm.setDirectObjectStorage(storage);
+            dsm.setDirectObjectStorage(storage);
 
-        assertTrue("setDirectObjectStorage(...) must flip the support flag",
-                dsm.supportsDirectMultipartDownload());
-        assertSame("DummyRemoteFileDsm must record the attached storage",
-                storage, dsm.lastAttachedStorage);
+            assertTrue("setDirectObjectStorage(...) must flip the support flag",
+                    dsm.supportsDirectMultipartDownload());
+            assertSame("DummyRemoteFileDsm must record the attached storage",
+                    storage, dsm.lastAttachedStorage);
+        } finally {
+            // Release the SDK S3AsyncClient + CRT HTTP client owned by the
+            // S3ObjectStorage so the per-test class doesn't leak SDK threads
+            // and direct-memory arenas. dsm.close() chains through to the
+            // attached ObjectStorage so we don't need to close `storage`
+            // explicitly. Broad catch is required: close paths on the SDK and
+            // on RemoteFileDataStorageManager can raise both IOException and
+            // RuntimeException (e.g. IllegalStateException when an arena is
+            // already released); test cleanup must not propagate those.
+            try {
+                dsm.close();
+            } catch (Exception ignored) {
+                // best-effort
+            }
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -316,13 +330,4 @@ public class IndexOptimizerMainDirectS3Test {
             // No close() — nothing to do.
         }
     }
-
-    /**
-     * Compile-time guard: a no-op reference to {@link CompletableFuture} keeps
-     * the AWS-SDK transitive deps in the resolved set even when test pruning
-     * (e.g. {@code -Dmaven.test.skip}) trims unused classes. Harmless at run
-     * time.
-     */
-    @SuppressWarnings("unused")
-    private static final Class<?> KEEP_DEP_RESOLVED = CompletableFuture.class;
 }
