@@ -20,6 +20,7 @@
 package herddb.indexing.optimizer;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 import herddb.indexing.segment.SegmentMetadata;
 import herddb.indexing.segment.SegmentState;
@@ -268,5 +269,59 @@ public class AggressivePolicyKwayTest {
             assertEquals("must pick smallest maxCount segments",
                     "s" + (i + 1), picked.get(i).metadata().getSegmentUuid());
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // maxInputBytes cap tests for k-way path (issue #602)
+    // -----------------------------------------------------------------------
+
+    /**
+     * In k-way mode, {@code maxInputBytes} must trim the largest candidates
+     * from the pre-selected k-way set until total ≤ cap, keeping at least 2.
+     */
+    @Test
+    public void kwayMaxInputBytesTrimsLargestCandidates() {
+        // 5 sub-target segments: sizes 100, 200, 300, 400, 500 bytes.
+        // kwayMax=5 → picks all 5, then applyMaxInputBytesCap trims with budget=400.
+        // 100+200+300+400+500=1500 > 400 → trim 500 → 1000 > 400 → trim 400
+        // → 600 > 400 → trim 300 → 300 ≤ 400 → stop. Result: [100, 200].
+        MergePolicy policy = new MergePolicy.AggressivePolicy(
+                10_000L, Long.MAX_VALUE, 100, /* kwayMax */ 5, /* maxInputBytes */ 400L);
+        List<VersionedSegmentMetadata> segments = new ArrayList<>();
+        for (int i = 1; i <= 5; i++) {
+            segments.add(seg("s" + i, i * 100L));  // 100, 200, 300, 400, 500 bytes
+        }
+        List<VersionedSegmentMetadata> picked = policy.pickMergeCandidates(segments);
+        assertEquals("k-way maxInputBytes must trim to 2 within budget", 2, picked.size());
+        long total = 0;
+        for (VersionedSegmentMetadata v : picked) {
+            total += v.metadata().getSizeBytes();
+        }
+        assertTrue("trimmed total must be ≤ 400; got " + total, total <= 400L);
+    }
+
+    /**
+     * In k-way mode, when every pair exceeds {@code maxInputBytes}, the
+     * 2-candidate minimum floor must override the cap.
+     */
+    @Test
+    public void kwayMaxInputBytesTinyBudgetKeepsMinimumTwo() {
+        MergePolicy policy = new MergePolicy.AggressivePolicy(
+                10_000L, Long.MAX_VALUE, 100, /* kwayMax */ 8, /* maxInputBytes */ 1L);
+        List<VersionedSegmentMetadata> picked = policy.pickMergeCandidates(makeSegments(4));
+        assertEquals("k-way mode must retain at least 2 candidates even with budget=1",
+                2, picked.size());
+    }
+
+    /**
+     * In k-way mode, {@code maxInputBytes == Long.MAX_VALUE} disables the cap —
+     * all {@code min(kwayMax, maxCount)} candidates are returned.
+     */
+    @Test
+    public void kwayMaxInputBytesDisabledReturnsFullSet() {
+        MergePolicy policy = new MergePolicy.AggressivePolicy(
+                10_000L, Long.MAX_VALUE, 100, /* kwayMax */ 5, /* maxInputBytes */ Long.MAX_VALUE);
+        List<VersionedSegmentMetadata> picked = policy.pickMergeCandidates(makeSegments(5));
+        assertEquals("disabled cap must not trim; all 5 must be returned", 5, picked.size());
     }
 }

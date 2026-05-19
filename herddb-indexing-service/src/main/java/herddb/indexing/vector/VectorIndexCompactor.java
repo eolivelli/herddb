@@ -1398,12 +1398,15 @@ final class VectorIndexCompactor {
         }
         } finally {
             // Close opened reader suppliers before deleting temp files (mmap release).
-            // Broad catch (IOException | RuntimeException) is required here: the jvector
-            // MemorySegmentReader$Supplier.close() implementation throws IllegalStateException
-            // (a RuntimeException) when the underlying Arena is already closed — which can
-            // happen when OnDiskGraphIndexCompactor closes its sources during or after
-            // compact(). We must swallow both flavors to guarantee that temp-file deletion
-            // in the next loop still runs.
+            // Broad catch (IOException | RuntimeException) is required here for best-effort
+            // cleanup safety: jvector's MemorySegmentReader$Supplier.close() throws
+            // IllegalStateException (a RuntimeException, not IOException) when the
+            // underlying Arena is already closed. While the new fresh-supplier PQ factory
+            // means PQRetrainer never closes the suppliers in this list, catching
+            // RuntimeException guards against future jvector contract changes and any
+            // opaque mmap cleanup order that could leave an arena closed before we reach
+            // this finally block. Swallowing both flavors ensures temp-file deletion
+            // in the next loop always runs.
             for (ReaderSupplier rs : openedReaderSuppliers) {
                 try {
                     rs.close();

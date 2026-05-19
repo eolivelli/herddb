@@ -180,4 +180,106 @@ public class AggressivePolicyTest {
         assertEquals("medium next", "med", picked.get(1).metadata().getSegmentUuid());
         assertEquals("big last", "big", picked.get(2).metadata().getSegmentUuid());
     }
+
+    // -----------------------------------------------------------------------
+    // maxInputBytes cap tests (issue #602)
+    // -----------------------------------------------------------------------
+
+    /**
+     * When {@code maxInputBytes} is set to a value that fits only 2 of the
+     * 5 sub-target candidates, the cap must trim from the tail (largest) until
+     * the total is within budget or only 2 remain.
+     */
+    @Test
+    public void maxInputBytesLegacyPathTrimsLargestCandidates() {
+        // 5 sub-target segments: 100, 200, 300, 400, 500 bytes.
+        // Budget: 350 bytes → fits the 3 smallest (100+200+300=600, still >350 after
+        // adding 300, so 300 gets trimmed too → 100+200=300 ≤ 350, keep those 2).
+        // After selecting all 5 via perCycleMaxBytes, applyMaxInputBytesCap trims
+        // the largest until total ≤ 350 OR only 2 remain.
+        // 100+200+300+400+500 = 1500 > 350 → trim 500 → 1000 > 350 → trim 400
+        // → 600 > 350 → trim 300 → 300 ≤ 350 → stop. Result: [100, 200].
+        MergePolicy policy = new MergePolicy.AggressivePolicy(
+                10_000L, Long.MAX_VALUE, 100, /* kwayMax */ 0, /* maxInputBytes */ 350L);
+        List<VersionedSegmentMetadata> picked = policy.pickMergeCandidates(
+                List.of(seg("a", 100L), seg("b", 200L), seg("c", 300L),
+                        seg("d", 400L), seg("e", 500L)));
+        assertEquals("cap must trim to 2 candidates within budget", 2, picked.size());
+        long total = 0;
+        for (VersionedSegmentMetadata v : picked) {
+            total += v.metadata().getSizeBytes();
+        }
+        assertTrue("total after trim must be ≤ 350; got " + total, total <= 350L);
+    }
+
+    /**
+     * When every pair of candidates exceeds the budget (even the two smallest),
+     * the minimum-2 floor must override the cap and return exactly 2 candidates.
+     */
+    @Test
+    public void maxInputBytesTinyBudgetKeepsMinimumTwoCandidates() {
+        // Budget = 1 byte; every single segment is already larger.
+        // The trim loop must stop at 2 and return them even though 2 > 1.
+        MergePolicy policy = new MergePolicy.AggressivePolicy(
+                10_000L, Long.MAX_VALUE, 100, /* kwayMax */ 0, /* maxInputBytes */ 1L);
+        List<VersionedSegmentMetadata> picked = policy.pickMergeCandidates(
+                List.of(seg("x", 1_000L), seg("y", 2_000L), seg("z", 3_000L)));
+        assertEquals("floor of 2 must be retained even when every pair exceeds budget",
+                2, picked.size());
+    }
+
+    /**
+     * {@code maxInputBytes == Long.MAX_VALUE} must disable the cap entirely —
+     * all sub-target candidates are returned (subject only to perCycleMaxBytes /
+     * maxCount).
+     */
+    @Test
+    public void maxInputBytesMaxValueDisablesCap() {
+        // All segments sub-target; no byte-cycle cap; maxInputBytes disabled.
+        MergePolicy policy = new MergePolicy.AggressivePolicy(
+                10_000L, Long.MAX_VALUE, 100, /* kwayMax */ 0, /* maxInputBytes */ Long.MAX_VALUE);
+        List<VersionedSegmentMetadata> picked = policy.pickMergeCandidates(
+                List.of(seg("a", 100L), seg("b", 200L), seg("c", 300L),
+                        seg("d", 400L), seg("e", 500L)));
+        assertEquals("disabled cap must not trim any candidates", 5, picked.size());
+    }
+
+    /**
+     * {@code maxInputBytes <= 0} must also disable the cap (treated as
+     * {@link Long#MAX_VALUE} by the constructor).
+     */
+    @Test
+    public void maxInputBytesZeroOrNegativeDisablesCap() {
+        MergePolicy policyZero = new MergePolicy.AggressivePolicy(
+                10_000L, Long.MAX_VALUE, 100, /* kwayMax */ 0, /* maxInputBytes */ 0L);
+        List<VersionedSegmentMetadata> picked = policyZero.pickMergeCandidates(
+                List.of(seg("a", 100L), seg("b", 200L), seg("c", 300L)));
+        assertEquals("maxInputBytes=0 must disable cap", 3, picked.size());
+
+        MergePolicy policyNeg = new MergePolicy.AggressivePolicy(
+                10_000L, Long.MAX_VALUE, 100, /* kwayMax */ 0, /* maxInputBytes */ -1L);
+        picked = policyNeg.pickMergeCandidates(
+                List.of(seg("a", 100L), seg("b", 200L), seg("c", 300L)));
+        assertEquals("maxInputBytes=-1 must disable cap", 3, picked.size());
+    }
+
+    /**
+     * The getter must reflect the configured budget exactly (or {@link Long#MAX_VALUE}
+     * for 0 / negative inputs).
+     */
+    @Test
+    public void maxInputBytesGetterReflectsConfiguration() {
+        MergePolicy.AggressivePolicy p1 = new MergePolicy.AggressivePolicy(
+                10_000L, Long.MAX_VALUE, 100, 0, 500_000L);
+        assertEquals(500_000L, p1.getMaxInputBytes());
+
+        MergePolicy.AggressivePolicy p2 = new MergePolicy.AggressivePolicy(
+                10_000L, Long.MAX_VALUE, 100, 0, Long.MAX_VALUE);
+        assertEquals(Long.MAX_VALUE, p2.getMaxInputBytes());
+
+        MergePolicy.AggressivePolicy p3 = new MergePolicy.AggressivePolicy(
+                10_000L, Long.MAX_VALUE, 100, 0, 0L);
+        assertEquals("constructor must normalize 0 to MAX_VALUE",
+                Long.MAX_VALUE, p3.getMaxInputBytes());
+    }
 }
