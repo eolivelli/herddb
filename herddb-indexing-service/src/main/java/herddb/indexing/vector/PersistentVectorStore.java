@@ -409,12 +409,12 @@ public class PersistentVectorStore extends AbstractVectorStore {
      * <p>Each segment's contribution is captured as a snapshot at registration
      * time and stored on the segment in
      * {@link VectorSegment#cachedEstimatedInMemoryBytes}, so the same value can
-     * later be subtracted on unregistration even if the segment's underlying
-     * BLink page-cache or pkData arrays have shifted in between.  Subsequent
-     * BLink page loads/evictions are not reflected in this counter; the BLink
-     * page-cache footprint is bounded by the {@link MemoryManager}'s global
-     * index-page replacement policy budget, which the back-pressure code
-     * already enforces independently.
+     * later be subtracted on unregistration.  The snapshot covers only the
+     * pkData / pkOffsets / pkLengths heap arrays (≈16 B/vector for BIGINT PKs);
+     * the BLink pk-to-ordinal tree is intentionally excluded because its
+     * loaded-page footprint is already bounded by the {@link MemoryManager}'s
+     * global index-page replacement policy budget, which the back-pressure code
+     * enforces independently (issue #592).
      */
     private final AtomicLong onDiskSegmentsEstimatedMemoryBytes = new AtomicLong(0);
 
@@ -4686,22 +4686,16 @@ public class PersistentVectorStore extends AbstractVectorStore {
      *   <li>pkToNode + nodeToPk ConcurrentHashMap entries (~100 bytes per entry × 2)</li>
      *   <li>Bytes PK objects (~50 bytes average)</li>
      *   <li>On-disk segments' in-memory footprint (pkData / pkOffsets / pkLengths
-     *       arrays plus the BLink pk-to-ordinal tree, issue #360) — read in
-     *       O(1) from {@link #onDiskSegmentsEstimatedMemoryBytes}, an
-     *       incrementally-maintained counter populated by
+     *       arrays only, ≈16 B/vector for BIGINT PKs) — read in O(1) from
+     *       {@link #onDiskSegmentsEstimatedMemoryBytes}, an incrementally-
+     *       maintained counter populated by
      *       {@link #registerSegmentMemoryEstimate} at every mutation of
-     *       {@link #segments} (issue #455).</li>
+     *       {@link #segments} (issue #455).  The BLink pk-to-ordinal tree is
+     *       intentionally excluded: its page-cache footprint is bounded by the
+     *       {@link MemoryManager}'s index-page replacement policy independently,
+     *       and including it caused permanent over-counting that triggered
+     *       spurious back-pressure stalls (issue #592).</li>
      * </ul>
-     *
-     * <p><strong>Snapshot semantics for the on-disk-segment portion.</strong>
-     * Each segment's contribution is captured as a snapshot at registration
-     * time, so subsequent BLink page-cache loads/evictions on already-
-     * registered segments are not reflected here.  Callers using this value
-     * for diagnostics should be aware that it tracks the static pkData /
-     * pkOffsets / pkLengths arrays exactly but only the registration-time
-     * snapshot of the dynamic BLink page-cache footprint; the live BLink
-     * footprint is bounded independently by the {@link MemoryManager} index
-     * page-replacement policy.
      */
     @Override
     public long estimatedMemoryUsageBytes() {
@@ -4729,7 +4723,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
     /**
      * Returns the estimated heap footprint of the in-memory HNSW shards only —
      * the live, frozen, and deferred {@link LiveGraphShard} graphs — excluding
-     * the on-disk segment pkData/pkOffsets/pkLengths/BLink contribution that
+     * the on-disk segment pkData/pkOffsets/pkLengths contribution that
      * {@link #estimatedMemoryUsageBytes()} additionally counts.
      *
      * <p>Issue #563: this is the figure that genuinely shrinks when a
@@ -4765,8 +4759,8 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
     /**
      * Returns the in-memory footprint of all currently registered on-disk
-     * {@link VectorSegment} objects (pkData/pkOffsets/pkLengths arrays plus
-     * the BLink pk-to-ordinal tree, snapshotted at segment registration time).
+     * {@link VectorSegment} objects (pkData/pkOffsets/pkLengths arrays only,
+     * ≈16 B/vector for BIGINT PKs; BLink is excluded — see issue #592).
      *
      * <p>Exposed for testing so that tests can assert the on-disk segment
      * contribution separately from the live-shard contribution, which is
@@ -4801,10 +4795,11 @@ public class PersistentVectorStore extends AbstractVectorStore {
      * on the segment in {@link VectorSegment#cachedEstimatedInMemoryBytes},
      * marks {@link VectorSegment#registeredInMemoryCounter}, and adds the
      * snapshot to {@link #onDiskSegmentsEstimatedMemoryBytes}.  Must be called
-     * exactly once per segment, after pkData/pkOffsets/pkLengths and the BLink
-     * have been populated (i.e. after {@code loadFusedPQSegment}), while the
-     * caller holds {@code stateLock.writeLock()} (or, for the load path, while
-     * no other thread can observe the store yet).
+     * exactly once per segment, after pkData/pkOffsets/pkLengths have been
+     * populated (i.e. after {@code loadFusedPQSegment}), while the caller
+     * holds {@code stateLock.writeLock()} (or, for the load path, while no
+     * other thread can observe the store yet).  The snapshot covers only
+     * pkData/pkOffsets/pkLengths; BLink is excluded (issue #592).
      *
      * <p>If the segment is already registered the call is a no-op so retry
      * paths cannot double-count.  The {@code registeredInMemoryCounter} flag
@@ -4859,13 +4854,10 @@ public class PersistentVectorStore extends AbstractVectorStore {
      * counter is compared (issue #455 — a missed register/unregister at any
      * future mutation site would cause the two values to diverge).
      *
-     * <p>The values may differ if the BLink page cache of an already-
-     * registered segment has loaded or evicted pages since registration; the
-     * tests only invoke this at clean lifecycle points where no such drift
-     * can occur (immediately after {@code start}, after a {@code checkpoint},
-     * after {@code runCompactionCycle}, after {@code reloadFromStatus}, and
-     * after the all-deleted checkpoint that resets {@code segments} to
-     * empty).
+     * <p>Since BLink is intentionally excluded from
+     * {@link VectorSegment#estimatedInMemoryBytes()} (issue #592), the counter
+     * and the iterated sum are always consistent: both count only the stable
+     * pkData/pkOffsets/pkLengths arrays, which do not change after registration.
      *
      * @return iterated sum of {@code seg.estimatedInMemoryBytes()} across
      *         the current segment list
@@ -5861,9 +5853,9 @@ public class PersistentVectorStore extends AbstractVectorStore {
             //
             // Capture snapshots BEFORE publishing newSegments: if any
             // estimatedInMemoryBytes() call were ever to throw (e.g. an
-            // unforeseen failure inside BLink.getUsedMemory()), unwinding
-            // before the publish leaves both this.segments and the counter
-            // consistent — no half-updated-counter window.
+            // unforeseen runtime failure), unwinding before the publish
+            // leaves both this.segments and the counter consistent —
+            // no half-updated-counter window.
             //
             // Issue #538 pr-reviewer pass-4: ordering is now `reapply →
             // register → publish`, so a throw in the reapply above also

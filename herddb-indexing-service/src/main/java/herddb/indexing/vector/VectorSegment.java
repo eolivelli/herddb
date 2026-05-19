@@ -394,29 +394,37 @@ class VectorSegment implements Closeable {
     /**
      * Estimates the heap memory currently held by this on-disk segment.
      *
-     * <p>Accounts for three components that are completely absent from the
+     * <p>Accounts for the two components that are completely absent from the
      * live-shard estimate in {@code PersistentVectorStore.estimatedMemoryUsageBytes()}:
      * <ol>
      *   <li>{@link #pkData} — byte array with all PKs packed end-to-end.</li>
      *   <li>{@link #pkOffsets} / {@link #pkLengths} — parallel {@code int[]}
      *       arrays mapping ordinal → offset/length inside {@code pkData}.</li>
-     *   <li>{@link #onDiskPkToNode} — pk-to-ordinal {@link BLink} tree whose
-     *       internal BLink Node structures are the single largest contributor
-     *       to the unaccounted heap gap (issue #360).  BLink already tracks
-     *       its loaded-page memory in {@link BLink#getUsedMemory()}.</li>
      * </ol>
      *
-     * <p>Note: {@link #onDiskGraph} upper HNSW layers are intentionally excluded.
-     * {@code OnDiskGraphIndex.ramBytesUsed()} iterates the in-memory neighbor maps
-     * with no result caching; including it would add O(segments × upper-layer-nodes)
-     * work to every {@code addVector} call via the back-pressure hot path.
-     * The three components above (pkData + BLink) already account for the primary
-     * 5–6 GiB unaccounted gap observed in the GKE BIGANN benchmark.
+     * <p>{@link #onDiskPkToNode} (BLink pk-to-ordinal tree) is intentionally
+     * excluded.  Its loaded-page footprint is already bounded by the
+     * {@link herddb.core.MemoryManager}'s global index-page replacement policy
+     * budget, which the back-pressure code enforces independently.  Including
+     * BLink's {@code getUsedMemory()} here would double-count its contribution:
+     * the snapshot taken at segment registration remains at the peak value
+     * (all pages loaded) while the MemoryManager freely evicts pages afterwards,
+     * causing {@code onDiskSegmentsEstimatedMemoryBytes} to be permanently
+     * over-stated by ≈128 B/vector and triggering spurious back-pressure stalls
+     * well below the true memory limit (issue #592).
+     *
+     * <p>Note: {@link #onDiskGraph} upper HNSW layers are also intentionally
+     * excluded. {@code OnDiskGraphIndex.ramBytesUsed()} iterates the in-memory
+     * neighbor maps with no result caching; including it would add
+     * O(segments × upper-layer-nodes) work to every {@code addVector} call via
+     * the back-pressure hot path.
      *
      * <p>Each field is null-guarded: fields that have not yet been populated
      * (e.g. before the segment is fully loaded) contribute 0.
      *
-     * @return estimated bytes of heap occupied by this segment's in-memory state
+     * @return estimated bytes of heap occupied by this segment's pkData /
+     *         pkOffsets / pkLengths arrays (~12 B/vector for 4-byte INT PKs,
+     *         ~16 B/vector for 8-byte BIGINT PKs)
      */
     long estimatedInMemoryBytes() {
         long bytes = 0;
@@ -432,10 +440,7 @@ class VectorSegment implements Closeable {
         if (pl != null) {
             bytes += (long) pl.length * Integer.BYTES;
         }
-        BLink<Bytes, Long> p2n = this.onDiskPkToNode;
-        if (p2n != null) {
-            bytes += p2n.getUsedMemory();
-        }
+        // BLink (onDiskPkToNode) intentionally excluded — see Javadoc above.
         return bytes;
     }
 
