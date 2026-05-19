@@ -630,6 +630,16 @@ public class PersistentVectorStore extends AbstractVectorStore {
      */
     private volatile int vectorIndexCompactionMaxInputs =
             DEFAULT_VECTOR_INDEX_COMPACTION_MAX_INPUTS;
+    /**
+     * Hard cap on the total bytes of source graph files that a single
+     * streaming compaction cycle may download (issue #602).  After
+     * {@link VectorIndexCompactor#chooseSegmentsToMerge} selects candidates,
+     * segments are trimmed (largest-first) until the total is within this
+     * budget.  Default is 100 GiB — enough to hold the vast majority of
+     * real-world merge inputs while preventing runaway disk consumption on
+     * small data-directory PVCs.  Set to {@link Long#MAX_VALUE} to disable.
+     */
+    private volatile long vectorIndexCompactionMaxInputBytes = 100L * 1024 * 1024 * 1024;
     private volatile long vectorIndexCompactionRetentionMs = 10L * 60_000L;
     /**
      * When {@code true} (the default), the per-cycle byte cap and segment
@@ -2000,6 +2010,29 @@ public class PersistentVectorStore extends AbstractVectorStore {
     }
 
     /**
+     * Sets the maximum total bytes of source graph files that a single
+     * streaming compaction cycle may download (issue #602).
+     * After candidate selection, segments are trimmed (largest-first) until
+     * the total download budget is within this cap.
+     * Use {@link Long#MAX_VALUE} to disable the cap.
+     *
+     * @param maxInputBytes positive budget in bytes; values &lt;= 0 are silently
+     *                      clamped to {@link Long#MAX_VALUE} (disabled)
+     */
+    public void setCompactionMaxInputBytes(long maxInputBytes) {
+        this.vectorIndexCompactionMaxInputBytes =
+                (maxInputBytes <= 0) ? Long.MAX_VALUE : maxInputBytes;
+    }
+
+    /**
+     * Returns the current per-cycle download budget in bytes (issue #602).
+     * {@link Long#MAX_VALUE} means the cap is disabled.
+     */
+    public long getCompactionMaxInputBytes() {
+        return vectorIndexCompactionMaxInputBytes;
+    }
+
+    /**
      * Sets the segment-count back-pressure threshold (issue #354).
      * {@link #addVectorInternal} will block when {@code segments.size()}
      * exceeds this value, waking the compaction thread first.
@@ -2471,6 +2504,39 @@ public class PersistentVectorStore extends AbstractVectorStore {
                     // Issue #587: hard cap on input segments per cycle, tier-scaled
                     // above so the drain rate keeps pace with the backlog.
                     effectiveMaxInputs);
+
+            // Issue #602: apply the per-cycle download budget cap AFTER candidate
+            // selection. Tiered scaling can push effectiveMaxBytes to 8 GiB; with
+            // large segments this could drive hundreds of GiBs of download traffic
+            // per cycle. maxInputBytes provides a hard ceiling independent of tiers.
+            // We trim the largest candidates first (the list is sorted smallest-first
+            // by chooseSegmentsToMerge) so we keep the maximum number of candidates
+            // while staying within budget. We always keep at least 2 to allow a
+            // meaningful merge; if even 2 exceed the budget we proceed anyway (the
+            // download will still be faster than per-node block-cache reads).
+            long maxInputBytes = vectorIndexCompactionMaxInputBytes;
+            if (maxInputBytes < Long.MAX_VALUE && !candidates.isEmpty()) {
+                long totalBytes = 0L;
+                for (VectorSegment seg : candidates) {
+                    totalBytes += Math.max(0L, seg.graphFileSize);
+                }
+                if (totalBytes > maxInputBytes) {
+                    // Trim from the tail (largest) until within budget or only 2 remain.
+                    while (candidates.size() > 2) {
+                        VectorSegment largest = candidates.get(candidates.size() - 1);
+                        totalBytes -= Math.max(0L, largest.graphFileSize);
+                        candidates.remove(candidates.size() - 1);
+                        if (totalBytes <= maxInputBytes) {
+                            break;
+                        }
+                    }
+                    LOGGER.log(Level.INFO,
+                            "vector store {0}: maxInputBytes cap ({1} bytes) trimmed"
+                                    + " candidates to {2} segment(s) ({3} bytes)",
+                            new Object[]{indexName, maxInputBytes, candidates.size(), totalBytes});
+                }
+            }
+
             if (candidates.isEmpty()) {
                 if (snapshot.size() >= COMPACTION_SEGMENT_COUNT_WARN_THRESHOLD) {
                     LOGGER.log(Level.WARNING,
@@ -3407,8 +3473,8 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
     /**
      * Package-private accessor for the tablespace UUID. Used by
-     * {@link SegmentPQReaderSupplier} to construct the correct storage key for
-     * downloading segment graph files during PQ retraining (issue #599).
+     * {@link VectorIndexCompactor} to construct the correct storage key for
+     * downloading source segment graph files during streaming compaction (issue #602).
      */
     String tableSpaceUUID() {
         return tableSpaceUUID;
@@ -3416,8 +3482,8 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
     /**
      * Package-private accessor for the data storage manager. Used by
-     * {@link SegmentPQReaderSupplier} to download segment graph files for bulk
-     * sequential vector reads during PQ retraining (issue #599).
+     * {@link VectorIndexCompactor} to eagerly download source segment graph
+     * files to local temp files before the merge hot path (issue #602).
      */
     herddb.storage.DataStorageManager dataStorageManager() {
         return dataStorageManager;

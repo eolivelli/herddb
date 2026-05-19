@@ -799,6 +799,10 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             final int vectorCompactionMaxInputs = config.getInt(
                     IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_MAX_INPUTS,
                     IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_MAX_INPUTS_DEFAULT);
+            // Hard cap on total bytes of source graph files per compaction cycle (issue #602).
+            final long vectorCompactionMaxInputBytes = config.getLong(
+                    IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_MAX_INPUT_BYTES,
+                    IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_MAX_INPUT_BYTES_DEFAULT);
             final boolean vectorCompactionTieredEnabled = config.getBoolean(
                     IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_TIERED_ENABLED,
                     IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_TIERED_ENABLED_DEFAULT);
@@ -835,14 +839,16 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                     "vector index compaction: tieredEnabled={0}, backpressureSegments={1}, "
                             + "backpressureMaxWaitMs={2}, localKickFraction={3},"
                             + " localEnabledWithOptimizer={4}, streamingEnabled={5},"
-                            + " microSegmentMaxNodes={6}, maxInputs={7}",
+                            + " microSegmentMaxNodes={6}, maxInputs={7},"
+                            + " maxInputBytes={8}",
                     new Object[]{vectorCompactionTieredEnabled, vectorCompactionBackpressureSegments,
                             vectorCompactionBackpressureMaxWaitMs,
                             vectorCompactionLocalKickFraction,
                             vectorCompactionLocalEnabledWithOptimizer,
                             vectorCompactionStreamingEnabled,
                             vectorCompactionMicroSegmentMaxNodes,
-                            vectorCompactionMaxInputs});
+                            vectorCompactionMaxInputs,
+                            vectorCompactionMaxInputBytes});
             // Async IO pipeline for FusedPQ search (issue #547).
             // Config key takes precedence over the system property.
             final boolean vectorSearchAsyncPipelineEnabled = config.getBoolean(
@@ -956,6 +962,8 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                 store.setTieredCompactionEnabled(vectorCompactionTieredEnabled);
                 store.setCompactionMicroSegmentMaxNodes(vectorCompactionMicroSegmentMaxNodes);
                 store.setCompactionMaxInputs(vectorCompactionMaxInputs);
+                // Issue #602: per-cycle download budget cap.
+                store.setCompactionMaxInputBytes(vectorCompactionMaxInputBytes);
                 store.setCompactionBackpressureThreshold(vectorCompactionBackpressureSegments);
                 store.setCompactionBackpressureMaxWaitMs(vectorCompactionBackpressureMaxWaitMs);
                 store.setLocalCompactionKickFraction(vectorCompactionLocalKickFraction);

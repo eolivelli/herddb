@@ -456,6 +456,11 @@ indexingService:
     # multiplier at >500 segments anyway, so this raises the effective cap to
     # 16000 in the current situation — well above the 672/588 observed counts.
     vector.index.compaction.maxCount: "2000"
+    # Per-cycle download budget for streaming compaction (issue #602).
+    # The IS data PVC is 100 GiB; cap at 40 GiB so the merged output
+    # (graph + map, ~1.5× the input for typical M=16 segments) plus
+    # the IS working data can coexist on the PVC without overflow.
+    indexing.vector.compaction.maxInputBytes: "42949672960"       # 40 GiB
   # Direct S3 download for segment map files during cold-start recovery (issue #381).
   # Mirrors the file server's GCS settings so the IS downloads segment map blocks
   # directly from GCS rather than routing them through the gRPC file-server.
@@ -561,6 +566,11 @@ indexOptimizer:
   # types — GCE rejects the attach with "pd-standard disk type cannot be used
   # by c3-standard-* machine type".  Use standard-rwo (pd-balanced) instead,
   # which is supported on all GKE machine families including c3.
+  extraConfig:
+    # Per-cycle download budget for streaming merge (issue #602).
+    # The optimizer tmp PVC is 50 GiB; capping inputs at 40 GiB leaves
+    # ~10 GiB for the merged output (graph + map) and scratch space.
+    indexoptimizer.merge.max.input.bytes: "42949672960"           # 40 GiB
   storage:
     tmp:
       storageClass: "standard-rwo"

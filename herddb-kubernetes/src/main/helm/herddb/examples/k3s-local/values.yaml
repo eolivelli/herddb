@@ -406,6 +406,10 @@ indexingService:
     # steady-state Caffeine cache footprint to ~40 segments and gives the
     # compaction loop much more headroom to merge before back-pressure fires.
     vector.index.compaction.backpressure.segments: "2147483647"
+    # Per-cycle download budget for streaming compaction (issue #602).
+    # The IS data PVC is 5 GiB; cap at 4 GiB to leave ~1 GiB headroom for
+    # the compaction output (merged graph + map) and IS working files.
+    indexing.vector.compaction.maxInputBytes: "4294967296"        # 4 GiB
     # Global vector memory budget: default 33% of MaxDirectMemorySize (8 GiB) = 2.64 GiB.
     # Previously raised to 60% as a workaround for the BLink snapshot over-counting bug
     # (issue #592). Fix merged in PR #594 — the override is no longer needed and is

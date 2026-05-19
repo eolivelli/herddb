@@ -228,6 +228,20 @@ public final class OptimizerConfiguration {
     public static final String PROPERTY_MERGE_KWAY_MAX = "indexoptimizer.merge.kway.max";
     public static final int PROPERTY_MERGE_KWAY_MAX_DEFAULT = 0;
 
+    /**
+     * Hard cap on the total bytes of source segment files that a single
+     * optimizer merge cycle may include (issue #602). After candidate
+     * selection, the largest candidates are trimmed until the total
+     * {@code sizeBytes} is within this limit. At least 2 candidates are
+     * always kept so a merge is still attempted.
+     * Default is 100 GiB ({@code 107374182400}).
+     * Set to {@link Long#MAX_VALUE} to disable.
+     */
+    public static final String PROPERTY_MERGE_MAX_INPUT_BYTES =
+            "indexoptimizer.merge.max.input.bytes";
+    public static final long PROPERTY_MERGE_MAX_INPUT_BYTES_DEFAULT =
+            100L * 1024 * 1024 * 1024; // 100 GiB
+
     // -------------------------------------------------------------------------
     // Horizontal scalability: pod role detection (step 1)
     // -------------------------------------------------------------------------

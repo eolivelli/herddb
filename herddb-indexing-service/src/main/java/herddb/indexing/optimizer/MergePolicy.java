@@ -164,23 +164,46 @@ public interface MergePolicy {
          * {@code 0}: legacy byte-cap behaviour.
          */
         private final int kwayMax;
+        /**
+         * Hard cap on the total bytes of source segment files that a single
+         * merge cycle may include (issue #602). After candidate selection,
+         * the largest candidates are trimmed until the total is within this
+         * limit. At least 2 candidates are always kept so the merge proceeds.
+         * Use {@link Long#MAX_VALUE} to disable.
+         */
+        private final long maxInputBytes;
 
         /**
          * Backward-compatible 3-arg constructor: uses legacy {@code perCycleMaxBytes}
-         * candidate selection ({@code kwayMax = 0}).
+         * candidate selection ({@code kwayMax = 0}) and no download budget cap
+         * ({@code maxInputBytes = Long.MAX_VALUE}).
          */
         public AggressivePolicy(long targetMaxBytes, long perCycleMaxBytes, int maxCount) {
             this(targetMaxBytes, perCycleMaxBytes, maxCount, /* kwayMax */ 0);
         }
 
         /**
-         * Full constructor adding k-way candidate selection (issue #524).
+         * 4-arg constructor adding k-way candidate selection (issue #524).
+         * No download budget cap ({@code maxInputBytes = Long.MAX_VALUE}).
          *
          * @param kwayMax  max inputs per merge cycle in k-way mode (0 = legacy byte-cap
          *                 mode; must be 0 or {@code >= 2})
          */
         public AggressivePolicy(long targetMaxBytes, long perCycleMaxBytes, int maxCount,
                                 int kwayMax) {
+            this(targetMaxBytes, perCycleMaxBytes, maxCount, kwayMax, Long.MAX_VALUE);
+        }
+
+        /**
+         * Full constructor adding the per-cycle download budget cap (issue #602).
+         *
+         * @param kwayMax       max inputs per merge cycle in k-way mode (0 = legacy)
+         * @param maxInputBytes hard cap on total source bytes per cycle;
+         *                      {@link Long#MAX_VALUE} disables the cap; values
+         *                      {@code <= 0} are treated as {@link Long#MAX_VALUE}
+         */
+        public AggressivePolicy(long targetMaxBytes, long perCycleMaxBytes, int maxCount,
+                                int kwayMax, long maxInputBytes) {
             if (targetMaxBytes <= 0L) {
                 throw new IllegalArgumentException("targetMaxBytes must be positive: " + targetMaxBytes);
             }
@@ -197,6 +220,7 @@ public interface MergePolicy {
             this.perCycleMaxBytes = perCycleMaxBytes;
             this.maxCount = maxCount;
             this.kwayMax = kwayMax;
+            this.maxInputBytes = (maxInputBytes <= 0) ? Long.MAX_VALUE : maxInputBytes;
         }
 
         public long getTargetMaxBytes() {
@@ -214,6 +238,11 @@ public interface MergePolicy {
         /** Returns the configured k-way max (0 = legacy byte-cap mode). */
         public int getKwayMax() {
             return kwayMax;
+        }
+
+        /** Returns the per-cycle download budget cap in bytes ({@link Long#MAX_VALUE} = disabled). */
+        public long getMaxInputBytes() {
+            return maxInputBytes;
         }
 
         @Override
@@ -282,7 +311,10 @@ public interface MergePolicy {
                 // (constructor enforces kwayMax >= 2 and maxCount >= 2), so
                 // picked.size() >= 2 is always true here. The guard is kept as a
                 // defensive belt-and-suspenders check.
-                return picked.size() >= 2 ? picked : new ArrayList<>();
+                if (picked.size() < 2) {
+                    return new ArrayList<>();
+                }
+                return applyMaxInputBytesCap(picked);
             }
 
             // Legacy byte-cap mode: respect perCycleMaxBytes.
@@ -304,7 +336,33 @@ public interface MergePolicy {
                 picked.add(v);
                 pickedBytes += size;
             }
-            return picked.size() >= 2 ? picked : new ArrayList<>();
+            if (picked.size() < 2) {
+                return new ArrayList<>();
+            }
+            return applyMaxInputBytesCap(picked);
+        }
+
+        /**
+         * Trims the largest candidates from a pre-selected, ascending-size-sorted
+         * list until the total {@code sizeBytes} is within {@link #maxInputBytes}.
+         * At least 2 candidates are always retained. The input list is modified
+         * in place.
+         */
+        private List<VersionedSegmentMetadata> applyMaxInputBytesCap(
+                List<VersionedSegmentMetadata> picked) {
+            if (maxInputBytes == Long.MAX_VALUE) {
+                return picked;
+            }
+            long totalBytes = 0L;
+            for (VersionedSegmentMetadata v : picked) {
+                totalBytes += Math.max(0L, v.metadata().getSizeBytes());
+            }
+            while (picked.size() > 2 && totalBytes > maxInputBytes) {
+                VersionedSegmentMetadata largest = picked.get(picked.size() - 1);
+                totalBytes -= Math.max(0L, largest.metadata().getSizeBytes());
+                picked.remove(picked.size() - 1);
+            }
+            return picked;
         }
     }
 }
