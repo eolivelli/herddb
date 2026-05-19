@@ -1640,7 +1640,7 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
                     return;
                 }
                 T value = parser.parse(reply);
-                future.complete(value);
+                completeOrRelease(future, value);
             } catch (RuntimeException parseError) {
                 future.completeExceptionally(parseError);
             } finally {
@@ -1652,6 +1652,34 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
             }
         });
         return future;
+    }
+
+    /**
+     * Completes {@code future} with {@code value}. If the future is already
+     * done (cancelled or completed exceptionally by a concurrent timeout or
+     * channel-error callback), {@link CompletableFuture#complete} returns
+     * {@code false} and the value would be abandoned with refcount = 1. In
+     * that case this method calls {@link ReferenceCountUtil#safeRelease} to
+     * decrement the refcount of any {@link io.netty.util.ReferenceCounted}
+     * held by {@code value} (e.g. a pooled direct {@link ByteBuf} returned by
+     * {@link #parseReadFileRangeResponse} or {@link #parseReadFileResponse}).
+     * For non-ReferenceCounted types (e.g. {@code byte[]}) the call is a
+     * no-op, so this helper is safe for all {@link #sendRequest} callers.
+     *
+     * <p>This is the fix for issue #596: the "normal-path" ByteBuf leak that
+     * occurs when a successful {@code readFileRange} response arrives after the
+     * outer {@link CompletableFuture} has already been cancelled or timed out.
+     *
+     * <p>Package-private for direct unit testing (see
+     * {@code RemoteFileServiceClientReadFileRangeByteBufLeakTest}).
+     */
+    static <T> void completeOrRelease(CompletableFuture<T> future, T value) {
+        if (!future.complete(value)) {
+            // The future was already completed (cancelled or completed
+            // exceptionally by a concurrent timeout / channel-idle check).
+            // Release any ReferenceCounted resource so it is not leaked.
+            ReferenceCountUtil.safeRelease(value);
+        }
     }
 
     private static <T> CompletableFuture<T> failed(Throwable t) {
