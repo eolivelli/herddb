@@ -24,12 +24,20 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 import herddb.core.MemoryManager;
 import herddb.mem.MemoryDataStorageManager;
+import herddb.storage.DataStorageManagerException;
 import herddb.utils.Bytes;
+import io.github.jbellis.jvector.disk.ByteBufferReader;
+import io.github.jbellis.jvector.disk.RandomAccessReader;
+import io.github.jbellis.jvector.disk.ReaderSupplier;
+import java.io.BufferedOutputStream;
+import java.io.FileOutputStream;
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Random;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Rule;
@@ -278,6 +286,207 @@ public class EagerDownloadCompactionTest {
             assertFalse("no herddb-compact-src-*.idx files should remain in "
                             + store.tmpDirectory(),
                     countDownloadTempFiles(store.tmpDirectory()) > 0);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Corrupt source graph — RuntimeException wrapping (issue #602 round-2)
+    // -----------------------------------------------------------------------
+
+    /**
+     * When the eager-download step provides a corrupt (all-zeros) graph payload,
+     * {@link io.github.jbellis.jvector.graph.disk.OnDiskGraphIndex#load} throws a
+     * {@link RuntimeException} (e.g. {@code IllegalArgumentException} on bad magic
+     * bytes). The new {@code catch (RuntimeException e)} arm in
+     * {@link VectorIndexCompactor#rebuildSegmentStreaming} must convert it to
+     * {@link CompactionException}, so that {@code runCompactionCycle} records the
+     * failure cleanly and does not propagate the exception to the caller.
+     */
+    @Test
+    public void corruptSourceGraphIsRecordedAsCompactionFailure() throws Exception {
+        Path tmpDir = tmpFolder.newFolder("corrupt-graph").toPath();
+        AtomicBoolean corruptMode = new AtomicBoolean(false);
+        MemoryDataStorageManager dsm = new MemoryDataStorageManager() {
+            @Override
+            public ReaderSupplier multipartIndexReaderSupplier(
+                    String tableSpace, String uuid, String fileType, long fileSize)
+                    throws DataStorageManagerException {
+                if (corruptMode.get() && "graph".equals(fileType)) {
+                    // Return a reader backed by all-zeros data of the correct size.
+                    // OnDiskGraphIndex.load() will parse a zeroed header and throw a
+                    // RuntimeException (bad magic / invalid version), exercising the
+                    // new catch (RuntimeException) arm in rebuildSegmentStreaming.
+                    byte[] zeros = new byte[(int) fileSize];
+                    return new ReaderSupplier() {
+                        @Override
+                        public RandomAccessReader get() {
+                            return new ByteBufferReader(ByteBuffer.wrap(zeros));
+                        }
+                    };
+                }
+                return super.multipartIndexReaderSupplier(tableSpace, uuid, fileType, fileSize);
+            }
+        };
+
+        try (PersistentVectorStore store = createStore(tmpDir, dsm)) {
+            store.start();
+
+            // Build 3 segments so streaming compaction has at least 2 candidates.
+            Random rng = new Random(602_5);
+            for (int c = 0; c < 3; c++) {
+                for (int i = 0; i < 300; i++) {
+                    store.addVector(Bytes.from_int(c * 10_000 + i), vec(rng, 16));
+                }
+                store.checkpoint();
+            }
+            assertTrue("need >= 2 segments", store.getSegmentCount() >= 2);
+
+            // From now on, graph files return zeros; compaction will find corrupt data.
+            corruptMode.set(true);
+
+            // runCompactionCycle must NOT throw — the RuntimeException from jvector
+            // must be caught and converted to a CompactionException internally.
+            store.runCompactionCycle();
+
+            // The failure must be recorded, not swallowed.
+            assertTrue(
+                    "a corrupt source graph must record a compaction failure; "
+                            + "consecutiveFailures=" + store.getCompactionConsecutiveFailures(),
+                    store.getCompactionConsecutiveFailures() > 0);
+            assertEquals("no successful compaction should be recorded after corrupt source",
+                    0, store.getCompactionSuccessesTotal());
+
+            // No stray temp files even after a failure.
+            assertEquals("temp files must be cleaned up on failure too",
+                    0, countDownloadTempFiles(store.tmpDirectory()));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Direct-download path (supportsDirectMultipartDownload == true)
+    // -----------------------------------------------------------------------
+
+    /**
+     * A {@link MemoryDataStorageManager} subclass that declares
+     * {@link #supportsDirectMultipartDownload()} {@code true} and implements
+     * {@link #downloadMultipartIndexFile} by reading the in-memory byte array
+     * and writing it to the destination path. This exercises the
+     * {@code supportsDirectDownload == true} branch in
+     * {@link VectorIndexCompactor#rebuildSegmentStreaming}.
+     */
+    private static class DirectDownloadDsm extends MemoryDataStorageManager {
+        /** When {@code true} the next downloadMultipartIndexFile call throws IOException. */
+        final AtomicBoolean failNextDownload = new AtomicBoolean(false);
+
+        @Override
+        public boolean supportsDirectMultipartDownload() {
+            return true;
+        }
+
+        @Override
+        public void downloadMultipartIndexFile(
+                String tableSpace, String uuid, String fileType,
+                long fileSize, Path destFile)
+                throws IOException, DataStorageManagerException {
+            if (failNextDownload.getAndSet(false)) {
+                throw new IOException("simulated direct-download I/O failure for " + uuid);
+            }
+            // Copy in-memory bytes to the destination path.
+            ReaderSupplier rs =
+                    super.multipartIndexReaderSupplier(tableSpace, uuid, fileType, fileSize);
+            byte[] buf = new byte[(int) fileSize];
+            try (RandomAccessReader reader = rs.get()) {
+                reader.seek(0L);
+                reader.readFully(buf);
+            }
+            try (FileOutputStream fos = new FileOutputStream(destFile.toFile());
+                    BufferedOutputStream bos = new BufferedOutputStream(fos)) {
+                bos.write(buf);
+            }
+        }
+    }
+
+    /**
+     * Verifies that the direct-download path
+     * ({@code dsm.supportsDirectMultipartDownload() == true}) produces a correct
+     * compacted result and cleans up all {@code herddb-compact-src-*.idx} temp files.
+     *
+     * <p>This exercises the {@code supportsDirectDownload == true} branch in
+     * {@link VectorIndexCompactor#rebuildSegmentStreaming} — the production S3/GCS/MinIO
+     * code path — which the {@link MemoryDataStorageManager} fallback-path tests do not
+     * cover. Restores the coverage that was removed when
+     * {@code SegmentPQReaderSupplierTest.DirectDownloadDsm} was deleted.
+     */
+    @Test
+    public void directDownloadPathSucceedsAndCleansUpTempFiles() throws Exception {
+        Path tmpDir = tmpFolder.newFolder("direct-download").toPath();
+        DirectDownloadDsm dsm = new DirectDownloadDsm();
+
+        try (PersistentVectorStore store = createStore(tmpDir, dsm)) {
+            store.start();
+
+            Random rng = new Random(602_6);
+            for (int c = 0; c < 4; c++) {
+                for (int i = 0; i < 300; i++) {
+                    store.addVector(Bytes.from_int(c * 10_000 + i), vec(rng, 16));
+                }
+                store.checkpoint();
+            }
+            assertTrue("need >= 2 segments", store.getSegmentCount() >= 2);
+
+            store.runCompactionCycle();
+
+            assertEquals("direct-download compaction must succeed",
+                    1, store.getCompactionSuccessesTotal());
+            assertEquals("no consecutive failures expected",
+                    0, store.getCompactionConsecutiveFailures());
+
+            // All temp files must be deleted.
+            assertEquals(
+                    "all herddb-compact-src-*.idx files must be cleaned up after direct-download compaction",
+                    0, countDownloadTempFiles(store.tmpDirectory()));
+        }
+    }
+
+    /**
+     * Verifies that a direct-download I/O failure is recorded as a compaction failure
+     * (not swallowed, not propagated out of {@code runCompactionCycle}), and that temp
+     * files are still cleaned up on failure.
+     */
+    @Test
+    public void directDownloadFailureIsRecordedAsCompactionFailure() throws Exception {
+        Path tmpDir = tmpFolder.newFolder("direct-download-fail").toPath();
+        DirectDownloadDsm dsm = new DirectDownloadDsm();
+
+        try (PersistentVectorStore store = createStore(tmpDir, dsm)) {
+            store.start();
+
+            Random rng = new Random(602_7);
+            for (int c = 0; c < 3; c++) {
+                for (int i = 0; i < 300; i++) {
+                    store.addVector(Bytes.from_int(c * 10_000 + i), vec(rng, 16));
+                }
+                store.checkpoint();
+            }
+            assertTrue("need >= 2 segments", store.getSegmentCount() >= 2);
+
+            // Arm the failure: the first graph-file download will throw IOException.
+            dsm.failNextDownload.set(true);
+
+            // runCompactionCycle must NOT throw.
+            store.runCompactionCycle();
+
+            // Failure must be recorded.
+            assertTrue(
+                    "direct-download I/O failure must record a compaction failure; "
+                            + "consecutiveFailures=" + store.getCompactionConsecutiveFailures(),
+                    store.getCompactionConsecutiveFailures() > 0);
+            assertEquals("no successes should be recorded on download failure",
+                    0, store.getCompactionSuccessesTotal());
+
+            // Temp files must still be cleaned up.
+            assertEquals("temp files must be cleaned up even after download failure",
+                    0, countDownloadTempFiles(store.tmpDirectory()));
         }
     }
 }

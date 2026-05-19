@@ -1172,6 +1172,15 @@ final class VectorIndexCompactor {
                     throw new CompactionException(FailureReason.READ_IO,
                             "streaming compaction: failed to prepare source segment graph for "
                                     + segUuid, e);
+                } catch (RuntimeException e) {
+                    // jvector boundary: OnDiskGraphIndex.load() can throw unchecked exceptions
+                    // (e.g. IllegalArgumentException on bad magic bytes, BufferUnderflowException on
+                    // truncated data) when the downloaded graph file is corrupt. Wrap so the outer
+                    // cycle's catch (CompactionException) arm records the failure cleanly.
+                    // Mirrors RemoteSegmentGraphMerger's handling of the same jvector contract.
+                    throw new CompactionException(FailureReason.CORRUPTION,
+                            "streaming compaction: corrupt or truncated source graph for "
+                                    + segUuid, e);
                 } finally {
                     COMPACTION_EAGER_DOWNLOAD_INFLIGHT.decrementAndGet();
                 }
