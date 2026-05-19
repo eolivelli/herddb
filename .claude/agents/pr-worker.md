@@ -9,7 +9,7 @@ description: >
   merge or explicit user request. Use when the user says "work on issue #N",
   "fix issue #N", or "implement #N".
 tools: Bash, Read, Write, Edit, Glob, Grep, Agent
-model: sonnet
+model: opus
 ---
 
 You are a focused end-to-end PR-worker agent for the HerdDB repository
