@@ -42,6 +42,8 @@ data:
     {{- if or .Values.fileServer.s3.gcsCompatibility .Values.minio.enabled }}
     s3.gcs.compatibility=true
     {{- end }}
+    s3.crt.max.concurrency={{ .Values.fileServer.s3.crtMaxConcurrency | default 4 | int64 }}
+    s3.crt.read.buffer.size={{ .Values.fileServer.s3.crtReadBufferSize | default 1073741824 | int64 }}
     {{- end }}
     http.enable=true
     http.port={{ .Values.fileServer.httpPort }}

@@ -21,35 +21,50 @@
 package herddb.remote;
 
 import static org.junit.Assert.assertEquals;
+import herddb.remote.storage.CrtS3HttpClientFactory;
 import java.util.Properties;
 import org.junit.Test;
 
 /**
  * Verifies that the CRT HTTP-client configuration constants introduced by
- * issue #612 are declared with the correct default values and that the
- * {@link RemoteFileServer} exposes them via its public {@code CONFIG_*}
- * constants so operators and tests can refer to them symbolically.
+ * issue #612 are declared in {@link CrtS3HttpClientFactory} with the correct
+ * property keys and default values, and that {@link RemoteFileServer} exposes
+ * them via its {@code CONFIG_CRT_*} aliases so existing references still
+ * compile.
  */
 public class RemoteFileServerCrtConfigTest {
 
     @Test
     public void crtMaxConcurrencyDefaultIsFour() {
-        assertEquals(4, RemoteFileServer.CONFIG_CRT_MAX_CONCURRENCY_DEFAULT);
+        assertEquals(4, CrtS3HttpClientFactory.PROPERTY_CRT_MAX_CONCURRENCY_DEFAULT);
     }
 
     @Test
     public void crtReadBufferSizeDefaultIsOneGiB() {
-        assertEquals(1024L * 1024 * 1024, RemoteFileServer.CONFIG_CRT_READ_BUFFER_SIZE_DEFAULT);
+        assertEquals(1024L * 1024 * 1024, CrtS3HttpClientFactory.PROPERTY_CRT_READ_BUFFER_SIZE_DEFAULT);
     }
 
     @Test
     public void crtMaxConcurrencyConfigKeyIsCorrect() {
-        assertEquals("s3.crt.max.concurrency", RemoteFileServer.CONFIG_CRT_MAX_CONCURRENCY);
+        assertEquals("s3.crt.max.concurrency", CrtS3HttpClientFactory.PROPERTY_CRT_MAX_CONCURRENCY);
     }
 
     @Test
     public void crtReadBufferSizeConfigKeyIsCorrect() {
-        assertEquals("s3.crt.read.buffer.size", RemoteFileServer.CONFIG_CRT_READ_BUFFER_SIZE);
+        assertEquals("s3.crt.read.buffer.size", CrtS3HttpClientFactory.PROPERTY_CRT_READ_BUFFER_SIZE);
+    }
+
+    /** RemoteFileServer.CONFIG_CRT_* must be aliases for the shared constants. */
+    @Test
+    public void remoteFileServerAliasesMatchFactory() {
+        assertEquals(CrtS3HttpClientFactory.PROPERTY_CRT_MAX_CONCURRENCY,
+                RemoteFileServer.CONFIG_CRT_MAX_CONCURRENCY);
+        assertEquals(CrtS3HttpClientFactory.PROPERTY_CRT_MAX_CONCURRENCY_DEFAULT,
+                RemoteFileServer.CONFIG_CRT_MAX_CONCURRENCY_DEFAULT);
+        assertEquals(CrtS3HttpClientFactory.PROPERTY_CRT_READ_BUFFER_SIZE,
+                RemoteFileServer.CONFIG_CRT_READ_BUFFER_SIZE);
+        assertEquals(CrtS3HttpClientFactory.PROPERTY_CRT_READ_BUFFER_SIZE_DEFAULT,
+                RemoteFileServer.CONFIG_CRT_READ_BUFFER_SIZE_DEFAULT);
     }
 
     /**
@@ -60,15 +75,15 @@ public class RemoteFileServerCrtConfigTest {
     @Test
     public void crtConfigIsReadFromProperties() {
         Properties props = new Properties();
-        props.setProperty(RemoteFileServer.CONFIG_CRT_MAX_CONCURRENCY, "8");
-        props.setProperty(RemoteFileServer.CONFIG_CRT_READ_BUFFER_SIZE, "536870912");
+        props.setProperty(CrtS3HttpClientFactory.PROPERTY_CRT_MAX_CONCURRENCY, "8");
+        props.setProperty(CrtS3HttpClientFactory.PROPERTY_CRT_READ_BUFFER_SIZE, "536870912");
 
         int maxConcurrency = Integer.parseInt(
-                props.getProperty(RemoteFileServer.CONFIG_CRT_MAX_CONCURRENCY,
-                        String.valueOf(RemoteFileServer.CONFIG_CRT_MAX_CONCURRENCY_DEFAULT)));
+                props.getProperty(CrtS3HttpClientFactory.PROPERTY_CRT_MAX_CONCURRENCY,
+                        String.valueOf(CrtS3HttpClientFactory.PROPERTY_CRT_MAX_CONCURRENCY_DEFAULT)));
         long readBufferSize = Long.parseLong(
-                props.getProperty(RemoteFileServer.CONFIG_CRT_READ_BUFFER_SIZE,
-                        String.valueOf(RemoteFileServer.CONFIG_CRT_READ_BUFFER_SIZE_DEFAULT)));
+                props.getProperty(CrtS3HttpClientFactory.PROPERTY_CRT_READ_BUFFER_SIZE,
+                        String.valueOf(CrtS3HttpClientFactory.PROPERTY_CRT_READ_BUFFER_SIZE_DEFAULT)));
 
         assertEquals(8, maxConcurrency);
         assertEquals(512L * 1024 * 1024, readBufferSize);
@@ -82,13 +97,13 @@ public class RemoteFileServerCrtConfigTest {
         Properties props = new Properties();
 
         int maxConcurrency = Integer.parseInt(
-                props.getProperty(RemoteFileServer.CONFIG_CRT_MAX_CONCURRENCY,
-                        String.valueOf(RemoteFileServer.CONFIG_CRT_MAX_CONCURRENCY_DEFAULT)));
+                props.getProperty(CrtS3HttpClientFactory.PROPERTY_CRT_MAX_CONCURRENCY,
+                        String.valueOf(CrtS3HttpClientFactory.PROPERTY_CRT_MAX_CONCURRENCY_DEFAULT)));
         long readBufferSize = Long.parseLong(
-                props.getProperty(RemoteFileServer.CONFIG_CRT_READ_BUFFER_SIZE,
-                        String.valueOf(RemoteFileServer.CONFIG_CRT_READ_BUFFER_SIZE_DEFAULT)));
+                props.getProperty(CrtS3HttpClientFactory.PROPERTY_CRT_READ_BUFFER_SIZE,
+                        String.valueOf(CrtS3HttpClientFactory.PROPERTY_CRT_READ_BUFFER_SIZE_DEFAULT)));
 
-        assertEquals(RemoteFileServer.CONFIG_CRT_MAX_CONCURRENCY_DEFAULT, maxConcurrency);
-        assertEquals(RemoteFileServer.CONFIG_CRT_READ_BUFFER_SIZE_DEFAULT, readBufferSize);
+        assertEquals(CrtS3HttpClientFactory.PROPERTY_CRT_MAX_CONCURRENCY_DEFAULT, maxConcurrency);
+        assertEquals(CrtS3HttpClientFactory.PROPERTY_CRT_READ_BUFFER_SIZE_DEFAULT, readBufferSize);
     }
 }

@@ -28,6 +28,7 @@ import herddb.network.ServerSideConnectionAcceptor;
 import herddb.network.netty.NettyChannelAcceptor;
 import herddb.remote.admin.RemoteFileServerAdminImpl;
 import herddb.remote.storage.CachingObjectStorage;
+import herddb.remote.storage.CrtS3HttpClientFactory;
 import herddb.remote.storage.InMemoryBlockCacheObjectStorage;
 import herddb.remote.storage.LocalObjectStorage;
 import herddb.remote.storage.ObjectStorage;
@@ -63,7 +64,6 @@ import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.core.checksums.RequestChecksumCalculation;
 import software.amazon.awssdk.core.checksums.ResponseChecksumValidation;
 import software.amazon.awssdk.crt.CRT;
-import software.amazon.awssdk.http.crt.AwsCrtAsyncHttpClient;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.s3.S3AsyncClient;
 import software.amazon.awssdk.services.s3.S3AsyncClientBuilder;
@@ -128,28 +128,20 @@ public class RemoteFileServer implements AutoCloseable {
     public static final String CONFIG_CACHE_SLAB_LARGE_FRACTION = "cache.slab.large.fraction";
 
     // -- AWS CRT HTTP client config (issue #612) ------------------------------------------
-    /**
-     * Maximum number of concurrent S3 connections the {@code AwsCrtAsyncHttpClient}
-     * may keep open. Each connection uses native (non-JVM) memory for its I/O
-     * buffers, so a high value can silently exhaust native memory and trigger an
-     * OOMKill. Default is 4. Raise cautiously only when S3 throughput is the
-     * observed bottleneck and native memory headroom is confirmed.
-     */
-    public static final String CONFIG_CRT_MAX_CONCURRENCY = "s3.crt.max.concurrency";
-    /** Default: 4 concurrent S3 connections. */
-    public static final int CONFIG_CRT_MAX_CONCURRENCY_DEFAULT = 4;
-
-    /**
-     * Per-connection native read-buffer size in bytes for the
-     * {@code AwsCrtAsyncHttpClient}. This buffer lives below the JVM heap
-     * and is invisible to {@code -XX:MaxDirectMemorySize} and Netty metrics.
-     * At the default concurrency of 4 connections, setting this to 1 GiB
-     * bounds the CRT native footprint to at most 4 GiB worst-case.
-     * Default is 1 GiB ({@code 1073741824}).
-     */
-    public static final String CONFIG_CRT_READ_BUFFER_SIZE = "s3.crt.read.buffer.size";
-    /** Default: 1 GiB per-connection read buffer. */
-    public static final long CONFIG_CRT_READ_BUFFER_SIZE_DEFAULT = 1024L * 1024 * 1024;
+    // Shared constants are in CrtS3HttpClientFactory; these aliases allow existing
+    // code and configuration documentation to refer to RemoteFileServer.CONFIG_CRT_*.
+    /** @see CrtS3HttpClientFactory#PROPERTY_CRT_MAX_CONCURRENCY */
+    public static final String CONFIG_CRT_MAX_CONCURRENCY =
+            CrtS3HttpClientFactory.PROPERTY_CRT_MAX_CONCURRENCY;
+    /** @see CrtS3HttpClientFactory#PROPERTY_CRT_MAX_CONCURRENCY_DEFAULT */
+    public static final int CONFIG_CRT_MAX_CONCURRENCY_DEFAULT =
+            CrtS3HttpClientFactory.PROPERTY_CRT_MAX_CONCURRENCY_DEFAULT;
+    /** @see CrtS3HttpClientFactory#PROPERTY_CRT_READ_BUFFER_SIZE */
+    public static final String CONFIG_CRT_READ_BUFFER_SIZE =
+            CrtS3HttpClientFactory.PROPERTY_CRT_READ_BUFFER_SIZE;
+    /** @see CrtS3HttpClientFactory#PROPERTY_CRT_READ_BUFFER_SIZE_DEFAULT */
+    public static final long CONFIG_CRT_READ_BUFFER_SIZE_DEFAULT =
+            CrtS3HttpClientFactory.PROPERTY_CRT_READ_BUFFER_SIZE_DEFAULT;
 
     private final String host;
     private final int port;
@@ -487,14 +479,11 @@ public class RemoteFileServer implements AutoCloseable {
                 config.getProperty("s3.gcs.compatibility", "false"));
 
         int crtMaxConcurrency = Integer.parseInt(
-                config.getProperty(CONFIG_CRT_MAX_CONCURRENCY,
-                        String.valueOf(CONFIG_CRT_MAX_CONCURRENCY_DEFAULT)));
+                config.getProperty(CrtS3HttpClientFactory.PROPERTY_CRT_MAX_CONCURRENCY,
+                        String.valueOf(CrtS3HttpClientFactory.PROPERTY_CRT_MAX_CONCURRENCY_DEFAULT)));
         long crtReadBufferSize = Long.parseLong(
-                config.getProperty(CONFIG_CRT_READ_BUFFER_SIZE,
-                        String.valueOf(CONFIG_CRT_READ_BUFFER_SIZE_DEFAULT)));
-        LOGGER.log(Level.INFO,
-                "S3 CRT client: maxConcurrency={0}, readBufferSizeInBytes={1}",
-                new Object[]{crtMaxConcurrency, crtReadBufferSize});
+                config.getProperty(CrtS3HttpClientFactory.PROPERTY_CRT_READ_BUFFER_SIZE,
+                        String.valueOf(CrtS3HttpClientFactory.PROPERTY_CRT_READ_BUFFER_SIZE_DEFAULT)));
         // Register a gauge that exposes the live native-memory footprint of the
         // CRT library (requires -Daws.crt.memory.tracing=1, set by setenv.sh).
         statsLogger.scope("rfs").scope("s3").registerGauge("crt_native_memory_bytes",
@@ -513,9 +502,7 @@ public class RemoteFileServer implements AutoCloseable {
                 .region(Region.of(region))
                 .credentialsProvider(StaticCredentialsProvider.create(
                         AwsBasicCredentials.create(accessKey, secretKey)))
-                .httpClientBuilder(AwsCrtAsyncHttpClient.builder()
-                        .maxConcurrency(crtMaxConcurrency)
-                        .readBufferSizeInBytes(crtReadBufferSize));
+                .httpClientBuilder(CrtS3HttpClientFactory.builder(crtMaxConcurrency, crtReadBufferSize));
         if (gcsCompatibility) {
             LOGGER.log(Level.INFO, "S3 client: GCS compatibility mode enabled "
                     + "(path-style addressing, SDK checksums WHEN_REQUIRED)");
