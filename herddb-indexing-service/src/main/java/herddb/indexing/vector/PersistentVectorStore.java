@@ -6704,15 +6704,53 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 uploadingActive.incrementAndGet();
                 String graphFilePath;
                 String segUuid = indexUUID + "_seg" + segmentId;
+                // Issue #616: register the segUuid in the provisional-multipart-files
+                // tracker BEFORE the upload starts, not after it returns. If the upload
+                // aborts mid-flight (e.g. OutOfDirectMemoryError from Netty's direct
+                // buffer pool while writing block 0), any partial S3 / file-server
+                // blocks were tracked-for-cleanup; the outer Phase B catch arm's
+                // rollbackProvisionalArtefacts() call then deletes them. Pre-fix the
+                // track happened only on successful return, leaking partial-upload
+                // blocks indefinitely — see the issue #616 reproduction. The pre-track
+                // is safe under success too: when Phase B + Phase C-prep complete the
+                // outer code clears provisionalMultipartFiles to null WITHOUT deleting
+                // anything (see the post-Phase-C-prep block in indexCheckpoint). It is
+                // also safe when the upload wrote zero bytes: rollback's
+                // deleteMultipartIndexFile call is a no-op against a missing key and
+                // the rollback path already swallows DataStorageManagerException /
+                // RuntimeException from such deletes (see rollbackProvisionalArtefacts).
+                trackProvisionalMultipartFile(segUuid, "graph");
                 try {
                     graphFilePath = dataStorageManager.writeMultipartIndexFile(
                             tableSpaceUUID,
                             segUuid, "graph",
                             tempFile, uploadBytesDone::addAndGet);
+                } catch (IOException | RuntimeException e) {
+                    // Issue #616: log SEVERE with the failing segment identity BEFORE
+                    // the exception propagates to awaitAllOrFirstFailure (which only
+                    // surfaces the FIRST failure when shards run in parallel). Without
+                    // this log the outer Phase B catch in doCheckpointFusedPQThreePhase
+                    // prints "Phase B exception" with no shard identity — operators
+                    // cannot tell which segment's upload aborted, which is the
+                    // diagnostic gap the issue is trying to close. The broad
+                    // RuntimeException catch is intentional: Netty wraps allocation
+                    // failures (including OutOfDirectMemoryError-style conditions)
+                    // and protocol errors into unchecked exceptions thrown out of the
+                    // multipart writer, and DataStorageManagerException is itself a
+                    // RuntimeException subclass. We re-throw unchanged so the existing
+                    // Phase B failure handling (rollbackProvisionalArtefacts +
+                    // recoverFromPhaseBFailure) runs exactly as before.
+                    LOGGER.log(Level.SEVERE,
+                            "checkpoint " + indexName + " Phase B: graph multipart"
+                                    + " write FAILED for segUuid=" + segUuid
+                                    + " (segmentId=" + segmentId
+                                    + ", vectors=" + shardSize
+                                    + ") — partial multipart state queued for rollback"
+                                    + " cleanup", e);
+                    throw e;
                 } finally {
                     uploadingActive.decrementAndGet();
                 }
-                trackProvisionalMultipartFile(segUuid, "graph");
                 graphUploadDoneNanos = System.nanoTime();
 
                 ConcurrentHashMap<Integer, Bytes> ordinalToPk = buildOrdinalToPk(shard);
@@ -6722,15 +6760,27 @@ public class PersistentVectorStore extends AbstractVectorStore {
                     uploadBytesTotal.addAndGet(mapSize);
                     uploadingActive.incrementAndGet();
                     String mapFilePath;
+                    // Issue #616: pre-track the map multipart file for the same reason
+                    // as the graph upload above. See the matching comment there.
+                    trackProvisionalMultipartFile(segUuid, "map");
                     try {
                         mapFilePath = dataStorageManager.writeMultipartIndexFile(
                                 tableSpaceUUID,
                                 segUuid, "map",
                                 mapFile, uploadBytesDone::addAndGet);
+                    } catch (IOException | RuntimeException e) {
+                        // Issue #616: see the matching catch on the graph upload above.
+                        LOGGER.log(Level.SEVERE,
+                                "checkpoint " + indexName + " Phase B: map multipart"
+                                        + " write FAILED for segUuid=" + segUuid
+                                        + " (segmentId=" + segmentId
+                                        + ", vectors=" + shardSize
+                                        + ") — partial multipart state queued for"
+                                        + " rollback cleanup", e);
+                        throw e;
                     } finally {
                         uploadingActive.decrementAndGet();
                     }
-                    trackProvisionalMultipartFile(segUuid, "map");
                     compactionNodesDone.addAndGet(shardSize);
                     SegmentWriteResult swr = new SegmentWriteResult(segmentId,
                             graphFilePath, graphSize,
