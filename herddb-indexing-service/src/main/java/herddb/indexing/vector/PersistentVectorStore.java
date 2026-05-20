@@ -2413,9 +2413,23 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 if (!running) {
                     return;
                 }
-            } catch (RuntimeException e) {
+            } catch (RuntimeException | Error e) {
                 // Safety net: the cycle itself logs specific failure
                 // reasons, but we must not let the thread die.
+                //
+                // Issue #621: include Error so an unexpected Error escape
+                // (e.g. a jvector code path or future refactor where
+                // VectorIndexCompactor's own per-step Error catches do not
+                // cover the source) does not silently kill the compaction
+                // daemon. Without this branch the IS would stop compacting
+                // until the next restart — the symptom #621 aims to prevent.
+                // The catch already logs SEVERE and bumps
+                // compactionConsecutiveFailures, which drives the
+                // computeBackoffMs back-off so a persistent Error source
+                // does not spin the loop tight. We do NOT rethrow because
+                // the surrounding while(running) loop is the daemon
+                // thread's lifecycle — letting an Error escape here ends
+                // the only retry path the compaction subsystem has.
                 LOGGER.log(Level.SEVERE,
                         "vector store " + indexName + ": unexpected compaction failure", e);
                 compactionConsecutiveFailures.incrementAndGet();

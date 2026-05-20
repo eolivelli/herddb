@@ -1298,12 +1298,21 @@ final class VectorIndexCompactor {
                             PhysicalCoreExecutor.pool(),
                             pqReaderFactory);
                     compactor.compact(graphTemp);
-                } catch (java.io.FileNotFoundException | RuntimeException e) {
+                } catch (java.io.FileNotFoundException | RuntimeException | Error e) {
                     // jvector boundary — wrap unchecked OR FileNotFoundException
                     // (declared on compact()) failures so they never reach the
                     // outer cycle's orphan-blind catch (IOException) arm. Covers both
                     // constructor-side (validateFeatures / validateLiveNodesBounds) and
                     // compact()-side failures. No orphans yet: this fires before any upload.
+                    //
+                    // Issue #621: include Error so a Netty OutOfDirectMemoryError
+                    // (or any other Error sub-class) thrown from jvector's compact()
+                    // is wrapped as a CompactionException and reaches runCompactionCycle's
+                    // catch arm, instead of escaping to vectorIndexCompactionLoop and
+                    // killing the daemon. We rethrow as a wrapped exception (not as the
+                    // original Throwable) so the outer cycle's failure-reason metrics
+                    // are recorded correctly; the original cause is preserved as the
+                    // CompactionException's cause for diagnosis.
                     throw new CompactionException(FailureReason.WRITE_IO,
                             "OnDiskGraphIndexCompactor constructor/compact failed for segment "
                                     + segmentId, e);
@@ -1312,7 +1321,9 @@ final class VectorIndexCompactor {
                 try {
                     writeStreamingCompactedMapFile(candidates, liveBitsets, mappers,
                             localSources, mapTemp, dim, keptCount);
-                } catch (RuntimeException e) {
+                } catch (RuntimeException | Error e) {
+                    // Issue #621: see the matching catch on OnDiskGraphIndexCompactor
+                    // above. No orphans yet — fires before any multipart upload.
                     throw new CompactionException(FailureReason.WRITE_IO,
                             "streaming compaction map-file build failed for segment "
                                     + segmentId, e);
@@ -1322,11 +1333,19 @@ final class VectorIndexCompactor {
             try {
                 swr = store.writeStreamingCompactedSegment(
                         graphTemp, mapTemp, segmentId, keptCount);
-            } catch (IOException | DataStorageManagerException e) {
+            } catch (IOException | DataStorageManagerException | Error e) {
                 // Either upload (graph or map) may have completed before the
                 // failure surfaced — track both as orphans regardless and let
                 // the outer cycle queue retention-aware deletes via
                 // pendingDeletes (issue #485 review item B.1#1).
+                //
+                // Issue #621: include Error so a Netty OutOfDirectMemoryError mid
+                // multipart-write produces the orphan-list wrap that
+                // runCompactionCycle's catch (CompactionException) arm drains into
+                // pendingDeletes. Without this branch, an Error skips the wrap, the
+                // outer cycle never sees the orphan list, and partial multipart
+                // blocks leak into remote storage — the symmetric compaction-side
+                // bug that #616 / #618 fixed on the checkpoint side.
                 List<String[]> failureOrphans = new ArrayList<>(2);
                 failureOrphans.add(new String[]{
                         store.indexUUID() + "_seg" + segmentId, "graph"});
@@ -1364,7 +1383,12 @@ final class VectorIndexCompactor {
 
             try {
                 mergedSegment = store.preloadCompactedSegment(swr);
-            } catch (IOException | DataStorageManagerException e) {
+            } catch (IOException | DataStorageManagerException | Error e) {
+                // Issue #621: include Error so a post-upload preload failure
+                // (Netty OOM, etc.) still routes the already-uploaded graph + map
+                // multipart files through the orphan-list pipeline. Pre-fix, an
+                // Error here would leak both files in remote storage even though
+                // the upload had succeeded and `orphans` was already populated.
                 FailureReason reason = (e instanceof DataStorageManagerException)
                         ? FailureReason.METADATA_IO : FailureReason.READ_IO;
                 throw new CompactionException(reason,
@@ -1695,7 +1719,12 @@ final class VectorIndexCompactor {
 
             try {
                 builder.cleanup();
-            } catch (RuntimeException e) {
+            } catch (RuntimeException | Error e) {
+                // Issue #621: include Error so an OutOfMemoryError thrown by the
+                // jvector builder's cleanup() (which allocates internal scratch
+                // buffers) is wrapped as a CompactionException rather than
+                // escaping to vectorIndexCompactionLoop. No orphans yet — fires
+                // before any multipart upload.
                 throw new CompactionException(FailureReason.WRITE_IO,
                         "GraphIndexBuilder.cleanup failed during compaction rebuild", e);
             }
@@ -1704,11 +1733,19 @@ final class VectorIndexCompactor {
             PersistentVectorStore.SegmentWriteResult swr;
             try {
                 swr = store.writeSyntheticShard(synthetic, segmentId, dim);
-            } catch (IOException | DataStorageManagerException e) {
+            } catch (IOException | DataStorageManagerException | Error e) {
                 // Issue #485 review item B.1#1: wrap the upload failure in a
                 // CompactionException carrying the orphan list so the outer
                 // cycle's pendingDeletes drainer fires (the previous rethrow
                 // dropped orphans with the stack frame).
+                //
+                // Issue #621: include Error for the same reason as the
+                // matching arm in rebuildSegmentStreaming around
+                // writeStreamingCompactedSegment — a Netty OutOfDirectMemoryError
+                // mid multipart-write must produce the orphan-list wrap that
+                // runCompactionCycle's catch (CompactionException) arm drains
+                // into pendingDeletes; otherwise partial blocks leak in remote
+                // storage.
                 List<String[]> failureOrphans = new ArrayList<>(2);
                 failureOrphans.add(new String[]{
                         store.indexUUID() + "_seg" + segmentId, "graph"});
@@ -1734,7 +1771,10 @@ final class VectorIndexCompactor {
 
             try {
                 mergedSegment = store.preloadCompactedSegment(swr);
-            } catch (IOException | DataStorageManagerException e) {
+            } catch (IOException | DataStorageManagerException | Error e) {
+                // Issue #621: see the matching arm in rebuildSegmentStreaming —
+                // a post-upload Error must still route the already-uploaded
+                // multipart files through `orphans` for retention-aware cleanup.
                 FailureReason reason = (e instanceof DataStorageManagerException)
                         ? FailureReason.METADATA_IO : FailureReason.READ_IO;
                 throw new CompactionException(reason,
