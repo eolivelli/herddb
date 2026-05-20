@@ -268,6 +268,54 @@ public abstract class DataStorageManager implements AutoCloseable {
             throws DataStorageManagerException;
 
     /**
+     * Issue #617: best-effort presence check for a multipart index file.
+     * Used by the operator-facing {@code DeleteSegment} RPC to refuse the
+     * delete when the graph file IS reachable (warning the operator that
+     * they may be targeting the wrong segment).
+     *
+     * <p>Default implementation opens the reader supplier with a 1-byte
+     * fictitious file size and attempts a single 1-byte read at offset 0.
+     * Success → {@code true}; an {@link IOException} or
+     * {@link DataStorageManagerException} on either step → {@code false}.
+     * Backends that can answer the question more cheaply (e.g. an S3
+     * {@code HEAD} request) should override.
+     *
+     * <p>The contract is intentionally "best-effort": callers MUST NOT
+     * use this as a strong existence check, only as a safety gate for
+     * operator-driven deletes. A {@code false} result combined with a
+     * {@code --force} override is the supported way to delete a segment.
+     */
+    public boolean multipartIndexFileExists(String tableSpace, String uuid, String fileType) {
+        // We do not know the real file size here; pass a sentinel value
+        // large enough to cover the first block. The default
+        // multipartIndexReaderSupplier implementations only use fileSize
+        // to compute block boundaries, so a too-large value is harmless
+        // for the single-byte read we are about to attempt.
+        io.github.jbellis.jvector.disk.ReaderSupplier rs;
+        try {
+            rs = multipartIndexReaderSupplier(tableSpace, uuid, fileType, 1L);
+        } catch (DataStorageManagerException e) {
+            return false;
+        }
+        try (io.github.jbellis.jvector.disk.RandomAccessReader r = rs.get()) {
+            r.seek(0L);
+            r.readInt();
+            return true;
+            // The reader will throw IOException on missing block-0; for backends
+            // that surface S3 NoSuchKey as an unchecked exception (the issue #617
+            // failure mode), the broader RuntimeException catch below absorbs it.
+            // Both are treated as "file not present" — see the method contract.
+        } catch (IOException | RuntimeException e) {
+            // Broad RuntimeException catch is necessary because some object-
+            // storage backends (S3) wrap NoSuchKeyException in a SdkException
+            // subclass that is itself a RuntimeException, not an IOException.
+            // We intentionally treat any error during the probe as "missing",
+            // consistent with the best-effort contract documented above.
+            return false;
+        }
+    }
+
+    /**
      * Returns {@code true} when this storage manager supports bypassing the gRPC
      * file-server round-trips for bulk segment-file downloads during recovery.
      * When {@code true}, callers may use

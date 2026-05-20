@@ -179,6 +179,57 @@ public abstract class AbstractVectorStore implements AutoCloseable {
     }
 
     /**
+     * Result of a {@link #dropSegmentByStorageKey(String)} call.
+     *
+     * <p>Used by the operator-facing {@code DeleteSegment} RPC (issue #617)
+     * to report whether the segment was found and, when it was, the number
+     * of live vectors that were lost as part of the removal — both as a
+     * sanity check ("did I just delete a populated segment?") and as the
+     * value the IS surfaces back to the {@code indexing-admin delete-segment}
+     * CLI for the operator's audit log.
+     */
+    public static final class SegmentDropResult {
+        public final boolean removed;
+        public final long vectorsLost;
+
+        public SegmentDropResult(boolean removed, long vectorsLost) {
+            this.removed = removed;
+            this.vectorsLost = vectorsLost;
+        }
+
+        public static final SegmentDropResult NOT_FOUND = new SegmentDropResult(false, 0L);
+    }
+
+    /**
+     * Removes a segment from the active list by its <em>multipart storage key</em>
+     * — i.e. the value returned by {@code PersistentVectorStore.segmentStorageKey}
+     * (legacy {@code indexUUID + "_seg" + segmentId} or, for adopted segments,
+     * the explicit {@code externalStorageKey}). Used by the operator-facing
+     * {@code DeleteSegment} RPC (issue #617) to remove a corrupted segment
+     * whose Phase B upload failed mid-flight, leaving it registered in IS
+     * metadata without a fully-written graph file in remote storage.
+     *
+     * <p>Idempotent: returns {@link SegmentDropResult#NOT_FOUND} when no
+     * segment with the given storage key is currently loaded.
+     *
+     * <p>Does <em>not</em> delete the segment's multipart files from the
+     * underlying storage manager — that is the responsibility of the
+     * caller (the {@code DeleteSegment} RPC handler), which only purges
+     * remote files when explicitly requested via {@code purge_storage=true}.
+     *
+     * <p>The default implementation is a no-op.
+     * {@link herddb.indexing.vector.PersistentVectorStore} overrides this.
+     *
+     * @param storageKey the segment's multipart storage key to remove
+     * @return a {@link SegmentDropResult} describing whether the segment
+     *         was removed and how many live vectors were lost
+     */
+    public SegmentDropResult dropSegmentByStorageKey(String storageKey) {
+        // No-op for non-persistent stores.
+        return SegmentDropResult.NOT_FOUND;
+    }
+
+    /**
      * Reconciles adopted (externally-produced) segments against the ZK-reported
      * snapshot. Any segment with a non-null external storage key whose UUID is
      * absent from {@code knownUuids} is dropped via {@link #dropSegmentByUuid}.

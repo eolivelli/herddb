@@ -2261,6 +2261,178 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         }
     }
 
+    /**
+     * Outcome of {@link #deleteSegment(String, String, String, boolean, boolean)}.
+     * Mirrors the wire fields of {@code DeleteSegmentResponse} so the gRPC
+     * handler is a thin translation layer.
+     */
+    public static final class DeleteSegmentResult {
+        public final String segment;
+        public final boolean removed;
+        public final long vectorsLost;
+        public final boolean graphFilePresent;
+        public final boolean storagePurged;
+
+        public DeleteSegmentResult(String segment, boolean removed, long vectorsLost,
+                                   boolean graphFilePresent, boolean storagePurged) {
+            this.segment = segment;
+            this.removed = removed;
+            this.vectorsLost = vectorsLost;
+            this.graphFilePresent = graphFilePresent;
+            this.storagePurged = storagePurged;
+        }
+    }
+
+    /**
+     * Thrown by {@link #deleteSegment} when the request must be rejected
+     * without mutating state: the index or store is not loaded, the
+     * segment is not registered, or the segment's graph file is still
+     * present in remote storage and {@code force == false}.
+     */
+    public static final class DeleteSegmentException extends RuntimeException {
+        public DeleteSegmentException(String message) {
+            super(message);
+        }
+    }
+
+    /**
+     * Issue #617: operator remediation tool. Removes a single segment from
+     * a {@link PersistentVectorStore}'s in-memory metadata, with optional
+     * purging of the segment's multipart files in the underlying
+     * {@link DataStorageManager}.
+     *
+     * <p>Refuses the deletion when the segment's graph file IS reachable
+     * in remote storage and {@code force == false} — the most likely
+     * explanation for a reachable graph file is that the operator is
+     * targeting the wrong segment. The {@code --force} flag (and an
+     * extra confirmation in the CLI) lets the operator override.
+     *
+     * <p>On a successful in-memory removal, this method re-publishes the
+     * current {@link IndexingServiceCheckpointState} so shadow replicas
+     * observe the new (smaller) segment count on their next reload. The
+     * re-publish is best-effort — if it fails the next regular checkpoint
+     * will still carry the updated segment list, so shadows converge.
+     *
+     * @throws DeleteSegmentException when the request cannot be satisfied
+     *                                without mutating state
+     */
+    public DeleteSegmentResult deleteSegment(String table, String indexName, String segmentStorageKey,
+                                              boolean purgeStorage, boolean force) {
+        if (table == null || table.isEmpty()) {
+            throw new DeleteSegmentException("table is required");
+        }
+        if (indexName == null || indexName.isEmpty()) {
+            throw new DeleteSegmentException("index is required");
+        }
+        if (segmentStorageKey == null || segmentStorageKey.isEmpty()) {
+            throw new DeleteSegmentException("segment is required");
+        }
+        AbstractVectorStore store = vectorStores.get(storeKey(table, indexName));
+        if (store == null) {
+            throw new DeleteSegmentException("index " + table + "." + indexName + " is not loaded");
+        }
+        if (!(store instanceof PersistentVectorStore)) {
+            throw new DeleteSegmentException(
+                    "index " + table + "." + indexName + " is non-persistent ("
+                            + store.getClass().getSimpleName() + "); has no on-disk segments");
+        }
+        PersistentVectorStore pvs = (PersistentVectorStore) store;
+
+        // Presence check (informational + safety gate).
+        java.util.List<String> keys = pvs.getSegmentStorageKeysSnapshot();
+        if (!keys.contains(segmentStorageKey)) {
+            throw new DeleteSegmentException(
+                    "segment " + segmentStorageKey + " is not registered in index "
+                            + table + "." + indexName + "; currently loaded segments: " + keys);
+        }
+
+        // MinIO HEAD-equivalent — best effort. We deliberately read the
+        // tablespace UUID from the engine rather than from the request because
+        // the IS is single-tablespace per instance.
+        boolean graphPresent = false;
+        if (dataStorageManager != null) {
+            graphPresent = dataStorageManager.multipartIndexFileExists(
+                    tableSpaceUUID, segmentStorageKey, "graph");
+        }
+        if (graphPresent && !force) {
+            throw new DeleteSegmentException(
+                    "refusing to delete segment " + segmentStorageKey
+                            + ": graph file IS reachable in remote storage. "
+                            + "Re-run with force=true if you are sure this is the right segment "
+                            + "(see issue #617).");
+        }
+
+        // Audit-level log BEFORE the mutation so a crash mid-delete leaves a
+        // forensic trace in the IS log.
+        LOGGER.log(Level.SEVERE,
+                "deleteSegment: operator-initiated removal of segment {0} from {1}.{2}"
+                        + " (graph_file_present={3}, force={4}, purge_storage={5})"
+                        + " — issue #617",
+                new Object[]{segmentStorageKey, table, indexName,
+                    graphPresent, force, purgeStorage});
+
+        AbstractVectorStore.SegmentDropResult drop = pvs.dropSegmentByStorageKey(segmentStorageKey);
+        if (!drop.removed) {
+            // Race: a concurrent compaction swap removed the segment between
+            // our snapshot and the drop. Treat as a no-op success — the
+            // operator's intent (segment gone) has been satisfied.
+            LOGGER.log(Level.WARNING,
+                    "deleteSegment: segment {0} disappeared between snapshot and drop"
+                            + " (concurrent compaction swap?); reporting no-op",
+                    segmentStorageKey);
+            return new DeleteSegmentResult(segmentStorageKey, false, 0L, graphPresent, false);
+        }
+
+        boolean storagePurged = false;
+        if (purgeStorage && dataStorageManager != null) {
+            // Best-effort: failures are logged but do not undo the in-memory
+            // removal. The operator can re-run with purge_storage=true to
+            // retry the file deletion if needed (the underlying call is
+            // idempotent).
+            try {
+                dataStorageManager.deleteMultipartIndexFile(tableSpaceUUID, segmentStorageKey, "graph");
+                dataStorageManager.deleteMultipartIndexFile(tableSpaceUUID, segmentStorageKey, "map");
+                storagePurged = true;
+            } catch (herddb.storage.DataStorageManagerException e) {
+                LOGGER.log(Level.WARNING,
+                        "deleteSegment: in-memory removal of " + segmentStorageKey
+                                + " succeeded but multipart file purge failed; "
+                                + "operator may need to clean up storage manually",
+                        e);
+            }
+        }
+
+        // Trigger a checkpoint so the new (smaller) segment list is
+        // serialised to the on-disk IndexStatus AND the corresponding
+        // IndexingServiceCheckpointState is republished to ZK. Without
+        // the checkpoint a shadow reload would still see the deleted
+        // segment in the IndexStatus and fail with "multipart file not
+        // found" when it tries to mmap the purged map file. The
+        // dropSegmentByStorageKey path marks the store dirty so the
+        // checkpoint will actually serialise.
+        //
+        // forceCheckpointAndSaveWatermark also calls
+        // publishCheckpointStateBestEffort internally, so shadows are
+        // notified as part of the same write.
+        try {
+            forceCheckpointAndSaveWatermark();
+        } catch (RuntimeException e) {
+            // Checkpoint failure must not undo the in-memory removal —
+            // a subsequent regular checkpoint (or another delete-segment
+            // call) will eventually serialise the reduced segment list.
+            // Logged at WARNING so operators can correlate with the
+            // SEVERE audit line emitted above.
+            LOGGER.log(Level.WARNING,
+                    "deleteSegment: post-delete checkpoint failed; shadows may"
+                            + " not observe the new segment count until the"
+                            + " next regular checkpoint",
+                    e);
+        }
+
+        return new DeleteSegmentResult(
+                segmentStorageKey, true, drop.vectorsLost, graphPresent, storagePurged);
+    }
+
     private static boolean isDmlType(short type) {
         return type == LogEntryType.INSERT
                 || type == LogEntryType.UPDATE

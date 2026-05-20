@@ -20,6 +20,8 @@
 
 package herddb.indexing.admin;
 
+import herddb.indexing.proto.DeleteSegmentRequest;
+import herddb.indexing.proto.DeleteSegmentResponse;
 import herddb.indexing.proto.DescribeIndexRequest;
 import herddb.indexing.proto.DescribeIndexResponse;
 import herddb.indexing.proto.GetEngineStatsRequest;
@@ -113,6 +115,22 @@ public final class IndexingAdminClient implements Closeable {
 
     public GetShadowStatusResponse getShadowStatus() {
         return stub().getShadowStatus(GetShadowStatusRequest.newBuilder().build());
+    }
+
+    /**
+     * Issue #617: operator remediation tool. Removes a single segment from
+     * the IS in-memory metadata, optionally purging its multipart files.
+     */
+    public DeleteSegmentResponse deleteSegment(String tablespace, String table, String index,
+                                                String segment, boolean purgeStorage, boolean force) {
+        return stub().deleteSegment(DeleteSegmentRequest.newBuilder()
+                .setTablespace(tablespace == null ? "" : tablespace)
+                .setTable(table == null ? "" : table)
+                .setIndex(index == null ? "" : index)
+                .setSegment(segment == null ? "" : segment)
+                .setPurgeStorage(purgeStorage)
+                .setForce(force)
+                .build());
     }
 
     public WaitForCheckpointResponse waitForCheckpoint(String tablespace, String table, String index,

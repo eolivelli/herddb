@@ -51,6 +51,20 @@ service IndexingService {
     // The commit-log tailer path remains the authoritative cleanup fallback.
     rpc DropIndex (DropIndexRequest) returns (DropIndexResponse);
 
+    // Issue #617: operator remediation tool. Removes a single corrupted /
+    // partially-written segment from the IS in-memory metadata so the
+    // compaction loop stops re-selecting it after a Phase B upload failure
+    // left the segment registered without a fully-written graph file.
+    //
+    // SAFETY: by default the IS refuses to delete a segment whose graph file
+    // IS reachable in remote storage (operator may be targeting the wrong
+    // segment). Set force=true to override. When purge_storage=true the IS
+    // also deletes the segment's multipart graph + map files from the
+    // underlying DataStorageManager. After a successful deletion the IS
+    // re-publishes its IndexingServiceCheckpointState so shadow replicas
+    // observe the new (smaller) segment set on their next reload.
+    rpc DeleteSegment (DeleteSegmentRequest) returns (DeleteSegmentResponse);
+
     // Push-based indexing (TESTING ONLY). When the indexing service runs with
     // indexing.log.type=push it does NOT tail a file/BookKeeper commit log;
     // instead a client serializes herddb.log.LogEntry objects and pushes them
@@ -361,6 +375,52 @@ message DropIndexRequest {
 // Intentionally empty: the IS begins cleanup asynchronously and returns as
 // soon as the in-memory store has been removed from its tracking map.
 message DropIndexResponse {
+}
+
+// Issue #617: operator remediation tool — see rpc DeleteSegment above.
+message DeleteSegmentRequest {
+    // Tablespace name. Currently informational only (the IS resolves the
+    // store by (table, index)); kept for symmetry with the other admin RPCs
+    // and so future multi-tablespace IS instances do not need a proto bump.
+    string tablespace = 1;
+    string table = 2;
+    string index = 3;
+    // The segment's multipart storage key (e.g. "vidx_<indexUUID>_seg627").
+    // This is the value reported by describe-index in the
+    // corrupted_segments list (issue #616) and the value the IS uses to
+    // address segment files in remote storage.
+    string segment = 4;
+    // Whether to delete the segment's multipart graph + map files from the
+    // underlying DataStorageManager after removing it from in-memory state.
+    // When false, the segment is unlinked from the IS but its files remain
+    // (useful when an operator wants to preserve evidence of corruption for
+    // post-mortem analysis).
+    bool purge_storage = 5;
+    // Whether to delete the segment even when its graph file IS reachable
+    // in remote storage. Set to true only after careful verification — a
+    // reachable graph file usually means the operator is targeting the
+    // wrong segment.
+    bool force = 6;
+}
+
+message DeleteSegmentResponse {
+    // The storage key of the segment that was removed (echoes
+    // DeleteSegmentRequest.segment).
+    string segment = 1;
+    // Whether the segment was found in the IS metadata and removed.
+    bool removed = 2;
+    // Number of live vectors lost as a result of the removal. -1 when
+    // the IS could not compute the number (e.g. the segment was not loaded).
+    int64 vectors_lost = 3;
+    // Whether the segment's graph file was reachable in remote storage at
+    // the moment the IS checked. Informational — operators use this to
+    // decide whether to retry with --force or whether they were targeting
+    // the wrong segment.
+    bool graph_file_present = 4;
+    // Whether the IS attempted to delete the segment's multipart files from
+    // remote storage (only true when the request set purge_storage=true and
+    // the in-memory removal succeeded).
+    bool storage_purged = 5;
 }
 
 // ---- Push-based indexing RPC (testing only — see rpc PushEntries) ----
