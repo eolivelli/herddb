@@ -24,6 +24,9 @@ import herddb.indexing.segment.SegmentRegistryClient;
 import herddb.metadata.MetadataStorageManagerException;
 import herddb.metadata.ServiceDiscoveryListener;
 import herddb.model.TableSpace;
+import herddb.remote.RemoteFileDataStorageManager;
+import herddb.remote.storage.ObjectStorage;
+import herddb.remote.storage.S3ObjectStorage;
 import herddb.server.RemoteFileClient;
 import herddb.server.RemoteFileServiceFactory;
 import herddb.server.ServerConfiguration;
@@ -31,6 +34,7 @@ import herddb.storage.DataStorageManager;
 import io.netty.util.concurrent.FastThreadLocalThread;
 import java.io.FileInputStream;
 import java.io.IOException;
+import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -55,6 +59,15 @@ import org.apache.zookeeper.KeeperException;
 import org.apache.zookeeper.WatchedEvent;
 import org.apache.zookeeper.Watcher;
 import org.apache.zookeeper.ZooKeeper;
+import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
+import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+import software.amazon.awssdk.core.checksums.RequestChecksumCalculation;
+import software.amazon.awssdk.core.checksums.ResponseChecksumValidation;
+import software.amazon.awssdk.http.crt.AwsCrtAsyncHttpClient;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.s3.S3AsyncClient;
+import software.amazon.awssdk.services.s3.S3AsyncClientBuilder;
+import software.amazon.awssdk.services.s3.S3Configuration;
 
 /**
  * Bootstrap entry point for the index-optimizer service. Loaded by the
@@ -1231,6 +1244,15 @@ public final class IndexOptimizerMain {
         this.mergerDataStorageManager = factory.createDataStorageManager(
                 metaDir, remoteTmp, Integer.MAX_VALUE, mergerFileClient);
 
+        // Issue #609: when indexoptimizer.s3.direct.enabled=true, attach a direct
+        // ObjectStorage client so RemoteSegmentGraphMerger's downloadGraphFile/
+        // downloadMapFile fast path runs against the object store rather than
+        // routing every block through the gRPC file-server. Mirrors the IS-side
+        // wiring in IndexingServer.buildDataStorageManager. Pulled into a helper
+        // so the env-var-validation + S3 client construction can be unit-tested
+        // in isolation.
+        maybeEnableDirectS3(this.mergerDataStorageManager, configuration);
+
         // Build the config provider that reads per-index jvector build parameters
         // directly from the checkpoint metadata on the remote file server (issue #516).
         // This avoids any dependency on IS liveness — the remote file server is
@@ -1242,6 +1264,134 @@ public final class IndexOptimizerMain {
                 "index merge config provider: RemoteMetadataIndexMergeConfigProvider"
                 + " (tablespaceUuid={0})", tablespaceUuid);
         return new RemoteSegmentMerger(mergerDataStorageManager, tmpDir, configProvider);
+    }
+
+    /**
+     * Issue #609: optionally wire a direct {@link ObjectStorage} client onto
+     * the optimizer's {@link RemoteFileDataStorageManager} so streaming
+     * compaction reads input segments directly from S3/GCS instead of routing
+     * every block through the gRPC file-server. Mirrors
+     * {@code IndexingServer.buildDataStorageManager}'s wiring for the IS pod.
+     *
+     * <p>Behaviour:
+     * <ul>
+     *   <li>When {@code indexoptimizer.s3.direct.enabled=false} (the default),
+     *       this is a strict no-op — no env-var lookup happens.</li>
+     *   <li>When the flag is {@code true} but the DSM is not a
+     *       {@link RemoteFileDataStorageManager} (e.g. unit-test fallbacks),
+     *       a {@link Level#WARNING} is logged and the optimizer continues
+     *       without direct S3. This matches the IS-side behaviour and keeps
+     *       the pod startable in degraded environments.</li>
+     *   <li>When the flag is {@code true} and the DSM is correct, the
+     *       {@code S3_ACCESS_KEY} and {@code S3_SECRET_KEY} environment
+     *       variables MUST be set; a missing or empty value surfaces as an
+     *       {@link IOException} (fast-fail).</li>
+     * </ul>
+     *
+     * <p>Package-private for unit-test access.
+     */
+    static void maybeEnableDirectS3(DataStorageManager dsm,
+            OptimizerConfiguration configuration) throws IOException {
+        boolean enabled = configuration.getBoolean(
+                OptimizerConfiguration.PROPERTY_S3_DIRECT_ENABLED,
+                OptimizerConfiguration.PROPERTY_S3_DIRECT_ENABLED_DEFAULT);
+        if (!enabled) {
+            return;
+        }
+        if (!(dsm instanceof RemoteFileDataStorageManager)) {
+            LOGGER.log(Level.WARNING,
+                    "indexoptimizer.s3.direct.enabled=true but the data storage manager"
+                            + " ({0}) is not a RemoteFileDataStorageManager — direct S3"
+                            + " download will NOT be active",
+                    dsm.getClass().getSimpleName());
+            return;
+        }
+        // Keys are injected exclusively via environment variables so they
+        // never appear in ConfigMaps, properties files, or log output.
+        String accessKey = System.getenv("S3_ACCESS_KEY");
+        String secretKey = System.getenv("S3_SECRET_KEY");
+        ObjectStorage directStorage = buildDirectS3ObjectStorage(
+                configuration, accessKey, secretKey);
+        ((RemoteFileDataStorageManager) dsm).setDirectObjectStorage(directStorage);
+        LOGGER.log(Level.INFO,
+                "Direct S3 download enabled for streaming compaction input segments"
+                        + " (issue #609)");
+    }
+
+    /**
+     * Builds an {@link ObjectStorage} that connects directly to S3/GCS for
+     * streaming-compaction segment downloads (issue #609). Pure function: takes
+     * credentials as parameters so the env-var-validation half of the public
+     * surface can be unit-tested independently of S3 client construction.
+     *
+     * <p>Throws {@link IOException} when either credential is {@code null} or
+     * empty so the optimizer fails fast at startup with a clear message instead
+     * of surfacing the misconfiguration as a cryptic AWS SDK error on the first
+     * merge.
+     *
+     * <p>Package-private for unit-test access.
+     */
+    static ObjectStorage buildDirectS3ObjectStorage(OptimizerConfiguration configuration,
+            String accessKey, String secretKey) throws IOException {
+        if (accessKey == null || accessKey.isEmpty()) {
+            throw new IOException(
+                    "S3_ACCESS_KEY environment variable must be set when "
+                            + OptimizerConfiguration.PROPERTY_S3_DIRECT_ENABLED + "=true");
+        }
+        if (secretKey == null || secretKey.isEmpty()) {
+            throw new IOException(
+                    "S3_SECRET_KEY environment variable must be set when "
+                            + OptimizerConfiguration.PROPERTY_S3_DIRECT_ENABLED + "=true");
+        }
+        String bucket = configuration.getString(
+                OptimizerConfiguration.PROPERTY_S3_BUCKET,
+                OptimizerConfiguration.PROPERTY_S3_BUCKET_DEFAULT);
+        String region = configuration.getString(
+                OptimizerConfiguration.PROPERTY_S3_REGION,
+                OptimizerConfiguration.PROPERTY_S3_REGION_DEFAULT);
+        String endpoint = configuration.getString(
+                OptimizerConfiguration.PROPERTY_S3_ENDPOINT,
+                OptimizerConfiguration.PROPERTY_S3_ENDPOINT_DEFAULT);
+        String s3Prefix = configuration.getString(
+                OptimizerConfiguration.PROPERTY_S3_PREFIX,
+                OptimizerConfiguration.PROPERTY_S3_PREFIX_DEFAULT);
+        boolean gcsCompatibility = configuration.getBoolean(
+                OptimizerConfiguration.PROPERTY_S3_GCS_COMPATIBILITY,
+                OptimizerConfiguration.PROPERTY_S3_GCS_COMPATIBILITY_DEFAULT);
+
+        S3AsyncClientBuilder clientBuilder = S3AsyncClient.builder()
+                .region(Region.of(region))
+                .credentialsProvider(StaticCredentialsProvider.create(
+                        AwsBasicCredentials.create(accessKey, secretKey)))
+                .httpClientBuilder(AwsCrtAsyncHttpClient.builder());
+
+        if (gcsCompatibility) {
+            LOGGER.log(Level.INFO,
+                    "Direct S3 client (GCS compatibility): path-style addressing, "
+                            + "SDK checksums WHEN_REQUIRED");
+            clientBuilder
+                    .serviceConfiguration(S3Configuration.builder()
+                            .pathStyleAccessEnabled(true)
+                            .build())
+                    .requestChecksumCalculation(RequestChecksumCalculation.WHEN_REQUIRED)
+                    .responseChecksumValidation(ResponseChecksumValidation.WHEN_REQUIRED);
+        } else {
+            LOGGER.log(Level.INFO,
+                    "Direct S3 client (AWS mode): virtual-hosted-style, "
+                            + "SDK default checksums");
+        }
+        if (!endpoint.isEmpty()) {
+            clientBuilder.endpointOverride(URI.create(endpoint));
+        }
+
+        S3AsyncClient s3Client = clientBuilder.build();
+        LOGGER.log(Level.INFO,
+                "Direct S3 client built for streaming compaction segment downloads:"
+                        + " bucket={0}, region={1}, prefix={2}",
+                new Object[]{bucket, region, s3Prefix});
+        // No StatsLogger here: the optimizer's stats provider may not be ready
+        // when this is invoked during startup.
+        return new S3ObjectStorage(s3Client, bucket, s3Prefix);
     }
 
     private Path resolveTmpDirectory() throws IOException {

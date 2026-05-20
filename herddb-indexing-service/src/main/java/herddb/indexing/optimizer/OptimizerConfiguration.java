@@ -202,6 +202,67 @@ public final class OptimizerConfiguration {
     public static final long PROPERTY_REMOTE_FILE_MAX_INFLIGHT_WRITE_BYTES_DEFAULT = 256L * 1024L * 1024L;
 
     // -------------------------------------------------------------------------
+    // Direct S3 access for streaming compaction (issue #609)
+    //
+    // Mirrors the IndexingServerConfiguration S3 block (issue #381). When
+    // {@code indexoptimizer.s3.direct.enabled=true} the optimizer pod attaches
+    // an {@link herddb.remote.storage.ObjectStorage} client to its
+    // {@link herddb.remote.RemoteFileDataStorageManager} so the
+    // {@code RemoteSegmentGraphMerger} downloads input segment graph/map
+    // files directly from object storage instead of routing them through the
+    // gRPC file-server. This is the optimizer-side counterpart of the
+    // streaming-compaction eager-download fast path: it eliminates wire-level
+    // contention against the file-server's bounded {@code max.inflight.read.bytes}
+    // semaphore and lifts merge throughput on large segments.
+    //
+    // Access/secret keys are read at runtime from the {@code S3_ACCESS_KEY} and
+    // {@code S3_SECRET_KEY} environment variables (never from the properties
+    // file) so they are not visible in ConfigMaps or log output.
+    // -------------------------------------------------------------------------
+
+    /**
+     * Enable direct object-storage download for streaming compaction input
+     * segments. Default {@code false}.
+     *
+     * <p>When {@code true}, the optimizer opens an S3/GCS client and downloads
+     * input segment graph/map files for streaming compaction directly from
+     * the bucket, bypassing the gRPC file-server. Requires the optimizer to
+     * be wired against a {@link herddb.remote.RemoteFileDataStorageManager}
+     * — when the DSM is anything else (e.g. test fallbacks) a WARNING is
+     * logged and the flag is silently ignored.
+     *
+     * <p><strong>Note:</strong> the configured bucket ({@link #PROPERTY_S3_BUCKET})
+     * is assumed to be pre-provisioned and accessible at startup. A missing
+     * bucket surfaces as a storage error on the first merge attempt.
+     */
+    public static final String PROPERTY_S3_DIRECT_ENABLED = "indexoptimizer.s3.direct.enabled";
+    public static final boolean PROPERTY_S3_DIRECT_ENABLED_DEFAULT = false;
+
+    /** S3 endpoint URL override. Leave empty for native AWS S3; set for GCS or MinIO. */
+    public static final String PROPERTY_S3_ENDPOINT = "indexoptimizer.s3.endpoint";
+    public static final String PROPERTY_S3_ENDPOINT_DEFAULT = "";
+
+    /** S3 bucket name containing the segment data. */
+    public static final String PROPERTY_S3_BUCKET = "indexoptimizer.s3.bucket";
+    public static final String PROPERTY_S3_BUCKET_DEFAULT = "";
+
+    /** AWS region. Used for native AWS S3; typically {@code "auto"} for GCS. */
+    public static final String PROPERTY_S3_REGION = "indexoptimizer.s3.region";
+    public static final String PROPERTY_S3_REGION_DEFAULT = "us-east-1";
+
+    /** Optional key prefix within the bucket (e.g. {@code "herddb/"}). */
+    public static final String PROPERTY_S3_PREFIX = "indexoptimizer.s3.prefix";
+    public static final String PROPERTY_S3_PREFIX_DEFAULT = "";
+
+    /**
+     * Enable GCS-compatibility mode on the S3 client:
+     * path-style addressing + SDK checksums WHEN_REQUIRED.
+     * Required for GCS and MinIO. Default {@code false}.
+     */
+    public static final String PROPERTY_S3_GCS_COMPATIBILITY = "indexoptimizer.s3.gcs.compatibility";
+    public static final boolean PROPERTY_S3_GCS_COMPATIBILITY_DEFAULT = false;
+
+    // -------------------------------------------------------------------------
     // K-way single-pass merge (issue #524)
     // -------------------------------------------------------------------------
 
