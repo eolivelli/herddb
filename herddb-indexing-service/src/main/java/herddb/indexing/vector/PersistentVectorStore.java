@@ -2729,6 +2729,48 @@ public class PersistentVectorStore extends AbstractVectorStore {
                     LOGGER.log(Level.WARNING,
                             "vector store " + indexName + ": compaction metadata failure", e);
                     notifySegmentCountMonitor(); // immediate wakeup (issue #370)
+                } catch (Error e) {
+                    // Issue #621: an Error (e.g. Netty OutOfDirectMemoryError)
+                    // thrown by the post-rebuild section above —
+                    // lateDeletes.forEach(merged::deletePk),
+                    // warmUpNewSegmentsBeforePublish(...), or
+                    // atomicSwapCompactionResult(...) — would otherwise bypass the
+                    // CompactionException arm and leak the rebuild's
+                    // already-uploaded merged-output multipart blocks in remote
+                    // storage. The per-step Error catches in
+                    // VectorIndexCompactor.rebuildSegmentStreaming /
+                    // rebuildSegmentLegacy close the same gap one frame deeper;
+                    // this arm closes the symmetric gap when the failure surfaces
+                    // AFTER a successful rebuild but BEFORE
+                    // atomicSwapCompactionResult publishes the merged segment.
+                    //
+                    // Drain rebuild.orphanPaths into pendingDeletes (mirrors the
+                    // CompactionException arm above), bump the per-reason failure
+                    // counter as WRITE_IO (the merged-output write succeeded but
+                    // failed to publish — closest existing bucket), then rethrow
+                    // so the daemon safety net at vectorIndexCompactionLoop:2416
+                    // — which is itself Error-aware (issue #621) — logs SEVERE
+                    // and bumps compactionConsecutiveFailures uniformly with any
+                    // other Error escape. We rethrow rather than swallow because
+                    // an Error caught here may still leave the JVM in a degraded
+                    // state where the next cycle is not safe to start without
+                    // the loop's back-off pause.
+                    recordCompactionFailure(VectorIndexCompactor.FailureReason.WRITE_IO);
+                    LOGGER.log(Level.SEVERE,
+                            "vector store " + indexName + ": compaction post-rebuild"
+                                    + " Error — draining orphan list for retention-aware"
+                                    + " cleanup before rethrowing", e);
+                    long now = System.currentTimeMillis();
+                    long sinceGen = currentIndexStatusGeneration.get();
+                    if (rebuild != null && rebuild.orphanPaths != null) {
+                        for (String[] orphan : rebuild.orphanPaths) {
+                            this.pendingDeletes.add(new PendingDelete(
+                                    encodeMultipartPath(orphan[0], orphan[1]),
+                                    now, sinceGen));
+                        }
+                    }
+                    notifySegmentCountMonitor();
+                    throw e;
                 }
             } finally {
                 // Drop the temporary BLink storages regardless of outcome so
@@ -2976,12 +3018,25 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
             try {
                 publisherSnapshot.stageNewSegments(stagedInfo);
-            } catch (RuntimeException stageFailed) {
+            } catch (RuntimeException | Error stageFailed) {
                 // Stage failed (e.g. ZK unreachable). Abort the local merge.
                 // Stage failure means no PROVISIONAL znode was created (or
                 // creation was interrupted), so unstage is a no-op; we MUST
                 // still queue the rebuild's already-uploaded multipart files
                 // for cleanup, otherwise they leak indefinitely.
+                //
+                // Issue #621: include Error in the catch list so a Netty
+                // OutOfDirectMemoryError (or any other Error sub-class) from
+                // the publisher boundary still drives queueMergedOutputForDeletion
+                // — without this, an Error would bypass the queue and the
+                // already-uploaded merged-output multipart blocks would leak
+                // (same data-loss shape as the streaming-rebuild Error gap
+                // closed by the per-step catches in
+                // VectorIndexCompactor.rebuildSegmentStreaming /
+                // rebuildSegmentLegacy). We rewrap as CompactionException so the
+                // outer runCompactionCycle catch arm records a clean
+                // METADATA_IO failure reason rather than letting the Error
+                // escape to the daemon safety net unattributed.
                 LOGGER.log(Level.WARNING,
                         "vector store {0}: stage of merged segment failed; aborting"
                                 + " local compaction merge",
@@ -2989,7 +3044,8 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 queueMergedOutputForDeletion(mergedOutput);
                 throw new VectorIndexCompactor.CompactionException(
                         VectorIndexCompactor.FailureReason.METADATA_IO,
-                        "stage of merged segment failed: " + stageFailed.getMessage());
+                        "stage of merged segment failed: " + stageFailed.getMessage(),
+                        stageFailed);
             }
 
             // Revalidate inputs are still ACTIVE in the registry. If a

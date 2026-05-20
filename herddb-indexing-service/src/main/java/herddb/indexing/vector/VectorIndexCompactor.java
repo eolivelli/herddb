@@ -926,7 +926,10 @@ final class VectorIndexCompactor {
             OnDiskGraphIndex.View view;
             try {
                 view = (OnDiskGraphIndex.View) odg.getView();
-            } catch (RuntimeException e) {
+            } catch (RuntimeException | Error e) {
+                // Issue #621: include Error for the metrics-bucketing reason
+                // documented at the download-stage catch in
+                // rebuildSegmentStreaming. No orphans yet (pre-upload).
                 throw new CompactionException(FailureReason.READ_IO,
                         "failed to open view on segment " + seg.segmentId, e);
             }
@@ -944,7 +947,8 @@ final class VectorIndexCompactor {
                     VectorFloat<?> vec;
                     try {
                         vec = view.getVector(ord);
-                    } catch (RuntimeException e) {
+                    } catch (RuntimeException | Error e) {
+                        // Issue #621: see the matching arm at view = ... above.
                         throw new CompactionException(FailureReason.CORRUPTION,
                                 "failed to read vector at ord " + ord + " of segment "
                                         + seg.segmentId, e);
@@ -962,7 +966,8 @@ final class VectorIndexCompactor {
                     syntheticShard.vectorCount.incrementAndGet();
                     try {
                         syntheticShard.builder.addGraphNode(localOrd, vec);
-                    } catch (RuntimeException e) {
+                    } catch (RuntimeException | Error e) {
+                        // Issue #621: see the matching arm at view = ... above.
                         throw new CompactionException(FailureReason.WRITE_IO,
                                 "addGraphNode failed at localOrd " + localOrd, e);
                     }
@@ -970,7 +975,11 @@ final class VectorIndexCompactor {
             } finally {
                 try {
                     view.close();
-                } catch (IOException e) {
+                } catch (IOException | Error e) {
+                    // Issue #621: include Error to match the close()-failure
+                    // catches in rebuildSegmentStreaming / rebuildSegmentLegacy
+                    // — must not let a close-time Error suppress an in-flight
+                    // CompactionException carrying an orphan list.
                     LOGGER.log(Level.FINE, "ignoring view close in compaction", e);
                 }
             }
@@ -1172,12 +1181,21 @@ final class VectorIndexCompactor {
                     throw new CompactionException(FailureReason.READ_IO,
                             "streaming compaction: failed to prepare source segment graph for "
                                     + segUuid, e);
-                } catch (RuntimeException e) {
+                } catch (RuntimeException | Error e) {
                     // jvector boundary: OnDiskGraphIndex.load() can throw unchecked exceptions
                     // (e.g. IllegalArgumentException on bad magic bytes, BufferUnderflowException on
                     // truncated data) when the downloaded graph file is corrupt. Wrap so the outer
                     // cycle's catch (CompactionException) arm records the failure cleanly.
                     // Mirrors RemoteSegmentGraphMerger's handling of the same jvector contract.
+                    //
+                    // Issue #621: include Error so a Netty OutOfDirectMemoryError
+                    // from the download path (or any other Error from the jvector
+                    // loader) is bucketed as CORRUPTION instead of escaping
+                    // uncaught and being attributed by the daemon safety net to
+                    // "unexpected compaction failure" with no per-reason metric.
+                    // No orphans yet (pre-upload), so this is metrics-bucketing
+                    // only — but the bucketing matters for operators triaging
+                    // failure patterns from the IS logs.
                     throw new CompactionException(FailureReason.CORRUPTION,
                             "streaming compaction: corrupt or truncated source graph for "
                                     + segUuid, e);
@@ -1376,6 +1394,15 @@ final class VectorIndexCompactor {
             // Upload succeeded — both files exist remotely. Pre-populate orphans
             // so any subsequent failure (preloadCompactedSegment, etc.) routes
             // them through pendingDeletes for retention-aware cleanup.
+            //
+            // Issue #621 review item: the orphan-routing guarantee is conditional
+            // on the failure reaching runCompactionCycle as a CompactionException.
+            // Every per-step catch in this method wraps Error → CompactionException
+            // (see the issue #621 broadening above), and the analogous
+            // post-rebuild path in PersistentVectorStore.runCompactionCycle has its
+            // own catch (Error) arm that drains rebuild.orphanPaths into
+            // pendingDeletes before rethrowing — both must stay Error-aware for
+            // the orphan-routing contract to hold.
             orphans.add(new String[]{
                     store.indexUUID() + "_seg" + segmentId, "graph"});
             orphans.add(new String[]{
@@ -1427,7 +1454,14 @@ final class VectorIndexCompactor {
             if (!success && mergedSegment != null) {
                 try {
                     mergedSegment.close();
-                } catch (RuntimeException e) {
+                } catch (RuntimeException | Error e) {
+                    // Issue #621: include Error so an Error from close()
+                    // (e.g. OOM on a close-time buffer flush) cannot
+                    // suppress an in-flight CompactionException carrying
+                    // the orphan list. If close() throws and the in-flight
+                    // exception is suppressed, runCompactionCycle's
+                    // catch (CompactionException) arm never sees the orphan
+                    // list and partial multipart files leak.
                     LOGGER.log(Level.FINE,
                             "ignoring merged-segment close failure (streaming)", e);
                 }
@@ -1787,13 +1821,20 @@ final class VectorIndexCompactor {
         } finally {
             try {
                 builder.close();
-            } catch (IOException e) {
+            } catch (IOException | Error e) {
+                // Issue #621: include Error for the same reason as the
+                // matching close() catches in rebuildSegmentStreaming —
+                // an Error from close() must not suppress an in-flight
+                // CompactionException carrying the orphan list, otherwise
+                // runCompactionCycle never sees the orphans and partial
+                // multipart files leak.
                 LOGGER.log(Level.FINE, "ignoring builder close failure in compaction", e);
             }
             if (!success && mergedSegment != null) {
                 try {
                     mergedSegment.close();
-                } catch (RuntimeException e) {
+                } catch (RuntimeException | Error e) {
+                    // Issue #621: see the matching close() catch above.
                     LOGGER.log(Level.FINE, "ignoring merged-segment close failure", e);
                 }
             }
