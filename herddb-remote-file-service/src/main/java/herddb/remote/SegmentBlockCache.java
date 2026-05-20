@@ -462,6 +462,22 @@ public final class SegmentBlockCache {
                     existing.retain();
                     return existing;
                 }
+                // Issue #619 review fix: before going to the wire, check if the
+                // block is already resident in the MAIN cache (typically because
+                // a recent warmup bulk-prefetch loaded it). If so, copy its bytes
+                // into a fresh frontier-region entry — that avoids one wire read
+                // per pinned block in the warmup-followed-by-pin-BFS flow. The
+                // main and frontier ConcurrentHashMaps use independent per-key
+                // locks so this nested compute() cannot deadlock with itself.
+                ByteBuf promoted = tryPromoteFromMainCache(key, length);
+                if (promoted != null) {
+                    frontierLoadSuccess.incrementAndGet();
+                    // promoted.refCnt() == 1 (just allocated). Bump to 2: one
+                    // for the cache entry, one for the caller's distribution
+                    // ref. Mirrors the loader branch.
+                    promoted.retain();
+                    return promoted;
+                }
                 long startNanos = System.nanoTime();
                 ByteBuf loaded;
                 try {
@@ -507,18 +523,31 @@ public final class SegmentBlockCache {
      *
      * <p>The input {@code data} buffer must contain exactly the bytes located
      * at file offsets {@code [baseOffset, baseOffset + data.readableBytes())}.
-     * The method splices {@code data} into {@code blockSize}-sized retained
-     * slices (the last slice may be shorter, mirroring end-of-file blocks) and
-     * inserts each slice as a fresh cache entry keyed by
+     * The method splits {@code data} into {@code blockSize}-sized chunks (the
+     * last chunk may be shorter, mirroring end-of-file blocks) and inserts
+     * each chunk as a fresh cache entry keyed by
      * {@code (path, (baseOffset + i * blockSize) / blockSize)} — exactly the
      * key shape used by {@link #getBlock}, so subsequent reads issued by
      * {@code RemoteRandomAccessReader} on the same {@code (path, blockSize)}
      * hit the freshly-loaded blocks.
      *
+     * <p><b>Memory discipline (issue #619 review fix).</b> Each cached entry
+     * is a freshly-allocated pooled direct {@link ByteBuf} of exactly
+     * {@code blockSize} bytes — the bytes are <em>copied</em> from {@code data}
+     * into the new buffer, and {@code data} is released before the method
+     * returns. This is critical: had we stored {@code data.retainedSlice(...)},
+     * each slice would have pinned the entire parent buffer (typically a 4 MiB
+     * multipart-chunk-sized pooled allocation), so a single hot 16 KiB block
+     * surviving LRU eviction would keep the 4 MiB parent alive — making the
+     * Caffeine byte budget under-account the real off-heap footprint by up to
+     * 256×. Per-block copies eliminate that amplification at the cost of one
+     * memcpy per block, which is negligible compared to the network read that
+     * produced {@code data}.
+     *
      * <p>Insertion is non-destructive: when a cache entry already exists for a
-     * given key the existing entry is preserved and our prepared slice is
-     * released — the call never evicts an entry that another reader has just
-     * single-flighted.
+     * given key the existing entry is preserved and the per-block copy is not
+     * even attempted — the call never evicts an entry that another reader has
+     * just single-flighted.
      *
      * <p><b>Ownership</b>: this method takes ownership of {@code data}. It is
      * released exactly once before the method returns, regardless of which
@@ -583,27 +612,38 @@ public final class SegmentBlockCache {
                 BlockKey key = new BlockKey(path, blockIndex);
                 int sliceStart = dataOff;
                 int finalSliceLen = sliceLen;
-                // outcome[0] == true when we are the inserter, false when an entry
-                // already existed and we left it untouched.
-                boolean[] inserted = {false};
+                // didInsert[0] == true when we are the inserter, false when an
+                // entry already existed and we left it untouched.
+                boolean[] didInsert = {false};
                 cache.asMap().compute(key, (k, existing) -> {
                     if (existing != null) {
                         // Concurrent reader already loaded this block — keep its
                         // copy (it is fresher with respect to the LRU pass) and
-                        // skip ours. The retainedSlice we did NOT create is just
-                        // not allocated; no buffer leak.
+                        // skip ours. Because we have not allocated any per-block
+                        // buffer yet there is nothing to leak.
                         return existing;
                     }
-                    // Prepare a fresh entry: retainedSlice() returns a slice whose
-                    // own refCnt starts at 1 and which holds an additional reference
-                    // on the parent. The cache takes ownership of that single slice
-                    // reference; the slice is released by the removal listener on
-                    // eviction (parent's ref drops accordingly).
-                    ByteBuf slice = data.retainedSlice(sliceStart, finalSliceLen);
-                    inserted[0] = true;
-                    return slice;
+                    // Allocate a fresh per-block pooled direct buffer and copy
+                    // the chunk's bytes into it. Each cached entry now carries
+                    // its OWN pooled allocation matching the cache's weigher
+                    // exactly — see the javadoc memory-discipline note.
+                    // writeBytes(src, srcIndex, length) does not advance the
+                    // source buffer's reader index (absolute form).
+                    ByteBuf block = PooledByteBufAllocator.DEFAULT.directBuffer(finalSliceLen);
+                    try {
+                        block.writeBytes(data, sliceStart, finalSliceLen);
+                    } catch (RuntimeException e) {
+                        // Out-of-memory / pool exhaustion: release the allocation
+                        // and re-throw so the bulk-insert finally-block can also
+                        // release `data`. The compute() lambda must NOT return
+                        // a half-initialised buffer.
+                        block.release();
+                        throw e;
+                    }
+                    didInsert[0] = true;
+                    return block;
                 });
-                if (inserted[0]) {
+                if (didInsert[0]) {
                     bulkInsertedBlocks.incrementAndGet();
                     bulkInsertedBytes.addAndGet(sliceLen);
                     insertedBytes += sliceLen;
@@ -614,14 +654,59 @@ public final class SegmentBlockCache {
                 fileOff += sliceLen;
             }
         } finally {
-            // Release the caller-owned parent buffer. Every retained slice we
-            // handed to the cache holds its own independent reference on the
-            // underlying memory, so releasing the parent here does NOT free the
-            // bytes used by the cached entries — those are kept alive until the
-            // cache evicts them (or invalidate*/clear is called).
+            // Release the caller-owned source buffer. With per-block copy
+            // (issue #619 review fix) the cached entries hold no reference to
+            // the parent, so this release frees the multipart-chunk pooled
+            // allocation back to Netty's allocator immediately — the cache's
+            // byte budget then bounds the off-heap footprint exactly.
             ReferenceCountUtil.safeRelease(data);
         }
         return insertedBytes;
+    }
+
+    /**
+     * If the main eviction cache already holds the block at {@code key} (e.g.
+     * because the warmup bulk-prefetch loaded it), allocate a fresh pooled
+     * direct buffer for the frontier region and copy the bytes across. Returns
+     * the fresh buffer (caller-owned, {@code refCnt == 1}) or {@code null} when
+     * the main cache misses.
+     *
+     * <p>Used by {@link #pinBlock} to short-circuit a wire read in the
+     * pin-warmup BFS pass when the bulk-prefetch has already populated the
+     * main cache (issue #619 review fix). The frontier region keeps an
+     * independent copy — eviction in the much larger main cache cannot
+     * displace it.
+     *
+     * <p>Both maps' {@code asMap().compute*()} take an independent per-key
+     * lock, so this method's {@code computeIfPresent} on the main cache is
+     * safe to call from inside the frontier cache's {@code compute()} lambda
+     * (called by {@link #pinBlock}). The two locks are taken in a consistent
+     * order (frontier → main) and nothing ever inverts it, so no deadlock.
+     */
+    private ByteBuf tryPromoteFromMainCache(BlockKey key, int length) {
+        if (cache == null) {
+            return null;
+        }
+        ByteBuf[] holder = new ByteBuf[1];
+        cache.asMap().computeIfPresent(key, (k, existing) -> {
+            int readable = existing.readableBytes();
+            if (readable <= 0) {
+                // Defensive: an entry with no readable bytes is degenerate. Leave
+                // it alone and report a frontier miss so the caller goes to the
+                // loader.
+                return existing;
+            }
+            ByteBuf copy = PooledByteBufAllocator.DEFAULT.directBuffer(readable);
+            try {
+                copy.writeBytes(existing, existing.readerIndex(), readable);
+            } catch (RuntimeException e) {
+                copy.release();
+                throw e;
+            }
+            holder[0] = copy;
+            return existing;
+        });
+        return holder[0];
     }
 
     /**

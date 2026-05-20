@@ -771,6 +771,18 @@ public class PersistentVectorStore extends AbstractVectorStore {
      */
     final AtomicLong warmedSegmentsTotal = new AtomicLong();
 
+    /**
+     * Counter: number of segments whose warmup BFS pass was skipped because
+     * the bulk-prefetch pass (issue #619) covered the entire warmup budget.
+     * Exposed for tests (the BFS short-circuit is what the issue #619 patch
+     * delivers vs. just "BFS hits cache") and for Prometheus dashboards that
+     * track the share of warmups served by the prefetch fast path.
+     *
+     * <p>This is a strict subset of {@link #warmedSegmentsTotal}: every
+     * bulk-prefetch-only segment is also counted as a warmed segment.
+     */
+    final AtomicLong warmedSegmentsBulkPrefetchOnly = new AtomicLong();
+
     // -------------------------------------------------------------------------
     // PQ codebook cache (issue #281)
     // -------------------------------------------------------------------------
@@ -5133,6 +5145,15 @@ public class PersistentVectorStore extends AbstractVectorStore {
     }
 
     /**
+     * Number of segments whose BFS pass was skipped because the issue #619
+     * bulk-prefetch pass fully covered the warmup budget. Strict subset of
+     * {@link #getWarmedSegmentsTotal()}.
+     */
+    public long getWarmedSegmentsBulkPrefetchOnly() {
+        return warmedSegmentsBulkPrefetchOnly.get();
+    }
+
+    /**
      * Warms a single segment's block cache (issue #569), idempotently.
      *
      * <p>This is the per-segment building block called both by the
@@ -5188,8 +5209,21 @@ public class PersistentVectorStore extends AbstractVectorStore {
         // The prefetch is best-effort: any I/O failure is logged and the BFS
         // path still runs as before, which means we never regress versus the
         // pre-#619 behaviour even when the remote file service is degraded.
-        bulkPrefetchSegmentIntoCache(seg, bytesPerSegment);
-        int nodesVisited = warmUpSegmentBfs(seg, odg, nodeLimit);
+        long prefetchedBytes = bulkPrefetchSegmentIntoCache(seg, bytesPerSegment);
+        // If the prefetch covered the whole warmup budget (or the whole file,
+        // if smaller) the BFS would just walk the graph in user-thread time
+        // without doing any I/O. Skip it and report nodeLimit as the visited
+        // count so the per-segment "warmed exactly once" accounting stays
+        // consistent with the BFS path. Falls through to the BFS when the
+        // prefetch is partial / failed / not applicable (local-disk supplier).
+        long expectedCoverage = Math.min(bytesPerSegment, seg.graphFileSize);
+        int nodesVisited;
+        if (prefetchedBytes >= expectedCoverage && expectedCoverage > 0) {
+            warmedSegmentsBulkPrefetchOnly.incrementAndGet();
+            nodesVisited = nodeLimit;
+        } else {
+            nodesVisited = warmUpSegmentBfs(seg, odg, nodeLimit);
+        }
         if (nodesVisited > 0) {
             seg.warmedUp = true;
             warmedSegmentsTotal.incrementAndGet();
@@ -5259,22 +5293,39 @@ public class PersistentVectorStore extends AbstractVectorStore {
      * every covered cache block. The BFS that follows hits the cache for every
      * read.
      *
-     * <p>Best-effort: the call is a no-op when the segment's
+     * <p><b>Layout assumption.</b> The prefetch reads the file linearly from
+     * offset 0 — it assumes the bytes the warmup BFS would have visited (the
+     * HNSW entry-frontier on Layer 0) live in the prefix
+     * {@code [0, bytesPerSegment)}. This holds for the current jvector
+     * {@link io.github.jbellis.jvector.disk.OnDiskGraphIndex} layout, where
+     * Layer 0 data dominates the file from a small header onwards. If a
+     * future jvector layout change moves the entry-frontier later in the file
+     * the prefetch will still populate the cache correctly but the BFS will
+     * miss those blocks and fall back to per-node wire reads — i.e. degraded
+     * to pre-#619 performance, not broken correctness.
+     *
+     * <p>Best-effort: the call is a no-op (returns 0) when the segment's
      * {@code onDiskReaderSupplier} does not implement
      * {@link BulkPrefetchReaderSupplier} (e.g. local-disk suppliers used in
      * unit tests, or in-memory readers). When the supplier supports prefetch
-     * but the read fails, the exception is logged at {@code WARNING} and
-     * swallowed — the subsequent BFS continues to load blocks one at a time
-     * via the normal path, so we never regress vs. the pre-#619 behaviour.
+     * but the read fails, the exception is logged at {@code WARNING} and the
+     * method returns 0 — the subsequent BFS continues to load blocks one at
+     * a time via the normal path, so we never regress vs. the pre-#619
+     * behaviour.
+     *
+     * @return number of bytes actually inserted into the block cache. When
+     *     this equals {@code Math.min(bytesPerSegment, seg.graphFileSize)} the
+     *     prefetch has fully covered the warmup budget and {@link #warmUpSegment}
+     *     skips the BFS pass.
      */
     // Package-private to allow direct testing — see Issue619BulkWarmupTest.
-    void bulkPrefetchSegmentIntoCache(VectorSegment seg, long bytesPerSegment) {
+    long bulkPrefetchSegmentIntoCache(VectorSegment seg, long bytesPerSegment) {
         if (bytesPerSegment <= 0) {
-            return;
+            return 0L;
         }
         io.github.jbellis.jvector.disk.ReaderSupplier rs = seg.onDiskReaderSupplier;
         if (!(rs instanceof BulkPrefetchReaderSupplier)) {
-            return;
+            return 0L;
         }
         BulkPrefetchReaderSupplier prefetcher = (BulkPrefetchReaderSupplier) rs;
         long startNanos = System.nanoTime();
@@ -5287,12 +5338,14 @@ public class PersistentVectorStore extends AbstractVectorStore {
                         new Object[]{indexName, seg.segmentId, inserted,
                                 (System.nanoTime() - startNanos) / 1_000_000L});
             }
+            return inserted;
         } catch (IOException e) {
             // Best-effort: the BFS below will pull blocks on demand.
             LOGGER.log(Level.WARNING,
                     "bulkPrefetchSegmentIntoCache {0}: I/O error prefetching "
                             + "segment {1}: {2} — falling back to per-node BFS",
                     new Object[]{indexName, seg.segmentId, e.getMessage()});
+            return 0L;
         } catch (RuntimeException e) {
             // Narrow catch on RuntimeException only: programming errors inside the
             // prefetcher (e.g. unaligned offset) must not abort the watermark
@@ -5301,6 +5354,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
             LOGGER.log(Level.WARNING,
                     "bulkPrefetchSegmentIntoCache " + indexName
                             + ": unexpected error prefetching segment " + seg.segmentId, e);
+            return 0L;
         }
     }
 

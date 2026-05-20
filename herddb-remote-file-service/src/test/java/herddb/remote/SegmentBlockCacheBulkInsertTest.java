@@ -27,7 +27,12 @@ import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.PooledByteBufAllocator;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.Test;
 
 /**
@@ -87,11 +92,10 @@ public class SegmentBlockCacheBulkInsertTest {
      * containing the right bytes, and the loader is never invoked when a
      * subsequent getBlock is issued.
      *
-     * <p>The parent buffer's refCnt after {@code bulkInsert} equals the number
-     * of newly-inserted slices (Netty's {@code retainedSlice} keeps an
-     * additional ref on the parent per outstanding slice); a separate test
-     * verifies that {@link SegmentBlockCache#invalidatePath} eventually drives
-     * that count back to zero — that is what "no leak" means.
+     * <p>With per-block-copy ownership (issue #619 review fix) the parent
+     * buffer is released as soon as {@code bulkInsert} returns — its refCnt
+     * is 0 immediately, not "N slices alive" — and the cache's byte budget
+     * therefore bounds the actual off-heap footprint exactly.
      */
     @Test
     public void bulkInsertCachesEveryBlock() throws Exception {
@@ -101,7 +105,7 @@ public class SegmentBlockCacheBulkInsertTest {
         assertEquals(1, data.refCnt());
 
         long inserted = cache.bulkInsert(PATH, 0L, BLOCK, data);
-        assertEquals("4 cached slices keep the parent alive", 4, data.refCnt());
+        assertEquals("parent buffer released eagerly — no slice pinning", 0, data.refCnt());
         assertEquals(BLOCK * 4L, inserted);
         assertEquals(4L, cache.bulkInsertedBlockCount());
         assertEquals(BLOCK * 4L, cache.bulkInsertedByteCount());
@@ -119,10 +123,11 @@ public class SegmentBlockCacheBulkInsertTest {
         }
         assertEquals("loader never invoked after bulkInsert", 0, loaderCalls.get());
 
-        // No leak: clearing the cache must drive the parent refCnt back to 0.
+        // No leak: cached entries are independent allocations released by the
+        // eviction listener on cache.clear().
         cache.clear();
         cache.cleanUp();
-        assertEquals("parent buffer fully released after cache.clear()", 0, data.refCnt());
+        assertEquals("weighted size 0 after cache.clear()", 0L, cache.weightedSize());
     }
 
     /**
@@ -137,7 +142,7 @@ public class SegmentBlockCacheBulkInsertTest {
         ByteBuf data = directRamp(total, 0);
 
         long inserted = cache.bulkInsert(PATH, 0L, BLOCK, data);
-        assertEquals("3 cached slices keep the parent alive", 3, data.refCnt());
+        assertEquals("parent released eagerly even with partial last block", 0, data.refCnt());
         assertEquals(total, inserted);
         assertEquals(3L, cache.bulkInsertedBlockCount());
 
@@ -227,9 +232,9 @@ public class SegmentBlockCacheBulkInsertTest {
         // whether block 1 was overwritten or preserved.
         ByteBuf data = directRamp(BLOCK * 4, 0);
         long inserted = cache.bulkInsert(PATH, 0L, BLOCK, data);
-        // 3 slices entered the cache (blocks 0, 2, 3); the skipped block did
-        // not retain the parent, so the parent's refCnt equals 3, not 4.
-        assertEquals("only the 3 inserted slices retain the parent", 3, data.refCnt());
+        // With per-block copy (issue #619 review fix) the parent is always
+        // released eagerly — present or skipped, neither path retains it.
+        assertEquals("parent released eagerly regardless of skip count", 0, data.refCnt());
 
         // Three blocks newly inserted (0, 2, 3); block 1 already there, skipped.
         assertEquals(BLOCK * 3L, inserted);
@@ -254,8 +259,10 @@ public class SegmentBlockCacheBulkInsertTest {
 
     /**
      * After invalidatePath every block inserted by bulkInsert must be gone
-     * from the cache and the underlying parent buffer's ref-count must reach
-     * 0 — i.e. the bulk insert did not leak references.
+     * from the cache. With per-block copies (issue #619 review fix) the
+     * parent buffer is already released before {@code bulkInsert} returns
+     * — invalidate's job is to free the per-block allocations, observable
+     * via {@link SegmentBlockCache#weightedSize()} dropping to 0.
      */
     @Test
     public void invalidatePathDropsAllBulkInsertedBlocks() {
@@ -266,7 +273,11 @@ public class SegmentBlockCacheBulkInsertTest {
         cache.cleanUp();
         long weightedBefore = cache.weightedSize();
         assertTrue("cache should be non-empty after bulk insert", weightedBefore > 0);
-        assertEquals("4 slices keep the parent alive before invalidate", 4, data.refCnt());
+        assertEquals("parent released by bulkInsert — no slice pinning", 0, data.refCnt());
+        // The cache's byte budget now exactly reflects the cached bytes (no
+        // hidden multipart-chunk amplification).
+        assertEquals("cache bytes match expected per-block sum",
+                (long) BLOCK * 4L, weightedBefore);
 
         cache.invalidatePath(PATH);
         cache.cleanUp();
@@ -275,7 +286,6 @@ public class SegmentBlockCacheBulkInsertTest {
         assertFalse(cache.containsBlock(PATH, (long) BLOCK, BLOCK));
         assertFalse(cache.containsBlock(PATH, 2L * BLOCK, BLOCK));
         assertFalse(cache.containsBlock(PATH, 3L * BLOCK, BLOCK));
-        assertEquals("parent buffer fully released after invalidatePath", 0, data.refCnt());
     }
 
     /**
@@ -295,6 +305,94 @@ public class SegmentBlockCacheBulkInsertTest {
         assertEquals(2L, cache.bulkInsertedBlockCount());
         assertEquals(2L, cache.bulkInsertSkippedCount());
         assertEquals("second buffer released even on full skip", 0, second.refCnt());
+    }
+
+    /**
+     * Concurrent stress: many threads run {@code bulkInsert} against
+     * overlapping ranges while another set of threads issues {@code getBlock}
+     * calls and a third thread periodically invokes {@code invalidatePath}.
+     * The test asserts (a) no {@code IllegalReferenceCountException} or other
+     * RuntimeException escapes, (b) every {@code getBlock} returns either the
+     * correct ramp bytes from the bulk insert or freshly-loaded bytes from
+     * the loader fallback, (c) after the workload completes and the cache is
+     * cleared the byte-weighted size drops to zero.
+     */
+    @Test
+    public void concurrentBulkInsertGetBlockAndInvalidate() throws Exception {
+        SegmentBlockCache cache = new SegmentBlockCache(8 * 1024 * 1024);
+        final int blocks = 64; // file is 64 KiB at BLOCK==1024
+        final int total = BLOCK * blocks;
+
+        // Loader returns ramp(0) bytes — same as the bulk insert — so we can
+        // assert each retrieved block's payload regardless of which path it
+        // came from.
+        SegmentBlockCache.BlockLoader loader = (p, off, len) -> {
+            int blockIdx = (int) (off / BLOCK);
+            return directRamp(len, blockIdx * BLOCK);
+        };
+
+        ExecutorService pool = Executors.newFixedThreadPool(8);
+        final int iterations = 200;
+        final AtomicReference<Throwable> firstFailure = new AtomicReference<>();
+        CountDownLatch latch = new CountDownLatch(8);
+        try {
+            // 3 bulk-insert threads.
+            for (int t = 0; t < 3; t++) {
+                pool.submit(() -> {
+                    try {
+                        for (int i = 0; i < iterations; i++) {
+                            cache.bulkInsert(PATH, 0L, BLOCK, directRamp(total, 0));
+                        }
+                    } catch (Throwable th) {
+                        firstFailure.compareAndSet(null, th);
+                    } finally {
+                        latch.countDown();
+                    }
+                });
+            }
+            // 4 read threads — assert payload correctness.
+            for (int t = 0; t < 4; t++) {
+                pool.submit(() -> {
+                    try {
+                        for (int i = 0; i < iterations * 4; i++) {
+                            int b = i % blocks;
+                            long off = (long) b * BLOCK;
+                            byte[] got = readAllAndRelease(cache.getBlock(PATH, off, BLOCK, loader));
+                            assertArrayEquals("block " + b + " bytes",
+                                    expectedSliceBytes(0, b * BLOCK, BLOCK), got);
+                        }
+                    } catch (Throwable th) {
+                        firstFailure.compareAndSet(null, th);
+                    } finally {
+                        latch.countDown();
+                    }
+                });
+            }
+            // 1 invalidator thread that periodically drops everything.
+            pool.submit(() -> {
+                try {
+                    for (int i = 0; i < iterations / 4; i++) {
+                        cache.invalidatePath(PATH);
+                        Thread.sleep(1);
+                    }
+                } catch (Throwable th) {
+                    firstFailure.compareAndSet(null, th);
+                } finally {
+                    latch.countDown();
+                }
+            });
+            assertTrue("workload finished within 60s", latch.await(60, TimeUnit.SECONDS));
+        } finally {
+            pool.shutdownNow();
+            pool.awaitTermination(5, TimeUnit.SECONDS);
+        }
+        if (firstFailure.get() != null) {
+            throw new AssertionError("concurrent workload failed", firstFailure.get());
+        }
+        // Drain pending eviction work.
+        cache.clear();
+        cache.cleanUp();
+        assertEquals("weighted size 0 after final clear", 0L, cache.weightedSize());
     }
 
     /**

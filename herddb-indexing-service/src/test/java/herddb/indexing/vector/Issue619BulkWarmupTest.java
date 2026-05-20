@@ -122,6 +122,9 @@ public class Issue619BulkWarmupTest {
     /**
      * When the supplier implements {@link BulkPrefetchReaderSupplier}, the
      * prefetch is invoked exactly once with {@code (startOffset=0, maxBytes=budget)}.
+     * Also asserts the new return-value contract introduced for issue #619
+     * review fix R3 — the bytes inserted are propagated to the caller so
+     * {@code warmUpSegment} can decide to skip the BFS.
      */
     @Test
     public void bulkPrefetchInvokedOnceWhenSupplierSupportsIt() throws Exception {
@@ -136,12 +139,50 @@ public class Issue619BulkWarmupTest {
             RecordingBulkPrefetchSupplier supplier = new RecordingBulkPrefetchSupplier();
             seg.onDiskReaderSupplier = supplier;
 
-            store.bulkPrefetchSegmentIntoCache(seg, BUDGET_BYTES);
+            long inserted = store.bulkPrefetchSegmentIntoCache(seg, BUDGET_BYTES);
 
             assertEquals("prefetch invoked exactly once", 1, supplier.calls.get());
             assertEquals("prefetch startOffset == 0", 0L, supplier.lastStartOffset.get());
             assertEquals("prefetch budget == warmupBytesPerSegment",
                     BUDGET_BYTES, supplier.lastBudget.get());
+            assertEquals("bytes-inserted return value flows back to caller",
+                    BUDGET_BYTES, inserted);
+        }
+    }
+
+    /**
+     * Review fix R3: when the bulk prefetch reports a successful failure
+     * (e.g. {@link IOException}) the helper returns 0 so that
+     * {@code warmUpSegment} falls back to the BFS path.
+     */
+    @Test
+    public void bulkPrefetchReturnsZeroOnIoFailure() throws Exception {
+        try (PersistentVectorStore store = newStore(tmpFolder.newFolder().toPath())) {
+            store.setWarmupBytesPerSegment(BUDGET_BYTES);
+            VectorSegment seg = new VectorSegment(0);
+            seg.graphFileSize = BUDGET_BYTES * 2L;
+            RecordingBulkPrefetchSupplier supplier = new RecordingBulkPrefetchSupplier();
+            supplier.failWith = new IOException("simulated");
+            seg.onDiskReaderSupplier = supplier;
+
+            long inserted = store.bulkPrefetchSegmentIntoCache(seg, BUDGET_BYTES);
+            assertEquals("IOException is swallowed; returns 0", 0L, inserted);
+        }
+    }
+
+    /**
+     * Review fix R3: when the supplier does not implement the mixin the
+     * helper returns 0 (no prefetch attempt). Verifies the return-value
+     * contract for the local-disk fallthrough path.
+     */
+    @Test
+    public void plainSupplierReturnsZero() throws Exception {
+        try (PersistentVectorStore store = newStore(tmpFolder.newFolder().toPath())) {
+            store.setWarmupBytesPerSegment(BUDGET_BYTES);
+            VectorSegment seg = new VectorSegment(0);
+            seg.graphFileSize = BUDGET_BYTES * 2L;
+            seg.onDiskReaderSupplier = new PlainSupplier();
+            assertEquals(0L, store.bulkPrefetchSegmentIntoCache(seg, BUDGET_BYTES));
         }
     }
 
@@ -246,6 +287,17 @@ public class Issue619BulkWarmupTest {
             store.bulkPrefetchSegmentIntoCache(seg, BUDGET_BYTES);
 
             assertEquals(3, supplier.calls.get());
+        }
+    }
+
+    /**
+     * Review fix R3: the {@code warmedSegmentsBulkPrefetchOnly} counter must
+     * still be zero before any warmup runs — sanity check the new accessor.
+     */
+    @Test
+    public void bulkPrefetchOnlyCounterStartsAtZero() throws Exception {
+        try (PersistentVectorStore store = newStore(tmpFolder.newFolder().toPath())) {
+            assertEquals(0L, store.getWarmedSegmentsBulkPrefetchOnly());
         }
     }
 

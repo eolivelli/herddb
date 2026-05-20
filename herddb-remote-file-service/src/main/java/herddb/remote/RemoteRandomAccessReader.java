@@ -765,6 +765,16 @@ public class RemoteRandomAccessReader implements RandomAccessReader {
          * fetched buffers are released on the failure branch so no off-heap
          * memory leaks.
          *
+         * <p><b>Threading constraint.</b> This method blocks on
+         * {@code CompletableFuture.allOf(...).join()}, and those futures are
+         * completed on the Netty event-loop threads owned by
+         * {@code RemoteFileServiceClient}. It MUST NOT be called from one of
+         * those event-loop threads — doing so would deadlock the loop that is
+         * supposed to complete the futures. The intended caller is the
+         * indexing-service checkpoint / compaction worker, which runs on a
+         * dedicated executor thread (see
+         * {@code PersistentVectorStore.bulkPrefetchSegmentIntoCache}).
+         *
          * @param startOffset starting byte offset; must be {@code >= 0} and
          *     aligned to {@code writeBlockSize}
          * @param maxBytes    upper bound on the number of bytes to read;

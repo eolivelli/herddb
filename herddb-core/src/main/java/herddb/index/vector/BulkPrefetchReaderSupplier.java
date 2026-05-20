@@ -48,6 +48,18 @@ import java.io.IOException;
  * need not implement this interface; callers check for it with
  * {@code instanceof} and fall back to the default BFS path when it is absent.
  *
+ * <p><b>Layout assumption.</b> Callers using this interface for HNSW warmup
+ * (notably {@code PersistentVectorStore.bulkPrefetchSegmentIntoCache}) assume
+ * that the bytes the warmup BFS would have visited — the HNSW entry-frontier
+ * on Layer 0 — live in the file's leading prefix. This holds for the current
+ * jvector {@code OnDiskGraphIndex} layout where Layer 0 data dominates the
+ * file from a small header onwards. If a future jvector layout change moves
+ * the entry-frontier later in the file, the prefetch still populates the
+ * cache correctly but covers the wrong bytes; the subsequent BFS then degrades
+ * to pre-#619 per-node wire reads — no correctness impact, only a missed
+ * optimisation. Implementations therefore do not need to know about the HNSW
+ * layout; they just deliver the bytes requested.
+ *
  * @author enrico.olivelli
  */
 public interface BulkPrefetchReaderSupplier {

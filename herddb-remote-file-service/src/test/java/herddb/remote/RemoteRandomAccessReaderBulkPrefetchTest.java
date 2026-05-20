@@ -20,6 +20,7 @@
 
 package herddb.remote;
 
+import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertNotNull;
@@ -31,6 +32,7 @@ import herddb.index.vector.BulkPrefetchReaderSupplier;
 import io.github.jbellis.jvector.disk.RandomAccessReader;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.util.Arrays;
 import java.util.List;
 import org.apache.bookkeeper.stats.NullStatsLogger;
 import org.junit.After;
@@ -293,6 +295,110 @@ public class RemoteRandomAccessReaderBulkPrefetchTest {
         assertEquals(0L, supplier.bulkPrefetchIntoCache(0L, 0L));
         assertEquals(0L, supplier.bulkPrefetchIntoCache(0L, -100L));
         assertEquals(0L, cache.bulkInsertedBlockCount());
+    }
+
+    /**
+     * Review fix R5: when one chunk in the middle is missing from storage
+     * (server returns {@code null}), the prefetch must surface an
+     * {@link IOException} without leaking any buffer fetched from earlier
+     * chunks. The current implementation joins on every chunk's future before
+     * any insert, so the failed chunk causes an early bail-out and the
+     * earlier successful buffers are drained via the catch block — exercised
+     * here against a real wire.
+     */
+    @Test
+    public void prefetchFailsCleanlyWhenServerMissingTrailingChunk() {
+        // Configure the supplier to think the file is 3 chunks long, but the
+        // upload only ever wrote chunks 0 and 1 — chunk 2 will return null
+        // from the server. The Supplier's totalSize is the source of truth
+        // for how many chunks the prefetch dispatches; we set it longer than
+        // actual storage to provoke the partial-availability path.
+        int fakeTotal = WRITE_BLOCK_SIZE * (NUM_CHUNKS + 2);
+        SegmentBlockCache cache = new SegmentBlockCache(1_000_000);
+        RemoteRandomAccessReader.Supplier supplier =
+                new RemoteRandomAccessReader.Supplier(client, PATH, fakeTotal,
+                        WRITE_BLOCK_SIZE, BUFFER_SIZE, NullStatsLogger.INSTANCE, cache);
+        try {
+            supplier.bulkPrefetchIntoCache(0L, fakeTotal);
+            fail("expected IOException for trailing missing chunks");
+        } catch (IOException expected) {
+            // Either chunk 3 or chunk 4 reported missing first; both are valid.
+            assertNotNull(expected.getMessage());
+        }
+        // Critical invariant: no off-heap leak. Caffeine releases everything
+        // it holds when invalidatePath runs; if the failure branch had leaked
+        // a fetched buffer we'd observe a stale entry left in the cache. We
+        // can't probe Netty's pool directly here, but a clean invalidate +
+        // weightedSize check exercises the eviction listener for every entry
+        // we did insert before failing.
+        cache.invalidatePath(PATH);
+        cache.cleanUp();
+        assertEquals(0L, cache.weightedSize());
+    }
+
+    /**
+     * Review fix R2: after a successful bulk prefetch the main cache holds
+     * every covered block; a subsequent pin-mode reader (the warmup pin BFS)
+     * must serve those blocks from main into the frontier region WITHOUT
+     * issuing a fresh wire read. The check observes the frontier region's
+     * load_success counter increasing while {@code SegmentBlockCache.loadSuccessCount}
+     * stays at zero (no main-cache loader invocation either).
+     */
+    @Test
+    public void pinModeAfterPrefetchPromotesMainCacheWithoutWireRead() throws Exception {
+        // Need a frontier budget for the pin region to be active.
+        SegmentBlockCache cache = new SegmentBlockCache(1_000_000, 200_000);
+        RemoteRandomAccessReader.Supplier supplier =
+                new RemoteRandomAccessReader.Supplier(client, PATH, TOTAL_SIZE,
+                        WRITE_BLOCK_SIZE, BUFFER_SIZE, NullStatsLogger.INSTANCE, cache);
+
+        // 1. Prefetch fills the MAIN cache.
+        supplier.bulkPrefetchIntoCache(0L, TOTAL_SIZE);
+        long mainLoadsAfterPrefetch = cache.loadSuccessCount();
+        // bulkInsert doesn't bump loadSuccess, so this is 0 before pin too.
+        assertEquals(0L, mainLoadsAfterPrefetch);
+
+        // 2. A pin-mode reader reads the same blocks — they must end up in
+        // the frontier region, promoted from main without a wire read.
+        try (RandomAccessReader pinReader = supplier.withPinMode().get()) {
+            pinReader.seek(0);
+            byte[] tmp = new byte[BUFFER_SIZE];
+            for (int i = 0; i < (TOTAL_SIZE / BUFFER_SIZE); i++) {
+                pinReader.readFully(tmp);
+                // bytes must match the original payload
+                int payloadOff = i * BUFFER_SIZE;
+                byte[] expected = Arrays.copyOfRange(payload, payloadOff, payloadOff + BUFFER_SIZE);
+                assertArrayEquals("block " + i + " bytes via pin reader", expected, tmp);
+            }
+        }
+
+        // 3. Frontier load_success increased — and crucially main load_success
+        // did NOT change (no extra wire read happened). This is the heart of
+        // the R2 fix.
+        assertEquals("no main-cache loader invocation after prefetch",
+                0L, cache.loadSuccessCount());
+        assertTrue("frontier loads must have run (promoted from main)",
+                cache.frontierLoadSuccessCount() > 0);
+    }
+
+    /**
+     * Sanity check for the promotion path: when the main cache is empty,
+     * pin-mode reads still work — they fall through to the loader exactly
+     * like before the R2 fix.
+     */
+    @Test
+    public void pinModeWithoutPriorPrefetchStillLoadsFromWire() throws Exception {
+        SegmentBlockCache cache = new SegmentBlockCache(1_000_000, 200_000);
+        RemoteRandomAccessReader.Supplier supplier =
+                new RemoteRandomAccessReader.Supplier(client, PATH, TOTAL_SIZE,
+                        WRITE_BLOCK_SIZE, BUFFER_SIZE, NullStatsLogger.INSTANCE, cache);
+        // No prefetch this time — main cache stays empty.
+        try (RandomAccessReader pinReader = supplier.withPinMode().get()) {
+            pinReader.seek(0);
+            pinReader.readInt();
+        }
+        // frontier load happened via the loader because main was empty.
+        assertEquals(1L, cache.frontierLoadSuccessCount());
     }
 
     /**
