@@ -24,7 +24,6 @@ import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
@@ -425,7 +424,6 @@ public class RemoteRandomAccessReaderBulkPrefetchTest {
                     !cache.containsBlock(PATH, (long) i * BUFFER_SIZE, BUFFER_SIZE));
         }
         // weightedSize() == 0 already implies size==0, but be explicit for readability.
-        assertNull("peekBytes returns null for evicted block",
-                cache.estimatedSize() > 0 ? "non-empty" : null);
+        assertEquals("estimatedSize() == 0 after invalidatePath", 0L, cache.estimatedSize());
     }
 }
