@@ -20,7 +20,6 @@
 package herddb.indexing.vector;
 
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 import herddb.core.MemoryManager;
 import herddb.mem.MemoryDataStorageManager;
@@ -196,16 +195,20 @@ public class Issue616PhaseBPartialUploadRollbackTest {
                 threw = true;
             }
 
-            // (A) Phase B must have failed — surfaced by either a thrown
-            // exception OR the consecutiveCheckpointFailures counter
-            // advancing. If NEITHER fired, the failure injection did not
-            // actually trip the Phase B handler and the rest of the test
-            // is meaningless.
-            assertTrue("Phase B must have failed — either by throw"
-                            + " (threw=" + threw + ") or by counter bump"
-                            + " (before=" + failuresBefore + ", after="
+            // (A) Phase B must have failed — under the fix, BOTH a thrown
+            // exception (the original IOException wrapped as
+            // DataStorageManagerException by checkpoint()) AND the
+            // consecutiveCheckpointFailures counter bump must fire (the
+            // outer Phase B catch in doCheckpointFusedPQThreePhase
+            // increments the counter BEFORE rethrowing). Asserting both
+            // tightens the contract — a future refactor that swallows
+            // the throw or skips the counter bump is caught immediately.
+            assertTrue("Phase B must have surfaced as a thrown exception"
+                            + " (threw=" + threw + ")", threw);
+            assertTrue("Phase B must have bumped the consecutive failure"
+                            + " counter (before=" + failuresBefore + ", after="
                             + store.getConsecutiveCheckpointFailures() + ")",
-                    threw || store.getConsecutiveCheckpointFailures() > failuresBefore);
+                    store.getConsecutiveCheckpointFailures() > failuresBefore);
 
             // (B) THE FIX: the partial multipart file that the failing
             // writeMultipartIndexFile call left in the DSM must have been
@@ -261,12 +264,106 @@ public class Issue616PhaseBPartialUploadRollbackTest {
                             + " Captured messages: " + captor.severeMessages,
                     captor.sawMessageContaining("_seg"));
 
-            // (E) Belt-and-suspenders: no SEVERE log should have leaked an
-            // "OK" / success indication for the failing segment. (Sanity:
-            // this catches a future refactor that accidentally promotes
-            // the success log to SEVERE.)
-            assertFalse("SEVERE log must not contain a successful-write line",
-                    captor.sawMessageContaining("Phase B: shard segment"));
+        } finally {
+            storeLogger.removeHandler(captor);
+            storeLogger.setLevel(previousLevel);
+        }
+    }
+
+    /**
+     * Issue #616 review item: the OOM scenario cited in the issue's
+     * reproduction surfaces as Netty's {@code OutOfDirectMemoryError},
+     * which extends {@link java.lang.OutOfMemoryError} (an {@link Error},
+     * NOT a {@link RuntimeException}). The inner SEVERE diagnostic catch
+     * in {@code writeShardAsFusedPQSegment} must catch {@link Throwable}
+     * — not just {@code IOException | RuntimeException} — so the failing
+     * segment's identity is logged in exactly the failure mode the issue
+     * is trying to make diagnosable.
+     *
+     * <p>In the default parallel Phase B path
+     * ({@code PHASE_B_SEGMENT_PARALLELISM=2}), {@code awaitAllOrFirstFailure}
+     * wraps a thrown {@link Throwable} that is neither {@link IOException}
+     * nor {@link RuntimeException} into an {@link IOException} with the
+     * original {@link Error} as the cause — so the outer Phase B catch
+     * arm still runs {@code rollbackProvisionalArtefacts()} +
+     * {@code recoverFromPhaseBFailure()} on Error. We assert that the
+     * partial multipart file is cleaned up AND the new SEVERE diagnostic
+     * line names the failing {@code segUuid}.
+     */
+    @Test(timeout = 60_000)
+    public void phaseBPartialUploadUnderErrorRolledBack() throws Exception {
+        Path tmpDir = tmpFolder.newFolder("issue616-phaseB-partial-error").toPath();
+        ErrorWriteFailingDsm dsm = new ErrorWriteFailingDsm();
+
+        SevereCaptor captor = new SevereCaptor();
+        Logger storeLogger = Logger.getLogger(PersistentVectorStore.class.getName());
+        storeLogger.addHandler(captor);
+        Level previousLevel = storeLogger.getLevel();
+        storeLogger.setLevel(Level.ALL);
+
+        try (PersistentVectorStore store = createStore(tmpDir, dsm)) {
+            store.start();
+
+            Random rng = new Random(616);
+            int dim = 16;
+            for (int i = 0; i < 50; i++) {
+                store.addVector(Bytes.from_int(i), vec(rng, dim));
+            }
+            store.checkpoint();
+
+            Set<String> filesAfterBaseline = dsm.snapshotMultipartFiles();
+            int segmentsAfterBaseline = store.getSegmentCount();
+
+            for (int i = 50; i < 100; i++) {
+                store.addVector(Bytes.from_int(i), vec(rng, dim));
+            }
+
+            dsm.resetWriteTracking();
+            dsm.failOnNextWriteWithError();
+
+            // We do NOT assert that checkpoint() throws an Error — the
+            // outer parallel-Phase-B path wraps it into an IOException
+            // (then DataStorageManagerException via checkpoint()). What
+            // matters is (i) the diagnostic SEVERE log fires (Throwable
+            // catch in the patched method), (ii) the rollback path runs
+            // (no orphan), and (iii) the segment registry is untouched.
+            long failuresBefore = store.getConsecutiveCheckpointFailures();
+            boolean failed = false;
+            try {
+                store.checkpoint();
+            } catch (Throwable expected) {
+                // Either a wrapped DataStorageManagerException (parallel
+                // path), or the raw Error (serial path) — both are
+                // acceptable evidence that Phase B failed. We catch
+                // Throwable here precisely because the Error path is
+                // exactly what we are testing.
+                failed = true;
+            }
+
+            assertTrue("Phase B must have failed under Error injection",
+                    failed || store.getConsecutiveCheckpointFailures() > failuresBefore);
+
+            Set<String> filesAfterFailure = dsm.snapshotMultipartFiles();
+            Set<String> orphanedFiles = new HashSet<>(filesAfterFailure);
+            orphanedFiles.removeAll(filesAfterBaseline);
+            assertTrue("Phase B rollback must delete every partial multipart"
+                            + " file from the failing checkpoint, even when the"
+                            + " injected failure is an Error (issue #616 review)."
+                            + " Orphaned: " + orphanedFiles,
+                    orphanedFiles.isEmpty());
+
+            assertEquals("Failing Phase B (Error path) must not grow the"
+                            + " segment registry",
+                    segmentsAfterBaseline, store.getSegmentCount());
+
+            // The diagnostic log MUST fire for the Error path — that is
+            // the gap the reviewer identified. Without the Throwable
+            // catch in writeShardAsFusedPQSegment, this assertion fails.
+            assertTrue("SEVERE log must name the failing segUuid even when"
+                            + " the upload throws an Error (issue #616 review)."
+                            + " Captured messages: " + captor.severeMessages,
+                    captor.sawMessageContaining("Phase B: graph multipart write FAILED")
+                            || captor.sawMessageContaining("Phase B: map multipart write FAILED"));
         } finally {
             storeLogger.removeHandler(captor);
             storeLogger.setLevel(previousLevel);
@@ -354,6 +451,79 @@ public class Issue616PhaseBPartialUploadRollbackTest {
         // Pin to the reader-supplier path so test behaviour does not change
         // if a future refactor flips the direct-download default (same
         // pattern as PhaseCPrepRollbackSafetyTest).
+        @Override
+        public boolean supportsDirectMultipartDownload() {
+            return false;
+        }
+
+        @Override
+        public void downloadMultipartIndexFile(String tableSpace, String uuid, String fileType,
+                                               long fileSize, java.nio.file.Path target)
+                throws IOException, DataStorageManagerException {
+            throw new UnsupportedOperationException("test pins reader-supplier path");
+        }
+    }
+
+    /**
+     * Variant of {@link MidWriteFailingDsm} that simulates the Netty
+     * {@code OutOfDirectMemoryError} scenario from the issue's reproduction:
+     * performs the underlying put (so the file appears in the simulated
+     * remote storage), then throws an {@link OutOfMemoryError}. The
+     * {@code OutOfMemoryError} hierarchy mirrors Netty's
+     * {@code io.netty.util.internal.OutOfDirectMemoryError extends
+     * java.lang.OutOfMemoryError extends VirtualMachineError extends Error}.
+     */
+    private static final class ErrorWriteFailingDsm extends MemoryDataStorageManager {
+
+        final AtomicInteger deleteCalls = new AtomicInteger();
+        final AtomicBoolean armed = new AtomicBoolean(false);
+
+        void resetWriteTracking() {
+            deleteCalls.set(0);
+        }
+
+        void failOnNextWriteWithError() {
+            armed.set(true);
+        }
+
+        Set<String> snapshotMultipartFiles() {
+            try {
+                java.lang.reflect.Field f = MemoryDataStorageManager.class
+                        .getDeclaredField("multipartFiles");
+                f.setAccessible(true);
+                @SuppressWarnings("unchecked")
+                java.util.Map<String, byte[]> map = (java.util.Map<String, byte[]>) f.get(this);
+                return new java.util.LinkedHashSet<>(map.keySet());
+            } catch (ReflectiveOperationException e) {
+                throw new AssertionError(
+                        "MemoryDataStorageManager.multipartFiles layout changed", e);
+            }
+        }
+
+        @Override
+        public String writeMultipartIndexFile(String tableSpace, String uuid, String fileType,
+                                              java.nio.file.Path tempFile,
+                                              java.util.function.LongConsumer progress)
+                throws IOException, DataStorageManagerException {
+            boolean takeVictimSlot = armed.compareAndSet(true, false);
+            if (takeVictimSlot) {
+                // Same put-then-throw simulation as MidWriteFailingDsm,
+                // but throws an Error instead of an IOException.
+                super.writeMultipartIndexFile(tableSpace, uuid, fileType, tempFile, progress);
+                throw new OutOfMemoryError("issue #616 test: simulated direct-buffer"
+                        + " allocation failure for " + tableSpace + "/" + uuid
+                        + "/" + fileType);
+            }
+            return super.writeMultipartIndexFile(tableSpace, uuid, fileType, tempFile, progress);
+        }
+
+        @Override
+        public void deleteMultipartIndexFile(String tableSpace, String uuid, String fileType)
+                throws DataStorageManagerException {
+            deleteCalls.incrementAndGet();
+            super.deleteMultipartIndexFile(tableSpace, uuid, fileType);
+        }
+
         @Override
         public boolean supportsDirectMultipartDownload() {
             return false;

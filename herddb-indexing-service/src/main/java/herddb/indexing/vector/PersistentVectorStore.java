@@ -3535,6 +3535,20 @@ public class PersistentVectorStore extends AbstractVectorStore {
             } finally {
                 uploadingActive.decrementAndGet();
             }
+            // Issue #616 review item: track-after-success here is INTENTIONAL and
+            // benign. writeStreamingCompactedSegment runs on the compaction code
+            // path, where provisionalMultipartFiles is NOT installed (only Phase B
+            // of indexCheckpoint installs it; see the only assignment at the top
+            // of doCheckpointFusedPQThreePhase). trackProvisionalMultipartFile is
+            // therefore a no-op on this path — both pre- and post-track placements
+            // are equivalent here. Compaction's own orphan-cleanup mechanism is
+            // independent: VectorIndexCompactor.rebuildSegmentStreaming wraps any
+            // failure from writeStreamingCompactedSegment into a CompactionException
+            // carrying a failureOrphans list (see VectorIndexCompactor.java around
+            // line 1330), which runCompactionCycle's catch arm then queues for the
+            // retention-aware pendingDeletes reaper. Do NOT pre-track here without
+            // first removing that orphan-list mechanism, or both pipelines would
+            // attempt to delete the same files.
             trackProvisionalMultipartFile(segUuid, "graph");
 
             // Upload map
@@ -3549,6 +3563,9 @@ public class PersistentVectorStore extends AbstractVectorStore {
             } finally {
                 uploadingActive.decrementAndGet();
             }
+            // Issue #616 review item: see the matching comment on the graph
+            // upload above — track-after-success is intentional on the compaction
+            // path because provisionalMultipartFiles is not installed here.
             trackProvisionalMultipartFile(segUuid, "map");
             compactionNodesDone.addAndGet(vectorCount);
             return new SegmentWriteResult(segmentId,
@@ -5671,7 +5688,26 @@ public class PersistentVectorStore extends AbstractVectorStore {
             if (hook != null) {
                 hook.run();
             }
-        } catch (IOException | RuntimeException e) {
+        } catch (IOException | RuntimeException | Error e) {
+            // Issue #616: include Error in the catch list so an Error thrown
+            // by writeShardAsFusedPQSegment (e.g. Netty's OutOfDirectMemoryError,
+            // which extends OutOfMemoryError extends Error — the failure mode
+            // cited in the issue's reproduction) still drives the rollback
+            // pipeline. In the parallel Phase B path,
+            // awaitAllOrFirstFailure already wraps a non-IOException /
+            // non-RuntimeException Throwable into an IOException; but in the
+            // serial path (shardTasks.size() == 1, which forces parallelism=1
+            // at doCheckpointFusedPQPhaseB) the Error propagates directly, so
+            // without this broadening the rollback + recovery would be
+            // skipped and the partial multipart files queued by the issue
+            // #616 pre-track would not be deleted.
+            //
+            // The broad Error catch is bounded: we run a small, fixed set of
+            // safe operations (log line + atomic counter bumps + remote-file
+            // deletes + writeLock'd state restore), then rethrow the original
+            // Throwable unchanged so the JVM's normal Error-handling semantics
+            // (e.g. thread termination for VirtualMachineError) are preserved
+            // at the call site.
             LOGGER.log(Level.SEVERE, "checkpoint " + indexName + ": Phase B exception", e);
             rollbackProvisionalArtefacts();
             consecutiveCheckpointFailures.incrementAndGet();
@@ -6701,7 +6737,6 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 // Upload graph file
                 long graphSize = Files.size(tempFile);
                 uploadBytesTotal.addAndGet(graphSize);
-                uploadingActive.incrementAndGet();
                 String graphFilePath;
                 String segUuid = indexUUID + "_seg" + segmentId;
                 // Issue #616: register the segUuid in the provisional-multipart-files
@@ -6720,26 +6755,34 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 // the rollback path already swallows DataStorageManagerException /
                 // RuntimeException from such deletes (see rollbackProvisionalArtefacts).
                 trackProvisionalMultipartFile(segUuid, "graph");
+                uploadingActive.incrementAndGet();
                 try {
                     graphFilePath = dataStorageManager.writeMultipartIndexFile(
                             tableSpaceUUID,
                             segUuid, "graph",
                             tempFile, uploadBytesDone::addAndGet);
-                } catch (IOException | RuntimeException e) {
+                } catch (Throwable e) {
                     // Issue #616: log SEVERE with the failing segment identity BEFORE
                     // the exception propagates to awaitAllOrFirstFailure (which only
                     // surfaces the FIRST failure when shards run in parallel). Without
                     // this log the outer Phase B catch in doCheckpointFusedPQThreePhase
                     // prints "Phase B exception" with no shard identity — operators
                     // cannot tell which segment's upload aborted, which is the
-                    // diagnostic gap the issue is trying to close. The broad
-                    // RuntimeException catch is intentional: Netty wraps allocation
-                    // failures (including OutOfDirectMemoryError-style conditions)
-                    // and protocol errors into unchecked exceptions thrown out of the
-                    // multipart writer, and DataStorageManagerException is itself a
-                    // RuntimeException subclass. We re-throw unchanged so the existing
-                    // Phase B failure handling (rollbackProvisionalArtefacts +
-                    // recoverFromPhaseBFailure) runs exactly as before.
+                    // diagnostic gap the issue is trying to close.
+                    //
+                    // The broad Throwable catch is required and intentional:
+                    //   (a) Netty surfaces direct-buffer allocation failures as
+                    //       OutOfDirectMemoryError, which extends OutOfMemoryError
+                    //       (an Error, NOT a RuntimeException) — this is the exact
+                    //       motivating failure cited in issue #616's reproduction.
+                    //       A narrower catch would skip the diagnostic for the very
+                    //       case the issue is trying to fix.
+                    //   (b) DataStorageManagerException is a RuntimeException
+                    //       subclass; IOException is checked. Both are caught.
+                    //   (c) We re-throw the original Throwable unchanged so the
+                    //       outer Phase B failure handling (awaitAllOrFirstFailure
+                    //       wrap + rollbackProvisionalArtefacts +
+                    //       recoverFromPhaseBFailure) runs exactly as before.
                     LOGGER.log(Level.SEVERE,
                             "checkpoint " + indexName + " Phase B: graph multipart"
                                     + " write FAILED for segUuid=" + segUuid
@@ -6758,18 +6801,19 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 try {
                     long mapSize = Files.size(mapFile);
                     uploadBytesTotal.addAndGet(mapSize);
-                    uploadingActive.incrementAndGet();
                     String mapFilePath;
                     // Issue #616: pre-track the map multipart file for the same reason
                     // as the graph upload above. See the matching comment there.
                     trackProvisionalMultipartFile(segUuid, "map");
+                    uploadingActive.incrementAndGet();
                     try {
                         mapFilePath = dataStorageManager.writeMultipartIndexFile(
                                 tableSpaceUUID,
                                 segUuid, "map",
                                 mapFile, uploadBytesDone::addAndGet);
-                    } catch (IOException | RuntimeException e) {
-                        // Issue #616: see the matching catch on the graph upload above.
+                    } catch (Throwable e) {
+                        // Issue #616: see the matching catch on the graph upload
+                        // above for why the catch is Throwable, not narrower.
                         LOGGER.log(Level.SEVERE,
                                 "checkpoint " + indexName + " Phase B: map multipart"
                                         + " write FAILED for segUuid=" + segUuid
@@ -7489,6 +7533,14 @@ public class PersistentVectorStore extends AbstractVectorStore {
      * Writes the graph and map data for one segment via the multipart API of
      * the underlying {@link herddb.storage.DataStorageManager}.
      */
+    // Issue #616 review item: writeOneSegmentData is reachable only through
+    // buildSegmentsInParallel, which currently has no in-tree caller — this is
+    // dormant Phase B code preserved for the parallel-slice rebuild path.
+    // The track-after-success pattern below mirrors the pre-#616 form of
+    // writeShardAsFusedPQSegment; if this method is re-enabled it MUST adopt
+    // the same pre-track + Throwable-catch layout as the patched live path
+    // (search for "Issue #616:" in writeShardAsFusedPQSegment) or partial
+    // multipart uploads will again leak into remote storage on Phase B failure.
     private SegmentWriteResult writeOneSegmentData(
             SegmentSlice s,
             ConcurrentHashMap<Integer, VectorFloat<?>> partVectors,
