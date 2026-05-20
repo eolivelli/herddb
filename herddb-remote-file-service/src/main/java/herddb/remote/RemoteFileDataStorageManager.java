@@ -33,7 +33,6 @@ import herddb.model.Record;
 import herddb.model.Table;
 import herddb.model.Transaction;
 import herddb.remote.storage.ObjectStorage;
-import herddb.remote.storage.ReadResult;
 import herddb.server.ServerConfiguration;
 import herddb.storage.DataPageDoesNotExistException;
 import herddb.storage.DataStorageManager;
@@ -46,8 +45,6 @@ import herddb.utils.ByteBufDataOutput;
 import herddb.utils.XXHash64Utils;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.PooledByteBufAllocator;
-import java.io.BufferedOutputStream;
-import java.io.FileOutputStream;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -1071,10 +1068,20 @@ public class RemoteFileDataStorageManager extends DataStorageManager
 
     /**
      * Downloads a multipart segment file directly from object storage to a local file,
-     * bypassing the file-server. Blocks are fetched sequentially (sufficient
-     * throughput for a single segment; parallelism across segments is handled by the
-     * caller). Each block is freed from the Netty pool immediately after being written
-     * to disk to keep peak heap / direct-memory usage bounded.
+     * bypassing the file-server. Blocks are fetched sequentially and written to
+     * {@code destFile} without materialising each block in a Netty {@link ByteBuf}:
+     * block 0 creates (or replaces) the destination file; each subsequent block is
+     * appended. Storage backends that override
+     * {@link ObjectStorage#downloadToFile(String, java.nio.file.Path, boolean)}
+     * (e.g. {@link herddb.remote.storage.S3ObjectStorage} via
+     * {@code AsyncResponseTransformer.toFile()}) avoid any intermediate heap or
+     * direct-memory copy entirely.
+     *
+     * <p>When {@code fileSize == 0} the loop runs zero iterations and the destination
+     * file is left untouched. Callers that require the file to exist (e.g. created
+     * as empty) should use {@code Files.createFile(destFile)} before calling this
+     * method. This matches the contract documented in
+     * {@link herddb.storage.DataStorageManager#downloadMultipartIndexFile}.
      *
      * <p>Only callable when {@link #supportsDirectMultipartDownload()} is {@code true}.
      */
@@ -1096,39 +1103,26 @@ public class RemoteFileDataStorageManager extends DataStorageManager
                 "downloadMultipartIndexFile: {0} fileSize={1} writeBlockSize={2} numBlocks={3}",
                 new Object[]{logicalPath, fileSize, writeBlockSize, numBlocks});
 
-        try (FileOutputStream fos = new FileOutputStream(destFile.toFile());
-             BufferedOutputStream bos = new BufferedOutputStream(fos, writeBlockSize)) {
-            for (int i = 0; i < numBlocks; i++) {
-                String blockPath = logicalPath + ObjectStorage.MULTIPART_SUFFIX + "/" + i;
-                ReadResult result;
-                try {
-                    result = storage.read(blockPath).get();
-                } catch (java.util.concurrent.ExecutionException e) {
-                    throw new IOException(
-                            "Failed to download block " + i + " of " + logicalPath, e.getCause());
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    throw new IOException(
-                            "Interrupted while downloading block " + i + " of " + logicalPath, e);
+        for (int i = 0; i < numBlocks; i++) {
+            String blockPath = logicalPath + ObjectStorage.MULTIPART_SUFFIX + "/" + i;
+            // Block 0: create / replace the destination file.
+            // Block 1+: append so the blocks form a single contiguous file.
+            boolean append = i > 0;
+            try {
+                storage.downloadToFile(blockPath, destFile, append).get();
+            } catch (java.util.concurrent.ExecutionException e) {
+                // Unwrap IOException so the caller sees the root I/O error directly
+                // rather than a double-nested IOException(cause=IOException).
+                Throwable cause = e.getCause();
+                if (cause instanceof IOException) {
+                    throw (IOException) cause;
                 }
-                if (result.status() != ReadResult.Status.FOUND) {
-                    throw new IOException(
-                            "Block " + i + " of " + logicalPath + " not found in object storage");
-                }
-                ByteBuf buf = result.byteBuf();
-                try {
-                    int readable = buf.readableBytes();
-                    // Avoid allocating a separate byte[] when the buffer has a backing array.
-                    if (buf.hasArray()) {
-                        bos.write(buf.array(), buf.arrayOffset() + buf.readerIndex(), readable);
-                    } else {
-                        byte[] tmp = new byte[readable];
-                        buf.readBytes(tmp);
-                        bos.write(tmp);
-                    }
-                } finally {
-                    result.release();
-                }
+                throw new IOException(
+                        "Failed to download block " + i + " of " + logicalPath, cause);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException(
+                        "Interrupted while downloading block " + i + " of " + logicalPath, e);
             }
         }
     }

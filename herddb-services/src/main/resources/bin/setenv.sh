@@ -42,6 +42,17 @@
 #     be introduced. With a SecurityManager the JDK default is -1 (cache
 #     forever), which would prevent pod-failover recovery without a JVM restart.
 JVECTOR_JAVA_OPTS="--add-modules jdk.incubator.vector -XX:CompileCommandFile=conf/jvector-compiler-directives -Dnetworkaddress.cache.negative.ttl=0 -Dnetworkaddress.cache.ttl=30"
+# AWS CRT native-memory tracing (issue #612).
+# Level 1 enables CRT.nativeMemory() to return the live native-memory footprint
+# consumed by AwsCrtAsyncHttpClient I/O buffers — essential for the Prometheus
+# metric added in this issue.  Overhead at level 1 is negligible (a single
+# per-allocation counter increment; no stack-trace unwinding).
+# Override by exporting this variable before starting the service, e.g.:
+#   export AWS_CRT_MEMORY_TRACING_OPTS=""                           # disable (empty string)
+#   export AWS_CRT_MEMORY_TRACING_OPTS="-Daws.crt.memory.tracing=2" # verbose
+# Note: uses ${VAR-default} (without colon) so an empty-string export disables
+# tracing, while a completely unset VAR still picks up the level-1 default.
+AWS_CRT_MEMORY_TRACING_OPTS="${AWS_CRT_MEMORY_TRACING_OPTS--Daws.crt.memory.tracing=1}"
 # JAVA_OPTS / JDK_JAVA_OPTIONS: when set by the caller, REPLACE the defaults.
 # JAVA_OPTS_EXTRA / JDK_JAVA_OPTIONS_EXTRA: appended to the final value, so
 # deployments (e.g. the Helm chart's server.javaOptsExtra) can ADD flags
@@ -64,7 +75,7 @@ JVECTOR_JAVA_OPTS="--add-modules jdk.incubator.vector -XX:CompileCommandFile=con
 # until we upgrade to Netty 4.1.122+ (where the default was reverted) or 4.2.x
 # (FFM-based and Unsafe-free).
 JDK_JAVA_OPTIONS="${JDK_JAVA_OPTIONS:---add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.io=ALL-UNNAMED --add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.rmi/sun.rmi.transport=ALL-UNNAMED --enable-native-access=ALL-UNNAMED --sun-misc-unsafe-memory-access=allow -Dio.netty.tryReflectionSetAccessible=true} ${JDK_JAVA_OPTIONS_EXTRA:-}"
-JAVA_OPTS="${JAVA_OPTS:--XX:+UseG1GC -Duser.language=en -Xmx4g -Xms4g -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=1g -Dio.netty.maxDirectMemory=0 -XX:+DisableExplicitGC -Djava.awt.headless=true -Djava.util.logging.config.file=conf/logging.properties} $JVECTOR_JAVA_OPTS ${JAVA_OPTS_EXTRA:-}"
+JAVA_OPTS="${JAVA_OPTS:--XX:+UseG1GC -Duser.language=en -Xmx4g -Xms4g -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=1g -Dio.netty.maxDirectMemory=0 -XX:+DisableExplicitGC -Djava.awt.headless=true -Djava.util.logging.config.file=conf/logging.properties} $JVECTOR_JAVA_OPTS $AWS_CRT_MEMORY_TRACING_OPTS ${JAVA_OPTS_EXTRA:-}"
 # Export so the settings reach child java processes started by launcher
 # scripts that rely on the JDK picking JDK_JAVA_OPTIONS up automatically
 # (e.g. indexing-admin.sh, herddb-cli.sh, vector-bench.sh, bookkeeper).

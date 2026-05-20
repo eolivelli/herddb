@@ -23,6 +23,7 @@ package herddb.remote.storage;
 import edu.umd.cs.findbugs.annotations.Nullable;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.PooledByteBufAllocator;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -34,6 +35,7 @@ import java.util.stream.Collectors;
 import org.apache.bookkeeper.stats.Counter;
 import org.apache.bookkeeper.stats.OpStatsLogger;
 import org.apache.bookkeeper.stats.StatsLogger;
+import software.amazon.awssdk.core.FileTransformerConfiguration;
 import software.amazon.awssdk.core.async.AsyncRequestBody;
 import software.amazon.awssdk.core.async.AsyncResponseTransformer;
 import software.amazon.awssdk.services.s3.S3AsyncClient;
@@ -133,6 +135,30 @@ public class S3ObjectStorage implements ObjectStorage {
                     }
                     throw new RuntimeException(cause);
                 });
+    }
+
+    /**
+     * Streams the S3 object at {@code path} directly to a local file using
+     * {@code AsyncResponseTransformer.toFile()}, avoiding the three-copy pattern
+     * (CRT native buffer → byte[] → Netty ByteBuf) of the default
+     * {@link #read(String)}-based fallback.
+     *
+     * <p>Block 0 of a multipart download uses {@code append=false}
+     * ({@link FileTransformerConfiguration#defaultCreateOrReplaceExisting()}); subsequent
+     * blocks use {@code append=true}
+     * ({@link FileTransformerConfiguration#defaultCreateOrAppend()}).
+     */
+    @Override
+    public CompletableFuture<Void> downloadToFile(String path, Path dest, boolean append) {
+        GetObjectRequest request = GetObjectRequest.builder()
+                .bucket(bucket)
+                .key(toKey(path))
+                .build();
+        FileTransformerConfiguration fileConfig = append
+                ? FileTransformerConfiguration.defaultCreateOrAppend()
+                : FileTransformerConfiguration.defaultCreateOrReplaceExisting();
+        return client.getObject(request, AsyncResponseTransformer.toFile(dest, fileConfig))
+                .thenApply(resp -> (Void) null);
     }
 
     @Override

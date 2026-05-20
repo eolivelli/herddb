@@ -463,6 +463,9 @@ public final class OptimizerConfiguration {
             "indexoptimizer.provisional.gc.ms";
     public static final long PROPERTY_PROVISIONAL_GC_MS_DEFAULT = 600_000L;
 
+    // CRT HTTP-client tuning — shared keys and defaults live in CrtS3HttpClientFactory.
+    // All services use the same property name: s3.crt.max.concurrency / s3.crt.read.buffer.size
+
     private final Properties properties;
 
     public OptimizerConfiguration(Properties properties) {

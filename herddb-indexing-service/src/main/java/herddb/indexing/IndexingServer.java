@@ -34,6 +34,7 @@ import herddb.metadata.IndexingServiceInstanceDescriptor;
 import herddb.metadata.MetadataStorageManager;
 import herddb.metadata.ServiceDiscoveryListener;
 import herddb.remote.RemoteFileDataStorageManager;
+import herddb.remote.storage.CrtS3HttpClientFactory;
 import herddb.remote.storage.ObjectStorage;
 import herddb.remote.storage.S3ObjectStorage;
 import herddb.server.RemoteFileClient;
@@ -58,6 +59,7 @@ import java.util.logging.Logger;
 import javax.servlet.http.HttpServlet;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
+import org.apache.bookkeeper.stats.Gauge;
 import org.apache.bookkeeper.stats.StatsLogger;
 import org.apache.bookkeeper.stats.prometheus.PrometheusMetricsProvider;
 import org.apache.bookkeeper.stats.prometheus.PrometheusServlet;
@@ -69,7 +71,7 @@ import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.core.checksums.RequestChecksumCalculation;
 import software.amazon.awssdk.core.checksums.ResponseChecksumValidation;
-import software.amazon.awssdk.http.crt.AwsCrtAsyncHttpClient;
+import software.amazon.awssdk.crt.CRT;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.s3.S3AsyncClient;
 import software.amazon.awssdk.services.s3.S3AsyncClientBuilder;
@@ -364,6 +366,19 @@ public class IndexingServer implements AutoCloseable {
         // Register Netty direct-memory gauges so the JVM dashboard can show
         // pool-arena footprint for this service (issue #503).
         NettyMemoryMetrics.register(statsLogger);
+        // CRT native-memory gauge (issue #612).
+        // Requires -Daws.crt.memory.tracing=1, which setenv.sh sets by default.
+        statsLogger.scope("s3").registerGauge("crt_native_memory_bytes", new Gauge<Long>() {
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+
+            @Override
+            public Long getSample() {
+                return CRT.nativeMemory();
+            }
+        });
 
         engine.setStatsLogger(statsLogger);
         this.serviceImpl = new IndexingServiceImpl(engine, statsLogger);
@@ -490,11 +505,17 @@ public class IndexingServer implements AutoCloseable {
                             + IndexingServerConfiguration.PROPERTY_S3_DIRECT_ENABLED + "=true");
         }
 
+        int crtMaxConcurrency = config.getInt(
+                CrtS3HttpClientFactory.PROPERTY_CRT_MAX_CONCURRENCY,
+                CrtS3HttpClientFactory.PROPERTY_CRT_MAX_CONCURRENCY_DEFAULT);
+        long crtReadBufferSize = config.getLong(
+                CrtS3HttpClientFactory.PROPERTY_CRT_READ_BUFFER_SIZE,
+                CrtS3HttpClientFactory.PROPERTY_CRT_READ_BUFFER_SIZE_DEFAULT);
         S3AsyncClientBuilder clientBuilder = S3AsyncClient.builder()
                 .region(Region.of(region))
                 .credentialsProvider(StaticCredentialsProvider.create(
                         AwsBasicCredentials.create(accessKey, secretKey)))
-                .httpClientBuilder(AwsCrtAsyncHttpClient.builder());
+                .httpClientBuilder(CrtS3HttpClientFactory.builder(crtMaxConcurrency, crtReadBufferSize));
 
         if (gcsCompatibility) {
             LOGGER.log(Level.INFO,

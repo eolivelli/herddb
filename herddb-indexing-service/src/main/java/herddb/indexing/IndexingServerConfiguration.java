@@ -559,6 +559,9 @@ public final class IndexingServerConfiguration {
     public static final String PROPERTY_S3_GCS_COMPATIBILITY = "indexing.s3.gcs.compatibility";
     public static final boolean PROPERTY_S3_GCS_COMPATIBILITY_DEFAULT = false;
 
+    // CRT HTTP-client tuning — shared keys and defaults live in CrtS3HttpClientFactory.
+    // All services use the same property name: s3.crt.max.concurrency / s3.crt.read.buffer.size
+
     // Storage
     public static final String PROPERTY_STORAGE_TYPE = "indexing.storage.type";
     public static final String PROPERTY_STORAGE_TYPE_DEFAULT = "file";

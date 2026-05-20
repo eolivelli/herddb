@@ -25,6 +25,7 @@ import herddb.metadata.MetadataStorageManagerException;
 import herddb.metadata.ServiceDiscoveryListener;
 import herddb.model.TableSpace;
 import herddb.remote.RemoteFileDataStorageManager;
+import herddb.remote.storage.CrtS3HttpClientFactory;
 import herddb.remote.storage.ObjectStorage;
 import herddb.remote.storage.S3ObjectStorage;
 import herddb.server.RemoteFileClient;
@@ -63,7 +64,6 @@ import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.core.checksums.RequestChecksumCalculation;
 import software.amazon.awssdk.core.checksums.ResponseChecksumValidation;
-import software.amazon.awssdk.http.crt.AwsCrtAsyncHttpClient;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.s3.S3AsyncClient;
 import software.amazon.awssdk.services.s3.S3AsyncClientBuilder;
@@ -1358,13 +1358,17 @@ public final class IndexOptimizerMain {
         boolean gcsCompatibility = configuration.getBoolean(
                 OptimizerConfiguration.PROPERTY_S3_GCS_COMPATIBILITY,
                 OptimizerConfiguration.PROPERTY_S3_GCS_COMPATIBILITY_DEFAULT);
-
+        int crtMaxConcurrency = configuration.getInt(
+                CrtS3HttpClientFactory.PROPERTY_CRT_MAX_CONCURRENCY,
+                CrtS3HttpClientFactory.PROPERTY_CRT_MAX_CONCURRENCY_DEFAULT);
+        long crtReadBufferSize = configuration.getLong(
+                CrtS3HttpClientFactory.PROPERTY_CRT_READ_BUFFER_SIZE,
+                CrtS3HttpClientFactory.PROPERTY_CRT_READ_BUFFER_SIZE_DEFAULT);
         S3AsyncClientBuilder clientBuilder = S3AsyncClient.builder()
                 .region(Region.of(region))
                 .credentialsProvider(StaticCredentialsProvider.create(
                         AwsBasicCredentials.create(accessKey, secretKey)))
-                .httpClientBuilder(AwsCrtAsyncHttpClient.builder());
-
+                .httpClientBuilder(CrtS3HttpClientFactory.builder(crtMaxConcurrency, crtReadBufferSize));
         if (gcsCompatibility) {
             LOGGER.log(Level.INFO,
                     "Direct S3 client (GCS compatibility): path-style addressing, "
