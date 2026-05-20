@@ -1481,7 +1481,16 @@ final class VectorIndexCompactor {
             for (ReaderSupplier rs : openedReaderSuppliers) {
                 try {
                     rs.close();
-                } catch (IOException | RuntimeException e) {
+                } catch (IOException | RuntimeException | Error e) {
+                    // Issue #621 review item: include Error here too. This
+                    // outermost finally runs AFTER the inner mergedSegment.close()
+                    // finally for both success and failure paths. On the failure
+                    // path, an Error from a downloaded source-graph supplier's
+                    // close() (e.g. memory-mapped Arena cleanup) would suppress
+                    // an in-flight CompactionException carrying the orphan list
+                    // — the same close-suppression pattern the inner finallys
+                    // address. Log + swallow; the rest of the finally must still
+                    // run (more reader suppliers + temp-file deletes below).
                     LOGGER.log(Level.FINE,
                             "ignoring source reader-supplier close in streaming compaction", e);
                 }
