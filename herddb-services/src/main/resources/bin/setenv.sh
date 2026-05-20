@@ -48,9 +48,11 @@ JVECTOR_JAVA_OPTS="--add-modules jdk.incubator.vector -XX:CompileCommandFile=con
 # metric added in this issue.  Overhead at level 1 is negligible (a single
 # per-allocation counter increment; no stack-trace unwinding).
 # Override by exporting this variable before starting the service, e.g.:
-#   export AWS_CRT_MEMORY_TRACING_OPTS=""                           # disable
+#   export AWS_CRT_MEMORY_TRACING_OPTS=""                           # disable (empty string)
 #   export AWS_CRT_MEMORY_TRACING_OPTS="-Daws.crt.memory.tracing=2" # verbose
-AWS_CRT_MEMORY_TRACING_OPTS="${AWS_CRT_MEMORY_TRACING_OPTS:--Daws.crt.memory.tracing=1}"
+# Note: uses ${VAR-default} (without colon) so an empty-string export disables
+# tracing, while a completely unset VAR still picks up the level-1 default.
+AWS_CRT_MEMORY_TRACING_OPTS="${AWS_CRT_MEMORY_TRACING_OPTS--Daws.crt.memory.tracing=1}"
 # JAVA_OPTS / JDK_JAVA_OPTIONS: when set by the caller, REPLACE the defaults.
 # JAVA_OPTS_EXTRA / JDK_JAVA_OPTIONS_EXTRA: appended to the final value, so
 # deployments (e.g. the Helm chart's server.javaOptsExtra) can ADD flags

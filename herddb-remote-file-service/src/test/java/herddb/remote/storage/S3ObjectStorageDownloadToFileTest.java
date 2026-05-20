@@ -22,11 +22,13 @@ package herddb.remote.storage;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 import java.lang.reflect.Proxy;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
@@ -35,6 +37,7 @@ import software.amazon.awssdk.core.async.AsyncResponseTransformer;
 import software.amazon.awssdk.services.s3.S3AsyncClient;
 import software.amazon.awssdk.services.s3.model.GetObjectRequest;
 import software.amazon.awssdk.services.s3.model.GetObjectResponse;
+import software.amazon.awssdk.services.s3.model.NoSuchKeyException;
 
 /**
  * Unit tests for {@link S3ObjectStorage#downloadToFile(String, Path, boolean)}.
@@ -118,6 +121,39 @@ public class S3ObjectStorageDownloadToFileTest {
         assertArrayEquals("stale content must be replaced by block 0", BLOCK_0, written);
     }
 
+    /**
+     * A mid-stream S3 error (e.g. {@code NoSuchKeyException}) must complete the
+     * returned future exceptionally. When the error occurs with {@code append=true},
+     * any pre-existing content in the destination file must remain intact (the SDK's
+     * {@code FileTransformerConfiguration.defaultCreateOrAppend()} uses
+     * {@code FailureBehavior.LEAVE}, so the partial-append behaviour is
+     * backend-determined; at minimum the file must not be deleted).
+     */
+    @Test
+    public void downloadToFilePropagatesS3Failure() throws Exception {
+        byte[] existing = {77, 88, 99};
+        Path dest = folder.newFile("existing.bin").toPath();
+        Files.write(dest, existing);
+
+        S3AsyncClient failingClient = failingProxyClient(
+                NoSuchKeyException.builder().message("simulated not found").build());
+        S3ObjectStorage storage = new S3ObjectStorage(failingClient, "bucket", "prefix/");
+
+        CompletableFuture<Void> future = storage.downloadToFile(
+                "segment/graph.multipart/1", dest, true);
+
+        ExecutionException ex = null;
+        try {
+            future.get();
+        } catch (ExecutionException e) {
+            ex = e;
+        }
+
+        assertTrue("future must complete exceptionally on S3 failure", ex != null);
+        // The existing file must not be deleted.
+        assertTrue("destination file must still exist after S3 error", Files.exists(dest));
+    }
+
     // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------
@@ -155,6 +191,36 @@ public class S3ObjectStorageDownloadToFileTest {
                                 }
                             });
                         });
+                        return future;
+                    }
+                    if ("close".equals(method.getName())) {
+                        return null;
+                    }
+                    throw new UnsupportedOperationException(
+                            "fake S3 client does not implement " + method.getName());
+                });
+    }
+
+    /**
+     * Returns a reflective {@link S3AsyncClient} proxy whose {@code getObject}
+     * method signals a failure via {@link AsyncResponseTransformer#exceptionOccurred(Throwable)},
+     * simulating a mid-stream S3 error such as {@link NoSuchKeyException}.
+     */
+    @SuppressWarnings("unchecked")
+    private static S3AsyncClient failingProxyClient(Throwable error) {
+        return (S3AsyncClient) Proxy.newProxyInstance(
+                S3AsyncClient.class.getClassLoader(),
+                new Class<?>[]{S3AsyncClient.class},
+                (proxy, method, args) -> {
+                    if ("getObject".equals(method.getName()) && args != null && args.length == 2
+                            && args[0] instanceof GetObjectRequest
+                            && args[1] instanceof AsyncResponseTransformer) {
+                        AsyncResponseTransformer<GetObjectResponse, ?> transformer =
+                                (AsyncResponseTransformer<GetObjectResponse, ?>) args[1];
+                        CompletableFuture<Object> future =
+                                (CompletableFuture<Object>) transformer.prepare();
+                        // Signal error before any data arrives — simulates NoSuchKey.
+                        transformer.exceptionOccurred(error);
                         return future;
                     }
                     if ("close".equals(method.getName())) {

@@ -22,6 +22,7 @@ package herddb.remote.storage;
 
 import io.netty.buffer.ByteBuf;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Path;
@@ -109,6 +110,12 @@ public interface ObjectStorage extends AutoCloseable {
      */
     default CompletableFuture<Void> downloadToFile(String path, Path dest, boolean append) {
         return read(path).thenApply(result -> {
+            // Guard: do NOT open or truncate the destination file when the object is absent.
+            // Checking status before opening preserves dest integrity on NOT_FOUND.
+            if (result.status() == ReadResult.Status.NOT_FOUND) {
+                throw new UncheckedIOException(
+                        new IOException("object not found: " + path));
+            }
             ByteBuf buf = result.byteBuf();
             try {
                 StandardOpenOption[] opts = append
@@ -128,7 +135,7 @@ public interface ObjectStorage extends AutoCloseable {
                         ch.write(nioBuf);
                     }
                 } catch (IOException e) {
-                    throw new RuntimeException(e);
+                    throw new UncheckedIOException(e);
                 }
             } finally {
                 result.release();

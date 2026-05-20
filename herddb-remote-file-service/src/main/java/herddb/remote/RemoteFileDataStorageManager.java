@@ -1077,6 +1077,12 @@ public class RemoteFileDataStorageManager extends DataStorageManager
      * {@code AsyncResponseTransformer.toFile()}) avoid any intermediate heap or
      * direct-memory copy entirely.
      *
+     * <p>When {@code fileSize == 0} the loop runs zero iterations and the destination
+     * file is left untouched. Callers that require the file to exist (e.g. created
+     * as empty) should use {@code Files.createFile(destFile)} before calling this
+     * method. This matches the contract documented in
+     * {@link herddb.storage.DataStorageManager#downloadMultipartIndexFile}.
+     *
      * <p>Only callable when {@link #supportsDirectMultipartDownload()} is {@code true}.
      */
     @Override
@@ -1105,8 +1111,14 @@ public class RemoteFileDataStorageManager extends DataStorageManager
             try {
                 storage.downloadToFile(blockPath, destFile, append).get();
             } catch (java.util.concurrent.ExecutionException e) {
+                // Unwrap IOException so the caller sees the root I/O error directly
+                // rather than a double-nested IOException(cause=IOException).
+                Throwable cause = e.getCause();
+                if (cause instanceof IOException) {
+                    throw (IOException) cause;
+                }
                 throw new IOException(
-                        "Failed to download block " + i + " of " + logicalPath, e.getCause());
+                        "Failed to download block " + i + " of " + logicalPath, cause);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 throw new IOException(
