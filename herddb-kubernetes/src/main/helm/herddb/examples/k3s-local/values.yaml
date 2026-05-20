@@ -147,7 +147,10 @@ fileServer:
   # -Dio.netty.maxDirectMemory=3221225472 (= MaxDirectMemorySize=3g in bytes):
   # Netty uses Unsafe.allocateMemory bypassing JVM Bits.reserveMemory, preventing
   # phantom-reference GC delays from exhausting the direct-memory counter (issue #253).
-  # With -Xmx2g: heap (2 g) + direct (3 g) + JVM overhead ≈ 1 g → 6 GiB container.
+  # With -Xmx2g: heap (2 g) + direct (3 g) + CRT native (4×1g max, issue #612) +
+  # JVM overhead ≈ 1 g → 10 GiB worst-case container RSS → 6 GiB container is tight.
+  # The file server does not run direct-S3 downloads so its CRT client is idle in
+  # the gRPC-push bench; effective CRT footprint ≈ 0 in this configuration.
   # Previously -Xmx4g with no MaxDirectMemorySize cap caused OOMKill when the IS
   # loaded 100+ HNSW segments concurrently (heap 4 g + direct up to 4 g > 5 GiB
   # limit; see issue #126).
@@ -168,6 +171,14 @@ fileServer:
     # explicit for parity with examples/gke/values.yaml and so the rendered
     # fileserver.properties clearly shows s3.gcs.compatibility=true.
     gcsCompatibility: true
+    # CRT HTTP-client concurrency cap (issue #612). Native memory budget:
+    # crtMaxConcurrency × crtReadBufferSize = 4 × 1 GiB = 4 GiB worst-case.
+    # The file server uses the CRT client for MinIO writes (segment uploads
+    # during Phase B). In gRPC-push mode the file server receives write
+    # requests from the IS and uploads them to MinIO; at 4 concurrent
+    # connections peak CRT native memory is bounded to 4 GiB.
+    crtMaxConcurrency: 4
+    crtReadBufferSize: 1073741824  # 1 GiB
   storage:
     # 200 GiB: sized to hold the full bigann 10M segment data in the local
     # disk cache without any MinIO fallback on warm queries.
@@ -317,11 +328,12 @@ indexingService:
   # the JVM will throw OutOfMemoryError before the container hits the 26 GiB limit,
   # giving GC a chance to recover rather than being killed immediately.
   #
-  # Container RSS budget at -Xmx5g:
+  # Container RSS budget at -Xmx5g (after issue #612 CRT cap):
   #   JVM heap:            5 GiB
   #   Netty direct:        8 GiB (Dio.netty.maxDirectMemory=8589934592)
   #   JVM overhead:        1 GiB (metaspace, code cache, thread stacks)
-  #   tmpfs/compaction:   12 GiB headroom (was ~10 GiB at -Xmx7g)
+  #   CRT native (issue #612): 4 GiB max (4 connections × 1 GiB read buffer)
+  #   tmpfs/compaction:    8 GiB headroom (reduced from 12 GiB; CRT now accounted)
   #   Total peak:         26 GiB → matches container limit
   #
   # Netty direct budget (unchanged):
@@ -415,6 +427,24 @@ indexingService:
     # (issue #592). Fix merged in PR #594 — the override is no longer needed and is
     # reverted here for Run 9. With accurate 16 B/vector accounting, 50M × 16 B = 800 MB
     # is well within the 33% × 8 GiB = 2.64 GiB limit.
+  # Direct S3 access: IS downloads segment files from MinIO directly,
+  # bypassing the file-server gRPC layer during index recovery (issue #381).
+  # Endpoint and bucket auto-mirror fileServer.s3 / minio settings.
+  # Credentials use the default MinIO minioadmin/minioadmin — acceptable for
+  # local benchmark use; replace with a credentialsSecret for production.
+  s3:
+    directEnabled: true
+    endpoint: "http://herddb-minio:9000"
+    bucket: "herddb-pages"
+    gcsCompatibility: true          # MinIO requires path-style (same as file server)
+    credentialsSecret: "herddb-minio-credentials"  # created by install.sh pre-step
+    # CRT HTTP-client concurrency cap (issue #612). Native memory budget:
+    # crtMaxConcurrency × crtReadBufferSize = 4 × 1 GiB = 4 GiB worst-case.
+    # The IS uses direct-S3 for segment-map downloads during compaction and
+    # index recovery. With 4 connections the CRT native footprint is bounded
+    # and now accounted for in the 26 GiB container budget above.
+    crtMaxConcurrency: 4
+    crtReadBufferSize: 1073741824  # 1 GiB
   resources:
     requests:
       memory: "26Gi"

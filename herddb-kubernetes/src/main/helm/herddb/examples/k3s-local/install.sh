@@ -157,6 +157,16 @@ if [[ -n "$DATASETS_DIR" ]]; then
     HELM_EXTRA_ARGS=(--set "tools.storage.datasets.hostPath=/datasets")
 fi
 
+# ── 5a. Pre-create MinIO credentials secret for IS direct S3 access ──
+# When indexingService.s3.directEnabled=true the IS reads S3_ACCESS_KEY and
+# S3_SECRET_KEY from the 'herddb-minio-credentials' Secret. Create/update it
+# here (idempotent) using the MinIO defaults wired in values.yaml.
+echo "==> Ensuring herddb-minio-credentials secret..."
+kubectl create secret generic herddb-minio-credentials \
+    --from-literal=S3_ACCESS_KEY=minioadmin \
+    --from-literal=S3_SECRET_KEY=minioadmin \
+    --dry-run=client -o yaml | kubectl apply -f -
+
 if helm status herddb >/dev/null 2>&1; then
     echo "==> Helm release 'herddb' already exists, upgrading..."
     helm upgrade herddb "$CHART_DIR" -f "$SCRIPT_DIR/values.yaml" "${HELM_EXTRA_ARGS[@]}"
