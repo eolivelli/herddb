@@ -3361,10 +3361,28 @@ public class PersistentVectorStore extends AbstractVectorStore {
             for (VectorSegment in : inputs) {
                 try {
                     in.close();
-                } catch (RuntimeException e) {
+                } catch (RuntimeException | Error e) {
                     // Narrow catch would be ideal but seg.close() can
                     // surface BLink close failures and we must not let
                     // the swap fail afterwards.
+                    //
+                    // Issue #621 review item: include Error too. This loop
+                    // runs AFTER the volatile publish at the top of Stage 3
+                    // (this.segments = new CopyOnWriteArrayList<>(...)) — at
+                    // this point the merged segment is LIVE. If an Error
+                    // (e.g. Netty OOM from a BLink page release, OOM from an
+                    // OnDiskGraph mmap Arena cleanup hook) escaped this catch
+                    // it would propagate back into the caller's catch (Error)
+                    // arm at runCompactionCycle, which only flips its
+                    // `published` flag AFTER atomicSwapCompactionResult
+                    // returns. With published == false the caller would drain
+                    // rebuild.orphanPaths — which back the now-LIVE merged
+                    // segment — into pendingDeletes, scheduling the live
+                    // segment's files for retention deletion. Same
+                    // silent-data-loss shape that #621 set out to close.
+                    // Swallowing here matches the existing RuntimeException
+                    // semantics: log and continue; the next close() in the
+                    // loop still runs.
                     LOGGER.log(Level.FINE,
                             "vector store " + indexName
                                     + ": ignoring close failure for compacted input segment",
@@ -3487,8 +3505,30 @@ public class PersistentVectorStore extends AbstractVectorStore {
         }
 
         if (inputsSafeToDelete) {
-            for (VectorSegment in : inputs) {
-                queueSegmentPendingDelete(in, vectorIndexCompactionRetentionMs);
+            try {
+                for (VectorSegment in : inputs) {
+                    queueSegmentPendingDelete(in, vectorIndexCompactionRetentionMs);
+                }
+            } catch (RuntimeException | Error e) {
+                // Issue #621 review item: this loop runs AFTER the publish
+                // (Stage 3) and AFTER the post-publish ZK coordination above.
+                // queueSegmentPendingDelete does small allocations
+                // (new PendingDelete + pendingDeletes.add), but in principle an
+                // OOM here would escape atomicSwapCompactionResult into the
+                // caller's catch (Error) arm — which has not yet flipped
+                // `published = true` (that happens upon successful return).
+                // The caller would then drain rebuild.orphanPaths, scheduling
+                // the LIVE merged segment's files for retention deletion —
+                // silent data loss. Swallow the failure: the input segments
+                // stay in MinIO as orphans-but-intact (no zombie). The
+                // optimizer's orphan-ACTIVE fold path or a manual reaper
+                // reclaims them on the next pass.
+                LOGGER.log(Level.WARNING,
+                        "vector store {0}: failed to queue all {1} compacted-input"
+                                + " segments for retention-aware deletion;"
+                                + " input files stay in MinIO until the next"
+                                + " optimizer fold or reaper pass: {2}",
+                        new Object[]{indexName, inputs.size(), e.getMessage()});
             }
         }
     }
