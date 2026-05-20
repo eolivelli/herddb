@@ -20,6 +20,12 @@
 
 package herddb.remote.storage;
 
+import io.netty.buffer.ByteBuf;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 
@@ -76,6 +82,60 @@ public interface ObjectStorage extends AutoCloseable {
     CompletableFuture<List<String>> list(String prefix);
 
     CompletableFuture<Integer> deleteByPrefix(String prefix);
+
+    /**
+     * Downloads the object at {@code path} and writes its content directly to
+     * a local file, without materialising the full object in JVM heap or Netty
+     * direct memory.
+     *
+     * <p>When {@code append} is {@code false} the destination file is created
+     * (or replaced if it already exists). When {@code append} is {@code true}
+     * the content is appended to the existing file (or the file is created if
+     * absent). This lets callers reconstruct a multipart logical file by
+     * downloading block 0 with {@code append=false} and all subsequent blocks
+     * with {@code append=true}.
+     *
+     * <p>The default implementation falls back to {@link #read(String)} and
+     * copies the returned {@link ByteBuf} via a {@link FileChannel}. Override
+     * in storage backends that can stream natively (e.g.
+     * {@link S3ObjectStorage} uses {@code AsyncResponseTransformer.toFile()}).
+     *
+     * @param path   object path (same key space as {@link #read(String)})
+     * @param dest   destination file path
+     * @param append when {@code true} content is appended; when {@code false}
+     *               the file is created or replaced
+     * @return a future that completes when the write is done; completes
+     *         exceptionally if the object does not exist or an I/O error occurs
+     */
+    default CompletableFuture<Void> downloadToFile(String path, Path dest, boolean append) {
+        return read(path).thenApply(result -> {
+            ByteBuf buf = result.byteBuf();
+            try {
+                StandardOpenOption[] opts = append
+                        ? new StandardOpenOption[]{
+                                StandardOpenOption.WRITE,
+                                StandardOpenOption.CREATE,
+                                StandardOpenOption.APPEND}
+                        : new StandardOpenOption[]{
+                                StandardOpenOption.WRITE,
+                                StandardOpenOption.CREATE,
+                                StandardOpenOption.TRUNCATE_EXISTING};
+                try (FileChannel ch = FileChannel.open(dest, opts)) {
+                    // nioBuffer() returns a ByteBuffer view without heap copying
+                    // for both direct and array-backed Netty buffers.
+                    ByteBuffer nioBuf = buf.nioBuffer(buf.readerIndex(), buf.readableBytes());
+                    while (nioBuf.hasRemaining()) {
+                        ch.write(nioBuf);
+                    }
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
+            } finally {
+                result.release();
+            }
+            return (Void) null;
+        });
+    }
 
     @Override
     void close() throws Exception;

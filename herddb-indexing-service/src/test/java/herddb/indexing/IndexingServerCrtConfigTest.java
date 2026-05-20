@@ -1,0 +1,82 @@
+/*
+ Licensed to Diennea S.r.l. under one
+ or more contributor license agreements. See the NOTICE file
+ distributed with this work for additional information
+ regarding copyright ownership. Diennea S.r.l. licenses this file
+ to you under the Apache License, Version 2.0 (the
+ "License"); you may not use this file except in compliance
+ with the License.  You may obtain a copy of the License at
+
+ http://www.apache.org/licenses/LICENSE-2.0
+
+ Unless required by applicable law or agreed to in writing,
+ software distributed under the License is distributed on an
+ "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ KIND, either express or implied.  See the License for the
+ specific language governing permissions and limitations
+ under the License.
+
+ */
+
+package herddb.indexing;
+
+import static org.junit.Assert.assertEquals;
+import org.junit.Test;
+
+/**
+ * Verifies that the CRT HTTP-client configuration constants introduced by
+ * issue #612 are declared in {@link IndexingServerConfiguration} with the
+ * correct property keys and default values, and that overrides are correctly
+ * returned by the configuration accessors.
+ */
+public class IndexingServerCrtConfigTest {
+
+    @Test
+    public void crtMaxConcurrencyDefaultIsFour() {
+        assertEquals(4, IndexingServerConfiguration.PROPERTY_S3_CRT_MAX_CONCURRENCY_DEFAULT);
+    }
+
+    @Test
+    public void crtReadBufferSizeDefaultIsOneGiB() {
+        assertEquals(1024L * 1024 * 1024,
+                IndexingServerConfiguration.PROPERTY_S3_CRT_READ_BUFFER_SIZE_DEFAULT);
+    }
+
+    @Test
+    public void crtMaxConcurrencyPropertyKeyIsCorrect() {
+        assertEquals("indexing.s3.crt.max.concurrency",
+                IndexingServerConfiguration.PROPERTY_S3_CRT_MAX_CONCURRENCY);
+    }
+
+    @Test
+    public void crtReadBufferSizePropertyKeyIsCorrect() {
+        assertEquals("indexing.s3.crt.read.buffer.size",
+                IndexingServerConfiguration.PROPERTY_S3_CRT_READ_BUFFER_SIZE);
+    }
+
+    @Test
+    public void defaultsAreReturnedWhenPropertiesAreAbsent() {
+        IndexingServerConfiguration cfg = new IndexingServerConfiguration();
+        assertEquals(IndexingServerConfiguration.PROPERTY_S3_CRT_MAX_CONCURRENCY_DEFAULT,
+                cfg.getInt(IndexingServerConfiguration.PROPERTY_S3_CRT_MAX_CONCURRENCY,
+                        IndexingServerConfiguration.PROPERTY_S3_CRT_MAX_CONCURRENCY_DEFAULT));
+        assertEquals(IndexingServerConfiguration.PROPERTY_S3_CRT_READ_BUFFER_SIZE_DEFAULT,
+                cfg.getLong(IndexingServerConfiguration.PROPERTY_S3_CRT_READ_BUFFER_SIZE,
+                        IndexingServerConfiguration.PROPERTY_S3_CRT_READ_BUFFER_SIZE_DEFAULT));
+    }
+
+    @Test
+    public void overridesAreHonouredByConfigurationAccessors() {
+        IndexingServerConfiguration cfg = new IndexingServerConfiguration()
+                .set(IndexingServerConfiguration.PROPERTY_S3_CRT_MAX_CONCURRENCY, 2)
+                .set(IndexingServerConfiguration.PROPERTY_S3_CRT_READ_BUFFER_SIZE,
+                        512L * 1024 * 1024);
+
+        assertEquals(2,
+                cfg.getInt(IndexingServerConfiguration.PROPERTY_S3_CRT_MAX_CONCURRENCY,
+                        IndexingServerConfiguration.PROPERTY_S3_CRT_MAX_CONCURRENCY_DEFAULT));
+        assertEquals(512L * 1024 * 1024,
+                cfg.getLong(IndexingServerConfiguration.PROPERTY_S3_CRT_READ_BUFFER_SIZE,
+                        IndexingServerConfiguration.PROPERTY_S3_CRT_READ_BUFFER_SIZE_DEFAULT));
+    }
+}

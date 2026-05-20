@@ -463,6 +463,61 @@ public final class OptimizerConfiguration {
             "indexoptimizer.provisional.gc.ms";
     public static final long PROPERTY_PROVISIONAL_GC_MS_DEFAULT = 600_000L;
 
+    // -------------------------------------------------------------------------
+    // Direct S3 access for segment downloads (issue #612)
+    //
+    // When indexoptimizer.s3.direct.enabled=true the optimizer builds its own
+    // AwsCrtAsyncHttpClient to download segment files directly from S3/GCS,
+    // bypassing the gRPC file-server round-trips. Credentials are injected via
+    // S3_ACCESS_KEY / S3_SECRET_KEY environment variables only (never in the
+    // config file).
+    // -------------------------------------------------------------------------
+
+    /**
+     * Enable direct S3 download for segment files during merge operations.
+     * Default {@code false}; when {@code true}, requires {@code S3_ACCESS_KEY}
+     * and {@code S3_SECRET_KEY} environment variables to be set.
+     */
+    public static final String PROPERTY_S3_DIRECT_ENABLED = "indexoptimizer.s3.direct.enabled";
+    public static final boolean PROPERTY_S3_DIRECT_ENABLED_DEFAULT = false;
+
+    /** S3 endpoint URL override. Leave empty for native AWS S3; set for GCS or MinIO. */
+    public static final String PROPERTY_S3_ENDPOINT = "indexoptimizer.s3.endpoint";
+    public static final String PROPERTY_S3_ENDPOINT_DEFAULT = "";
+
+    /** S3 bucket name containing the segment data. */
+    public static final String PROPERTY_S3_BUCKET = "indexoptimizer.s3.bucket";
+    public static final String PROPERTY_S3_BUCKET_DEFAULT = "";
+
+    /** AWS region. */
+    public static final String PROPERTY_S3_REGION = "indexoptimizer.s3.region";
+    public static final String PROPERTY_S3_REGION_DEFAULT = "us-east-1";
+
+    /** Optional key prefix within the bucket (e.g. {@code "herddb/"}). */
+    public static final String PROPERTY_S3_PREFIX = "indexoptimizer.s3.prefix";
+    public static final String PROPERTY_S3_PREFIX_DEFAULT = "";
+
+    /**
+     * Enable GCS-compatibility mode on the direct S3 client:
+     * path-style addressing + SDK checksum WHEN_REQUIRED.
+     */
+    public static final String PROPERTY_S3_GCS_COMPATIBILITY = "indexoptimizer.s3.gcs.compatibility";
+    public static final boolean PROPERTY_S3_GCS_COMPATIBILITY_DEFAULT = false;
+
+    /**
+     * Maximum number of concurrent S3 connections the {@code AwsCrtAsyncHttpClient}
+     * may keep open (issue #612). Default is 4.
+     */
+    public static final String PROPERTY_S3_CRT_MAX_CONCURRENCY = "indexoptimizer.s3.crt.max.concurrency";
+    public static final int PROPERTY_S3_CRT_MAX_CONCURRENCY_DEFAULT = 4;
+
+    /**
+     * Per-connection native read-buffer size in bytes for the
+     * {@code AwsCrtAsyncHttpClient} (issue #612). Default is 1 GiB.
+     */
+    public static final String PROPERTY_S3_CRT_READ_BUFFER_SIZE = "indexoptimizer.s3.crt.read.buffer.size";
+    public static final long PROPERTY_S3_CRT_READ_BUFFER_SIZE_DEFAULT = 1024L * 1024 * 1024;
+
     private final Properties properties;
 
     public OptimizerConfiguration(Properties properties) {

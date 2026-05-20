@@ -559,6 +559,26 @@ public final class IndexingServerConfiguration {
     public static final String PROPERTY_S3_GCS_COMPATIBILITY = "indexing.s3.gcs.compatibility";
     public static final boolean PROPERTY_S3_GCS_COMPATIBILITY_DEFAULT = false;
 
+    /**
+     * Maximum number of concurrent S3 connections the {@code AwsCrtAsyncHttpClient}
+     * may keep open for the direct S3 download client (issue #612). Each connection
+     * uses native (non-JVM) memory for its I/O buffers, so a high value can silently
+     * exhaust native memory and trigger an OOMKill. Default is 4.
+     */
+    public static final String PROPERTY_S3_CRT_MAX_CONCURRENCY = "indexing.s3.crt.max.concurrency";
+    /** Default: 4 concurrent S3 connections. */
+    public static final int PROPERTY_S3_CRT_MAX_CONCURRENCY_DEFAULT = 4;
+
+    /**
+     * Per-connection native read-buffer size in bytes for the
+     * {@code AwsCrtAsyncHttpClient} used for direct S3 downloads (issue #612).
+     * At the default concurrency of 4, this bounds the CRT native footprint to
+     * at most 4 GiB worst-case. Default is 1 GiB ({@code 1073741824}).
+     */
+    public static final String PROPERTY_S3_CRT_READ_BUFFER_SIZE = "indexing.s3.crt.read.buffer.size";
+    /** Default: 1 GiB per-connection read buffer. */
+    public static final long PROPERTY_S3_CRT_READ_BUFFER_SIZE_DEFAULT = 1024L * 1024 * 1024;
+
     // Storage
     public static final String PROPERTY_STORAGE_TYPE = "indexing.storage.type";
     public static final String PROPERTY_STORAGE_TYPE_DEFAULT = "file";

@@ -1358,13 +1358,22 @@ public final class IndexOptimizerMain {
         boolean gcsCompatibility = configuration.getBoolean(
                 OptimizerConfiguration.PROPERTY_S3_GCS_COMPATIBILITY,
                 OptimizerConfiguration.PROPERTY_S3_GCS_COMPATIBILITY_DEFAULT);
-
+        int crtMaxConcurrency = configuration.getInt(
+                OptimizerConfiguration.PROPERTY_S3_CRT_MAX_CONCURRENCY,
+                OptimizerConfiguration.PROPERTY_S3_CRT_MAX_CONCURRENCY_DEFAULT);
+        long crtReadBufferSize = configuration.getLong(
+                OptimizerConfiguration.PROPERTY_S3_CRT_READ_BUFFER_SIZE,
+                OptimizerConfiguration.PROPERTY_S3_CRT_READ_BUFFER_SIZE_DEFAULT);
+        LOGGER.log(Level.INFO,
+                "Direct S3 CRT client (optimizer): maxConcurrency={0}, readBufferSizeInBytes={1}",
+                new Object[]{crtMaxConcurrency, crtReadBufferSize});
         S3AsyncClientBuilder clientBuilder = S3AsyncClient.builder()
                 .region(Region.of(region))
                 .credentialsProvider(StaticCredentialsProvider.create(
                         AwsBasicCredentials.create(accessKey, secretKey)))
-                .httpClientBuilder(AwsCrtAsyncHttpClient.builder());
-
+                .httpClientBuilder(AwsCrtAsyncHttpClient.builder()
+                        .maxConcurrency(crtMaxConcurrency)
+                        .readBufferSizeInBytes(crtReadBufferSize));
         if (gcsCompatibility) {
             LOGGER.log(Level.INFO,
                     "Direct S3 client (GCS compatibility): path-style addressing, "
