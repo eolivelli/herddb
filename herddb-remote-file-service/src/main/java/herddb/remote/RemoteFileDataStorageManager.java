@@ -1045,6 +1045,46 @@ public class RemoteFileDataStorageManager extends DataStorageManager
                 readerStatsLogger, segmentBlockCache);
     }
 
+    /**
+     * Issue #617 + pr-reviewer follow-up #2: backend-specific override of the
+     * {@code multipartIndexFileExists} probe. The default
+     * {@link DataStorageManager#multipartIndexFileExists} implementation
+     * builds a {@link RemoteRandomAccessReader} with a fictitious
+     * {@code fileSize=1L} and then calls {@code readInt()} on it — that
+     * combination triggers an infinite loop in
+     * {@link RemoteRandomAccessReader#readFully(byte[])} because the loop's
+     * {@code toCopy} becomes zero once {@code position} matches the fake
+     * {@code totalSize}. We bypass the reader entirely and probe block-0
+     * directly via the file-server client's {@code readFileRange} API,
+     * which returns {@code null} when the underlying block is absent.
+     *
+     * <p>4 bytes is the same probe length the base contract documents (the
+     * default impl does {@code readInt()}), so the contract gap that
+     * {@code --force} covers — a block-0 of ≥4 bytes is enough to make the
+     * probe return {@code true} even on a truncated upload — is preserved.
+     */
+    @Override
+    public boolean multipartIndexFileExists(String tableSpace, String uuid, String fileType) {
+        String logicalPath = remoteMultipartPath(tableSpace, uuid, fileType);
+        int blockSize = Math.max(client.getBlockSize(), MULTIPART_BLOCK_SIZE);
+        try {
+            byte[] head = client.readFileRange(logicalPath, 0L, 4, blockSize);
+            // RemoteFileServiceClient.readFileRange returns null for missing
+            // blocks (see RemoteFileServiceTest.testWriteFileBlockAndReadFileRange).
+            // A non-null result with ≥ 1 byte means block-0 is reachable —
+            // matches the base contract's "best-effort presence check".
+            return head != null && head.length > 0;
+        } catch (RuntimeException e) {
+            // Some backends wrap NoSuchKey-style errors in unchecked
+            // exceptions; treat any failure during the probe as "missing"
+            // per the contract.
+            LOGGER.log(Level.FINE,
+                    "multipartIndexFileExists: probe failed for {0}: {1}",
+                    new Object[]{logicalPath, e.getMessage()});
+            return false;
+        }
+    }
+
     @Override
     public void deleteMultipartIndexFile(String tableSpace, String uuid, String fileType)
             throws DataStorageManagerException {

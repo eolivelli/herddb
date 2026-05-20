@@ -287,13 +287,22 @@ public abstract class DataStorageManager implements AutoCloseable {
      */
     public boolean multipartIndexFileExists(String tableSpace, String uuid, String fileType) {
         // We do not know the real file size here; pass a sentinel value
-        // large enough to cover the first block. The default
-        // multipartIndexReaderSupplier implementations only use fileSize
-        // to compute block boundaries, so a too-large value is harmless
-        // for the single-byte read we are about to attempt.
+        // larger than any plausible block-0 footprint plus 4 bytes for the
+        // probe. Passing a too-small value (e.g. 1L) breaks the default
+        // multipartIndexReaderSupplier readers because readFully then sees
+        // available==0 once position reaches the fake totalSize and spins
+        // (pr-reviewer follow-up #2). Backends that can answer the question
+        // more cheaply (e.g. an S3 HEAD request, or a wire-level
+        // readFileRange) should override this method outright —
+        // RemoteFileDataStorageManager does exactly that.
         io.github.jbellis.jvector.disk.ReaderSupplier rs;
         try {
-            rs = multipartIndexReaderSupplier(tableSpace, uuid, fileType, 1L);
+            // 1 GiB is far larger than any real block-0 in production; the
+            // probe still only ever reads 4 bytes, so the inflated fileSize
+            // only affects the reader's internal end-of-file accounting and
+            // never causes the backend to fetch more bytes than necessary.
+            rs = multipartIndexReaderSupplier(tableSpace, uuid, fileType,
+                    1L * 1024 * 1024 * 1024);
         } catch (DataStorageManagerException e) {
             return false;
         }

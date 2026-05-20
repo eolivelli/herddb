@@ -345,6 +345,42 @@ public class IndexingAdminCliDeleteSegmentTest {
     }
 
     /**
+     * pr-reviewer follow-up #1: when the targeted IS is a shadow replica,
+     * the server short-circuits the RPC with the exact prefix
+     * {@code "not_primary: this indexing-service instance is a shadow
+     * replica (shadowOf=...)"}. The CLI must surface this as a non-zero
+     * exit code with the rejection text on stderr.
+     */
+    @Test
+    public void shadowConfiguredServerRejectsWithNotPrimaryPrefix() throws Exception {
+        // The fake server emulates the IndexingServiceImpl.deleteSegment
+        // shadow gate: it never invokes the engine, just returns
+        // FAILED_PRECONDITION with the exact "not_primary:" message.
+        fakeServer = new FakeDeleteSegmentServer(req -> {
+            throw Status.FAILED_PRECONDITION
+                    .withDescription("not_primary: this indexing-service instance is a"
+                            + " shadow replica (shadowOf=0); target the primary instead")
+                    .asRuntimeException();
+        });
+        fakeServer.start();
+
+        int rc = cli.run(new String[]{
+            "delete-segment",
+            "--server", fakeServer.address(),
+            "--table", "t",
+            "--index", "i",
+            "--segment", "vidx_seg1",
+            "--yes"
+        });
+        assertTrue("CLI must exit non-zero on shadow rejection, got rc=" + rc, rc != 0);
+        String err = stderr();
+        assertTrue("stderr must carry the not_primary: prefix, got:\n" + err,
+                err.contains("not_primary:"));
+        assertTrue("stderr must mention shadowOf=, got:\n" + err,
+                err.contains("shadowOf="));
+    }
+
+    /**
      * Missing {@code --segment} flag must exit with usage code 2, not
      * with a stack trace.
      */

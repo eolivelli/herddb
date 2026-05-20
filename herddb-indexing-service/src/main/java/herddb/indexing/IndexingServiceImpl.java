@@ -707,6 +707,23 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
                         + " purge_storage={4} force={5} (issue #617)",
                 new Object[]{indexName, table, request.getTablespace(), segment,
                     request.getPurgeStorage(), request.getForce()});
+        // pr-reviewer follow-up #1: refuse the RPC up-front when this instance
+        // is configured as a shadow replica. Shadow instances mirror their
+        // primary's segment list via reloadFromIndexStatus(); accepting a
+        // delete-segment write on a shadow would silently diverge the two
+        // copies and the next reload would just put the segment back. The
+        // operator must target the primary instead.
+        if (engine.isConfiguredAsShadow()) {
+            String desc = "not_primary: this indexing-service instance is a shadow replica "
+                    + "(shadowOf=" + engine.getShadowOfOrMinusOne()
+                    + "); target the primary instead";
+            LOGGER.log(Level.WARNING,
+                    "DeleteSegment RPC rejected on shadow instance: {0}", desc);
+            responseObserver.onError(Status.FAILED_PRECONDITION
+                    .withDescription(desc)
+                    .asRuntimeException());
+            return;
+        }
         try {
             IndexingServiceEngine.DeleteSegmentResult result = engine.deleteSegment(
                     table, indexName, segment,

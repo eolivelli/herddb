@@ -2332,6 +2332,18 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             throw new DeleteSegmentException("index " + table + "." + indexName + " is not loaded");
         }
         if (!(store instanceof PersistentVectorStore)) {
+            // pr-reviewer follow-up #6: a ReadOnlyVectorStore means we are
+            // running as a shadow replica (or have loaded a snapshot in
+            // read-only mode); the IS-level gate at IndexingServiceImpl
+            // .deleteSegment normally short-circuits these RPCs before they
+            // reach the engine, but we keep belt-and-braces here in case a
+            // future caller bypasses the gRPC layer.
+            if (store instanceof herddb.indexing.vector.ReadOnlyVectorStore) {
+                throw new DeleteSegmentException(
+                        "index " + table + "." + indexName
+                                + ": this instance is a shadow replica — target the primary"
+                                + " indexing service");
+            }
             throw new DeleteSegmentException(
                     "index " + table + "." + indexName + " is non-persistent ("
                             + store.getClass().getSimpleName() + "); has no on-disk segments");
@@ -2374,13 +2386,19 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         AbstractVectorStore.SegmentDropResult drop = pvs.dropSegmentByStorageKey(segmentStorageKey);
         if (!drop.removed) {
             // Race: a concurrent compaction swap removed the segment between
-            // our snapshot and the drop. Treat as a no-op success — the
-            // operator's intent (segment gone) has been satisfied.
+            // our snapshot and the drop. Treat as a no-op — the operator's
+            // intent (segment gone) has been satisfied, but we cannot compute
+            // the vectors_lost count because the segment handle is no longer
+            // accessible. Surface -1L per the proto contract so operators can
+            // distinguish "removed 0 vectors" from "did not remove anything
+            // and cannot tell what would have been lost"
+            // (pr-reviewer follow-up #5).
             LOGGER.log(Level.WARNING,
                     "deleteSegment: segment {0} disappeared between snapshot and drop"
-                            + " (concurrent compaction swap?); reporting no-op",
+                            + " (concurrent compaction swap?); reporting no-op with"
+                            + " vectors_lost=-1 (race path)",
                     segmentStorageKey);
-            return new DeleteSegmentResult(segmentStorageKey, false, 0L, graphPresent, false);
+            return new DeleteSegmentResult(segmentStorageKey, false, -1L, graphPresent, false);
         }
 
         boolean storagePurged = false;
@@ -3960,6 +3978,33 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
 
     public long getShadowReloadCount() {
         return shadowReloadCount.get();
+    }
+
+    /**
+     * Test-only accessor: returns the segment count of the loaded vector
+     * store for {@code table.indexName} regardless of whether it is a
+     * {@link PersistentVectorStore} (primary) or a
+     * {@link herddb.indexing.vector.ReadOnlyVectorStore} (shadow).
+     * Returns {@code -1} when the store is not loaded.
+     *
+     * <p>Added in pr-reviewer follow-up #4 for issue #617 so the
+     * {@code ShadowDeleteSegmentE2ETest.lateBootShadowObservesPostDeleteState}
+     * case can assert that a shadow booted AFTER a primary-side delete
+     * loads the smaller (post-delete) segment count, without having to
+     * unwrap the vector store map directly.
+     */
+    public int getSegmentCountForTest(String table, String indexName) {
+        AbstractVectorStore store = vectorStores.get(storeKey(table, indexName));
+        if (store == null) {
+            return -1;
+        }
+        if (store instanceof PersistentVectorStore) {
+            return ((PersistentVectorStore) store).getSegmentCount();
+        }
+        if (store instanceof herddb.indexing.vector.ReadOnlyVectorStore) {
+            return ((herddb.indexing.vector.ReadOnlyVectorStore) store).getSegmentCount();
+        }
+        return -1;
     }
 
     /**

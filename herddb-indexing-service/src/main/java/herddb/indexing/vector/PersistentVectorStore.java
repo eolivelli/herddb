@@ -3691,6 +3691,17 @@ public class PersistentVectorStore extends AbstractVectorStore {
         return segments.get(idx).externalStorageKey;
     }
 
+    /**
+     * Test-only accessor for the deferred-close queue used by
+     * {@link #dropSegmentByUuid} and {@link #dropSegmentByStorageKey}.
+     * Returns the current number of queued (not-yet-closed) segments.
+     * Pr-reviewer follow-up #3 for issue #617 uses this to assert the
+     * queue eventually drains after the operator-driven drop.
+     */
+    public int getPendingSegmentClosesSizeForTest() {
+        return pendingSegmentCloses.size();
+    }
+
     VectorSegment preloadCompactedSegment(SegmentWriteResult swr) throws IOException, DataStorageManagerException {
         VectorSegment seg = new VectorSegment(swr.segmentId);
         seg.segmentUuid = swr.segmentUuid;

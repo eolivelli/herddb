@@ -463,4 +463,111 @@ public class ShadowDeleteSegmentE2ETest {
             primary.close();
         }
     }
+
+    /**
+     * pr-reviewer follow-up #4 for issue #617: a shadow that boots AFTER
+     * the primary has already executed {@code deleteSegment(force=true,
+     * purge=true)} must load the smaller (post-delete) segment count on its
+     * very first reload — exactly the operational sequence operators
+     * follow when they delete an orphan segment on a primary, then bring
+     * up a fresh shadow from the cleaned-up checkpoint.
+     *
+     * <p>Asserts:
+     * <ol>
+     *   <li>the primary's segment count drops by one immediately;</li>
+     *   <li>the shadow becomes ready;</li>
+     *   <li>{@code shadowReloadCount == 1} (the cold-boot reload counts
+     *       as the first observation);</li>
+     *   <li>the shadow's loaded segment count matches the primary's
+     *       post-delete count.</li>
+     * </ol>
+     */
+    @Test
+    public void lateBootShadowObservesPostDeleteState() throws Exception {
+        MemoryDataStorageManager dsm = new MemoryDataStorageManager();
+        MemoryManager mm = new MemoryManager(128 * 1024 * 1024, 0, 1024 * 1024, 1024 * 1024);
+        final String stableUuid = "idx-uuid-617-lateboot";
+
+        AtomicReference<PersistentVectorStore> primaryStore = new AtomicReference<>();
+        IndexingServiceEngine primary = newPrimary(dsm, mm, stableUuid, primaryStore);
+        primary.start();
+
+        Table t = createTable();
+        Index idx = createIndex(stableUuid);
+        primary.applyEntry(new LogSequenceNumber(1, 1), LogEntryFactory.createTable(t, null));
+        primary.applyEntry(new LogSequenceNumber(1, 2), LogEntryFactory.createIndex(idx, null));
+
+        Random rng = new Random(617_42);
+        int dim = 12;
+        LogSequenceNumber last = null;
+        // Build enough vectors that a single checkpoint produces ≥1 segment,
+        // then a SECOND checkpoint produces another segment so the delete
+        // below has more than one segment to choose from. We then delete
+        // exactly one and verify the shadow loads the remaining count.
+        for (int batch = 0; batch < 2; batch++) {
+            for (int i = 0; i < 64; i++) {
+                Record r = RecordSerializer.makeRecord(t,
+                        "pk", "k" + batch + "_" + i, "vec", randomVector(rng, dim));
+                LogEntry ins = LogEntryFactory.insert(t, r.key, r.value, null);
+                last = new LogSequenceNumber(1, 300 + batch * 100 + i);
+                primary.applySingleEntryForTest(last, ins);
+            }
+            primary.awaitPendingWorkForTest();
+            primary.setLastProcessedLsnForTest(last);
+            primary.forceCheckpointAndSaveWatermark();
+        }
+        seedDsmSchema(dsm, primary.getTableSpaceUUID(), t, idx);
+        metadata.registerIndexingServiceInstance(
+                IndexingServiceInstanceDescriptor.primary("p0", "dummy:0", 0));
+
+        IndexingServiceEngine shadow = null;
+        try {
+            PersistentVectorStore pvs = primaryStore.get();
+            assertNotNull(pvs);
+            int beforeDelete = pvs.getSegmentCount();
+            assertTrue("primary must have ≥2 segments before the delete to make the"
+                            + " post-delete comparison non-trivial, got " + beforeDelete,
+                    beforeDelete >= 2);
+
+            List<String> keys = pvs.getSegmentStorageKeysSnapshot();
+            String victim = keys.get(0);
+
+            // Step 1: primary-side delete BEFORE the shadow is ever
+            // started. force=true + purge=true is the operational
+            // sequence for orphaned segments.
+            IndexingServiceEngine.DeleteSegmentResult result = primary.deleteSegment(
+                    "vectable", "vidx", victim,
+                    /* purgeStorage */ true, /* force */ true);
+            assertTrue("primary-side delete must succeed", result.removed);
+            assertTrue("graph file was present before the delete", result.graphFilePresent);
+            assertTrue("purge=true must report storage_purged=true", result.storagePurged);
+
+            int afterDelete = pvs.getSegmentCount();
+            assertEquals("primary segment count must drop by exactly one",
+                    beforeDelete - 1, afterDelete);
+
+            // Step 2: only now boot the shadow. The shadow has never seen
+            // the pre-delete IndexStatus — it loads the (already smaller)
+            // post-delete one on its very first reload.
+            shadow = newShadow(dsm, mm, 0);
+            shadow.start();
+            assertTrue("late-boot shadow must become ready", shadow.isShadowReady());
+
+            assertEquals("shadow must have reloaded exactly once on cold boot",
+                    1L, shadow.getShadowReloadCount());
+
+            // Step 3: the shadow's loaded segment count must match the
+            // primary's POST-delete count. A regression that leaks the
+            // pre-delete IndexStatus into the shadow's load path would
+            // produce a mismatch here.
+            int shadowSegments = shadow.getSegmentCountForTest("vectable", "vidx");
+            assertEquals("late-boot shadow must observe the post-delete segment count",
+                    afterDelete, shadowSegments);
+        } finally {
+            if (shadow != null) {
+                shadow.close();
+            }
+            primary.close();
+        }
+    }
 }
