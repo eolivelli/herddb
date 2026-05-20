@@ -21,6 +21,7 @@
 package herddb.remote;
 
 import edu.umd.cs.findbugs.annotations.Nullable;
+import herddb.index.vector.BulkPrefetchReaderSupplier;
 import herddb.index.vector.PinModeReaderSupplier;
 import herddb.utils.VectorSearchRequestContext;
 import io.github.jbellis.jvector.disk.RandomAccessReader;
@@ -29,10 +30,14 @@ import io.netty.buffer.ByteBuf;
 import io.netty.util.ReferenceCountUtil;
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.TimeUnit;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 import org.apache.bookkeeper.stats.Counter;
 import org.apache.bookkeeper.stats.NullStatsLogger;
 import org.apache.bookkeeper.stats.OpStatsLogger;
@@ -631,7 +636,11 @@ public class RemoteRandomAccessReader implements RandomAccessReader {
      * that entry-frontier Layer-0 blocks survive eviction pressure from the main
      * cache.
      */
-    public static class Supplier implements ReaderSupplier, PinModeReaderSupplier {
+    public static class Supplier implements ReaderSupplier, PinModeReaderSupplier,
+            BulkPrefetchReaderSupplier {
+
+        private static final Logger SUPPLIER_LOGGER =
+                Logger.getLogger(Supplier.class.getName());
 
         private final RemoteFileServiceClient client;
         private final String path;
@@ -728,6 +737,152 @@ public class RemoteRandomAccessReader implements RandomAccessReader {
          */
         public boolean hasFrontierCacheActive() {
             return blockCache.isFrontierCacheActive();
+        }
+
+        /**
+         * Bulk-prefetches up to {@code maxBytes} bytes starting at
+         * {@code startOffset} from the remote file into the local
+         * {@link SegmentBlockCache} (issue #619).
+         *
+         * <p>Issues one
+         * {@link RemoteFileServiceClient#readFileRangeAsByteBufAsync} call per
+         * underlying multipart chunk (chunks are {@code writeBlockSize} bytes
+         * wide) and dispatches them in parallel. Each completed chunk is fed
+         * to {@link SegmentBlockCache#bulkInsert} which slices it into
+         * {@code bufferSize}-sized cache blocks. After this method returns,
+         * subsequent reads via a normal {@link RemoteRandomAccessReader}
+         * targeting the same {@code (path, bufferSize)} key space hit the
+         * cache for every covered block — no further wire I/O.
+         *
+         * <p>If the cache is disabled
+         * ({@code blockCache.isActive() == false}) the call is a no-op:
+         * caching is off, so populating it would be pointless.
+         *
+         * <p>If the prefetch returns a {@code null} buffer for any chunk
+         * (file deleted underneath us, or not yet uploaded) the call fails
+         * with {@link IOException}; callers must treat this as best-effort
+         * and continue with the per-block fallback path. All successfully
+         * fetched buffers are released on the failure branch so no off-heap
+         * memory leaks.
+         *
+         * @param startOffset starting byte offset; must be {@code >= 0} and
+         *     aligned to {@code writeBlockSize}
+         * @param maxBytes    upper bound on the number of bytes to read;
+         *     clamped to {@code totalSize - startOffset}
+         * @return number of bytes actually inserted into the cache
+         * @throws IOException if any underlying read fails
+         */
+        @Override
+        public long bulkPrefetchIntoCache(long startOffset, long maxBytes) throws IOException {
+            if (!blockCache.isActive() || maxBytes <= 0) {
+                return 0;
+            }
+            if (startOffset < 0) {
+                throw new IllegalArgumentException(
+                        "startOffset must be >= 0, got " + startOffset);
+            }
+            if (startOffset >= totalSize) {
+                return 0;
+            }
+            if (startOffset % writeBlockSize != 0) {
+                throw new IllegalArgumentException(
+                        "startOffset must be aligned to multipart chunk size "
+                                + writeBlockSize + ", got " + startOffset);
+            }
+            long endOffset = Math.min(totalSize, startOffset + maxBytes);
+            if (endOffset <= startOffset) {
+                return 0;
+            }
+
+            // Build one per-chunk request: chunks are writeBlockSize-aligned and
+            // never span a multipart-chunk boundary (the storage backend forbids
+            // it; readFileRangeAsByteBufAsync's recursive splitter only handles
+            // a single boundary so we have to align here explicitly).
+            List<CompletableFuture<ByteBuf>> futures = new ArrayList<>();
+            List<Long> offsets = new ArrayList<>();
+            long off = startOffset;
+            while (off < endOffset) {
+                long nextBoundary = ((off / writeBlockSize) + 1L) * writeBlockSize;
+                long chunkEnd = Math.min(endOffset, nextBoundary);
+                int len = (int) (chunkEnd - off);
+                offsets.add(off);
+                futures.add(client.readFileRangeAsByteBufAsync(path, off, len, writeBlockSize));
+                off = chunkEnd;
+            }
+
+            long startNanos = System.nanoTime();
+            try {
+                // Block the calling thread (typically the checkpoint / compaction
+                // worker that owns warmUpNewSegmentsBeforePublish) until every
+                // chunk has resolved. We *want* to block: the warmup contract is
+                // synchronous and the caller is on a dedicated executor.
+                CompletableFuture.allOf(
+                                futures.toArray(new CompletableFuture[0]))
+                        .join();
+            } catch (CompletionException ce) {
+                // Drain any chunk that completed successfully before the failure.
+                releaseCompletedFutures(futures);
+                Throwable cause = ce.getCause();
+                if (cause instanceof IOException) {
+                    throw (IOException) cause;
+                }
+                throw new IOException("Bulk prefetch failed for path=" + path
+                        + " startOffset=" + startOffset, cause);
+            }
+
+            long insertedBytes = 0;
+            // Track which futures still own a buffer that we need to release on
+            // a failure mid-iteration (e.g., a null result from the server).
+            int nextToConsume = 0;
+            try {
+                for (int i = 0; i < futures.size(); i++) {
+                    ByteBuf data = futures.get(i).getNow(null);
+                    if (data == null) {
+                        // null = "block not found" — file deleted or not yet
+                        // uploaded. Surface as an IOException; the warmup path
+                        // treats it as best-effort and falls back to BFS.
+                        nextToConsume = i + 1;
+                        throw new IOException("Bulk prefetch: server returned null"
+                                + " path=" + path + " offset=" + offsets.get(i));
+                    }
+                    // bulkInsert takes ownership of `data` and releases it.
+                    long chunkOff = offsets.get(i);
+                    nextToConsume = i + 1;
+                    insertedBytes += blockCache.bulkInsert(path, chunkOff, bufferSize, data);
+                }
+                if (insertedBytes > 0) {
+                    SUPPLIER_LOGGER.log(Level.FINE,
+                            "bulkPrefetchIntoCache path={0}: inserted {1} bytes "
+                                    + "({2} chunks) in {3} ms",
+                            new Object[]{path, insertedBytes, futures.size(),
+                                    (System.nanoTime() - startNanos) / 1_000_000L});
+                }
+                return insertedBytes;
+            } catch (IOException | RuntimeException e) {
+                // Release any chunk still owned by a pending future. Anything
+                // already passed to bulkInsert has been consumed there.
+                for (int i = nextToConsume; i < futures.size(); i++) {
+                    CompletableFuture<ByteBuf> f = futures.get(i);
+                    if (f.isDone() && !f.isCompletedExceptionally() && !f.isCancelled()) {
+                        ReferenceCountUtil.safeRelease(f.getNow(null));
+                    }
+                }
+                throw e;
+            }
+        }
+
+        /**
+         * Release every successfully-completed chunk buffer in {@code futures}
+         * — used on the failure path of
+         * {@link #bulkPrefetchIntoCache(long, long)} so that buffers fetched
+         * before the failing chunk do not leak.
+         */
+        private static void releaseCompletedFutures(List<CompletableFuture<ByteBuf>> futures) {
+            for (CompletableFuture<ByteBuf> f : futures) {
+                if (f.isDone() && !f.isCompletedExceptionally() && !f.isCancelled()) {
+                    ReferenceCountUtil.safeRelease(f.getNow(null));
+                }
+            }
         }
 
         @Override

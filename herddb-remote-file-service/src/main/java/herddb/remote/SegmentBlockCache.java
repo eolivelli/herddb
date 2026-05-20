@@ -162,6 +162,11 @@ public final class SegmentBlockCache {
     private final AtomicLong frontierLoadFailure = new AtomicLong();
     private final AtomicLong frontierLoadTimeNanos = new AtomicLong();
 
+    // --- Bulk-insert (warmup prefetch) stats — issue #619 ---
+    private final AtomicLong bulkInsertedBlocks = new AtomicLong();
+    private final AtomicLong bulkInsertedBytes = new AtomicLong();
+    private final AtomicLong bulkInsertSkipped = new AtomicLong();
+
     /**
      * Creates a cache with a main eviction region and no frontier (pinned) region.
      * Equivalent to {@code SegmentBlockCache(maxBytes, 0)}.
@@ -494,6 +499,129 @@ public final class SegmentBlockCache {
         } finally {
             retained.release();
         }
+    }
+
+    /**
+     * Bulk-inserts a contiguous range of bytes into the main eviction region as
+     * a sequence of cache-block-sized entries (issue #619).
+     *
+     * <p>The input {@code data} buffer must contain exactly the bytes located
+     * at file offsets {@code [baseOffset, baseOffset + data.readableBytes())}.
+     * The method splices {@code data} into {@code blockSize}-sized retained
+     * slices (the last slice may be shorter, mirroring end-of-file blocks) and
+     * inserts each slice as a fresh cache entry keyed by
+     * {@code (path, (baseOffset + i * blockSize) / blockSize)} — exactly the
+     * key shape used by {@link #getBlock}, so subsequent reads issued by
+     * {@code RemoteRandomAccessReader} on the same {@code (path, blockSize)}
+     * hit the freshly-loaded blocks.
+     *
+     * <p>Insertion is non-destructive: when a cache entry already exists for a
+     * given key the existing entry is preserved and our prepared slice is
+     * released — the call never evicts an entry that another reader has just
+     * single-flighted.
+     *
+     * <p><b>Ownership</b>: this method takes ownership of {@code data}. It is
+     * released exactly once before the method returns, regardless of which
+     * code path (success, no-op when the cache is disabled, or exception) is
+     * taken. Callers must not touch {@code data} after the call.
+     *
+     * <p><b>Concurrency</b>: insertion uses {@code asMap().compute()} so each
+     * per-key step is atomic with the removal listener, exactly as in
+     * {@link #getBlock}. The bulk operation as a whole is NOT a single atomic
+     * unit — a concurrent {@link #invalidatePath} call may remove some of the
+     * just-inserted blocks while others stay, which is fine: invalidation is
+     * already a best-effort coarse cleanup and never causes data corruption.
+     *
+     * @param path       logical multipart path (same path used by
+     *                   {@link #getBlock} on the read side)
+     * @param baseOffset starting file offset of the {@code data} buffer; must
+     *                   be a non-negative multiple of {@code blockSize}
+     * @param blockSize  cache-block size in bytes (must equal the read window
+     *                   used by the reader); must be {@code > 0}
+     * @param data       caller-prepared buffer containing the bytes located at
+     *                   {@code [baseOffset, baseOffset + data.readableBytes())}.
+     *                   Ownership transfers to this method.
+     * @return number of bytes actually inserted into the cache (excludes the
+     *     size of blocks that were already cached and therefore skipped)
+     * @throws IllegalArgumentException if {@code baseOffset} or
+     *     {@code blockSize} are invalid
+     */
+    public long bulkInsert(String path, long baseOffset, int blockSize, ByteBuf data) {
+        Objects.requireNonNull(path, "path");
+        Objects.requireNonNull(data, "data");
+        if (blockSize <= 0) {
+            ReferenceCountUtil.safeRelease(data);
+            throw new IllegalArgumentException("blockSize must be > 0, got " + blockSize);
+        }
+        if (baseOffset < 0) {
+            ReferenceCountUtil.safeRelease(data);
+            throw new IllegalArgumentException("baseOffset must be >= 0, got " + baseOffset);
+        }
+        if (baseOffset % blockSize != 0) {
+            ReferenceCountUtil.safeRelease(data);
+            throw new IllegalArgumentException(
+                    "baseOffset must be a multiple of blockSize, got baseOffset=" + baseOffset
+                            + " blockSize=" + blockSize);
+        }
+        // Disabled cache: nothing to insert; honour the ownership contract by releasing data.
+        if (cache == null) {
+            ReferenceCountUtil.safeRelease(data);
+            return 0;
+        }
+        int totalLen = data.readableBytes();
+        if (totalLen == 0) {
+            ReferenceCountUtil.safeRelease(data);
+            return 0;
+        }
+        long insertedBytes = 0;
+        try {
+            int dataOff = 0;
+            long fileOff = baseOffset;
+            while (dataOff < totalLen) {
+                int sliceLen = Math.min(blockSize, totalLen - dataOff);
+                long blockIndex = fileOff / blockSize;
+                BlockKey key = new BlockKey(path, blockIndex);
+                int sliceStart = dataOff;
+                int finalSliceLen = sliceLen;
+                // outcome[0] == true when we are the inserter, false when an entry
+                // already existed and we left it untouched.
+                boolean[] inserted = {false};
+                cache.asMap().compute(key, (k, existing) -> {
+                    if (existing != null) {
+                        // Concurrent reader already loaded this block — keep its
+                        // copy (it is fresher with respect to the LRU pass) and
+                        // skip ours. The retainedSlice we did NOT create is just
+                        // not allocated; no buffer leak.
+                        return existing;
+                    }
+                    // Prepare a fresh entry: retainedSlice() returns a slice whose
+                    // own refCnt starts at 1 and which holds an additional reference
+                    // on the parent. The cache takes ownership of that single slice
+                    // reference; the slice is released by the removal listener on
+                    // eviction (parent's ref drops accordingly).
+                    ByteBuf slice = data.retainedSlice(sliceStart, finalSliceLen);
+                    inserted[0] = true;
+                    return slice;
+                });
+                if (inserted[0]) {
+                    bulkInsertedBlocks.incrementAndGet();
+                    bulkInsertedBytes.addAndGet(sliceLen);
+                    insertedBytes += sliceLen;
+                } else {
+                    bulkInsertSkipped.incrementAndGet();
+                }
+                dataOff += sliceLen;
+                fileOff += sliceLen;
+            }
+        } finally {
+            // Release the caller-owned parent buffer. Every retained slice we
+            // handed to the cache holds its own independent reference on the
+            // underlying memory, so releasing the parent here does NOT free the
+            // bytes used by the cached entries — those are kept alive until the
+            // cache evicts them (or invalidate*/clear is called).
+            ReferenceCountUtil.safeRelease(data);
+        }
+        return insertedBytes;
     }
 
     /**
@@ -1004,6 +1132,37 @@ public final class SegmentBlockCache {
         return frontierCache.policy().eviction()
                 .map(e -> e.weightedSize().orElse(0L))
                 .orElse(0L);
+    }
+
+    // -------------------------------------------------------------------------
+    // Bulk-insert (warmup prefetch) stats — issue #619.
+    // -------------------------------------------------------------------------
+
+    /**
+     * Number of cache blocks inserted by successful {@link #bulkInsert} calls
+     * (excludes blocks skipped because the cache already held a copy).
+     */
+    public long bulkInsertedBlockCount() {
+        return bulkInsertedBlocks.get();
+    }
+
+    /**
+     * Total bytes inserted by {@link #bulkInsert} calls. Mirrors
+     * {@link #bulkInsertedBlockCount} but summed over actual slice lengths
+     * (a partial end-of-file slice contributes less than {@code blockSize}).
+     */
+    public long bulkInsertedByteCount() {
+        return bulkInsertedBytes.get();
+    }
+
+    /**
+     * Number of {@link #bulkInsert} attempts that were skipped because a
+     * concurrent reader had already cached the same {@code (path, blockIndex)}
+     * key. A high value indicates frequent overlap between bulk prefetch and
+     * single-flight loads — informational, not a fault.
+     */
+    public long bulkInsertSkippedCount() {
+        return bulkInsertSkipped.get();
     }
 
     // -------------------------------------------------------------------------

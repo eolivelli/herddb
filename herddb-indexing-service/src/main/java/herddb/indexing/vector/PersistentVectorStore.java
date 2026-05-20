@@ -100,6 +100,7 @@ import java.util.function.Predicate;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Stream;
+import herddb.index.vector.BulkPrefetchReaderSupplier;
 import herddb.index.vector.PinModeReaderSupplier;
 import org.apache.bookkeeper.stats.OpStatsLogger;
 
@@ -5179,6 +5180,15 @@ public class PersistentVectorStore extends AbstractVectorStore {
         int nodeLimit = (int) Math.min(
                 idUpperBound,
                 Math.max(1L, bytesPerSegment / approxBytesPerNode));
+        // Bulk-prefetch shortcut (issue #619): when the segment's reader supplier
+        // supports bulk prefetch (i.e. it is backed by the remote file service),
+        // pull the warmup budget worth of bytes in a few large multipart-aligned
+        // reads and bulk-insert them into the SegmentBlockCache. The BFS below
+        // then runs entirely against a hot cache — no per-node wire round-trips.
+        // The prefetch is best-effort: any I/O failure is logged and the BFS
+        // path still runs as before, which means we never regress versus the
+        // pre-#619 behaviour even when the remote file service is degraded.
+        bulkPrefetchSegmentIntoCache(seg, bytesPerSegment);
         int nodesVisited = warmUpSegmentBfs(seg, odg, nodeLimit);
         if (nodesVisited > 0) {
             seg.warmedUp = true;
@@ -5234,6 +5244,63 @@ public class PersistentVectorStore extends AbstractVectorStore {
                             + "{3} nodes in {4} ms",
                     new Object[]{indexName, warmed, context, totalNodes,
                             System.currentTimeMillis() - startMs});
+        }
+    }
+
+    /**
+     * Bulk-prefetches the first {@code bytesPerSegment} bytes of the segment's
+     * graph file into the {@link herddb.remote.SegmentBlockCache} via a small
+     * number of large multipart-chunk-sized reads — issue #619.
+     *
+     * <p>This is the fast replacement for the per-node BFS reads of
+     * {@link #warmUpSegmentBfs}: instead of issuing ~{@code bytesPerSegment /
+     * 16 KiB} separate {@code readFileRange} calls, we issue one call per
+     * underlying multipart chunk (typically 4 MiB) in parallel and bulk-insert
+     * every covered cache block. The BFS that follows hits the cache for every
+     * read.
+     *
+     * <p>Best-effort: the call is a no-op when the segment's
+     * {@code onDiskReaderSupplier} does not implement
+     * {@link BulkPrefetchReaderSupplier} (e.g. local-disk suppliers used in
+     * unit tests, or in-memory readers). When the supplier supports prefetch
+     * but the read fails, the exception is logged at {@code WARNING} and
+     * swallowed — the subsequent BFS continues to load blocks one at a time
+     * via the normal path, so we never regress vs. the pre-#619 behaviour.
+     */
+    // Package-private to allow direct testing — see Issue619BulkWarmupTest.
+    void bulkPrefetchSegmentIntoCache(VectorSegment seg, long bytesPerSegment) {
+        if (bytesPerSegment <= 0) {
+            return;
+        }
+        io.github.jbellis.jvector.disk.ReaderSupplier rs = seg.onDiskReaderSupplier;
+        if (!(rs instanceof BulkPrefetchReaderSupplier)) {
+            return;
+        }
+        BulkPrefetchReaderSupplier prefetcher = (BulkPrefetchReaderSupplier) rs;
+        long startNanos = System.nanoTime();
+        try {
+            long inserted = prefetcher.bulkPrefetchIntoCache(0L, bytesPerSegment);
+            if (inserted > 0) {
+                LOGGER.log(Level.FINE,
+                        "bulkPrefetchSegmentIntoCache {0}: segment {1} prefetched "
+                                + "{2} bytes in {3} ms",
+                        new Object[]{indexName, seg.segmentId, inserted,
+                                (System.nanoTime() - startNanos) / 1_000_000L});
+            }
+        } catch (IOException e) {
+            // Best-effort: the BFS below will pull blocks on demand.
+            LOGGER.log(Level.WARNING,
+                    "bulkPrefetchSegmentIntoCache {0}: I/O error prefetching "
+                            + "segment {1}: {2} — falling back to per-node BFS",
+                    new Object[]{indexName, seg.segmentId, e.getMessage()});
+        } catch (RuntimeException e) {
+            // Narrow catch on RuntimeException only: programming errors inside the
+            // prefetcher (e.g. unaligned offset) must not abort the watermark
+            // save. Checked exceptions other than IOException are unreachable —
+            // the interface declares only IOException.
+            LOGGER.log(Level.WARNING,
+                    "bulkPrefetchSegmentIntoCache " + indexName
+                            + ": unexpected error prefetching segment " + seg.segmentId, e);
         }
     }
 
