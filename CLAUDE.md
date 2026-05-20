@@ -56,14 +56,23 @@ Never push commits directly to the `master` branch. Always create a feature bran
 open a pull request so that CI runs and changes can be reviewed before merging.
 
 ## Before Sending a PR
+Spotless replaced Maven Checkstyle in issue #544 / PR #554 — **do not invoke
+`mvn checkstyle:check` directly**; with no project-level configuration the
+plugin falls back to the Sun defaults and reports thousands of bogus
+violations. Use Spotless instead.
+
 First auto-fix formatting (unused imports, trailing whitespace, trailing
 newline, tabs → spaces) with Spotless, then run the code validation checks
 locally before opening a pull request:
 ```
 mvn -B spotless:apply -DskipTests
-mvn -B spotless:check apache-rat:check spotbugs:check install -DskipTests -Pci
+mvn -B spotless:check apache-rat:check install -DskipTests spotbugs:check -Pci
 ```
-This matches what `.github/workflows/ci.yml` runs in CI (spotless, Apache RAT license headers, SpotBugs).
+This matches what `.github/workflows/ci.yml` runs in CI (spotless, Apache RAT
+license headers, SpotBugs). The goal order is significant: `spotbugs:check`
+must run **after** `install` because it analyses the freshly-compiled `.class`
+files that `install` writes — running spotbugs first leaves it inspecting
+stale classes (or no classes at all on a clean checkout).
 
 For any change related to indexes, checkpoints, or concurrency, also run every
 subclass of `DirectMultipleConcurrentUpdatesSuite` (in
