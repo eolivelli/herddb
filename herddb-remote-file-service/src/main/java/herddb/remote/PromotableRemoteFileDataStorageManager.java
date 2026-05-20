@@ -362,4 +362,20 @@ public class PromotableRemoteFileDataStorageManager extends DataStorageManager {
             throws DataStorageManagerException {
         activeDelegate.deleteMultipartIndexFile(tableSpace, uuid, fileType);
     }
+
+    /**
+     * Issue #617 + pr-reviewer follow-up #5: delegate the multipart presence
+     * probe to the {@link #activeDelegate}. The default
+     * {@link DataStorageManager#multipartIndexFileExists} fallback would still
+     * work after the 1 GiB sentinel fix in the base class, but it routes the
+     * probe through {@link #multipartIndexReaderSupplier} and a synthetic
+     * {@code readInt()} — which is slower and noisier than letting the
+     * delegate (typically a {@link RemoteFileDataStorageManager} or a
+     * {@link ReadReplicaDataStorageManager}) handle the probe with its own
+     * backend-specific shortcut.
+     */
+    @Override
+    public boolean multipartIndexFileExists(String tableSpace, String uuid, String fileType) {
+        return activeDelegate.multipartIndexFileExists(tableSpace, uuid, fileType);
+    }
 }

@@ -854,19 +854,40 @@ public final class IndexingAdminCli {
                     cli.getOptionValue("table"),
                     cli.getOptionValue("index"),
                     segment, purge, force);
+            // pr-reviewer follow-up #3: the engine emits vectors_lost=-1 on the
+            // race path (segment dropped by a concurrent compaction between the
+            // engine's snapshot and the engine's drop call — the count is
+            // genuinely unknown, NOT zero). Render the sentinel as the explicit
+            // "unknown" string in both text and JSON so wrapper scripts don't
+            // mistake it for a real zero. We keep the field present in JSON
+            // (rather than omitting it) so the schema is stable; the field
+            // type widens from number to "number | \"unknown\"".
+            boolean vectorsLostUnknown = resp.getVectorsLost() < 0L;
             if (cli.hasOption("json")) {
                 Map<String, Object> m = new LinkedHashMap<>();
                 m.put("segment", resp.getSegment());
                 m.put("removed", resp.getRemoved());
-                m.put("vectors_lost", resp.getVectorsLost());
+                if (vectorsLostUnknown) {
+                    m.put("vectors_lost", "unknown");
+                } else {
+                    m.put("vectors_lost", resp.getVectorsLost());
+                }
                 m.put("graph_file_present", resp.getGraphFilePresent());
                 m.put("storage_purged", resp.getStoragePurged());
                 out.println(JsonWriter.toJson(m));
             } else {
-                out.printf(Locale.ROOT,
-                        "segment=%s removed=%s vectors_lost=%d graph_file_present=%s storage_purged=%s%n",
-                        resp.getSegment(), resp.getRemoved(), resp.getVectorsLost(),
-                        resp.getGraphFilePresent(), resp.getStoragePurged());
+                if (vectorsLostUnknown) {
+                    out.printf(Locale.ROOT,
+                            "segment=%s removed=%s vectors_lost=unknown (race) "
+                                    + "graph_file_present=%s storage_purged=%s%n",
+                            resp.getSegment(), resp.getRemoved(),
+                            resp.getGraphFilePresent(), resp.getStoragePurged());
+                } else {
+                    out.printf(Locale.ROOT,
+                            "segment=%s removed=%s vectors_lost=%d graph_file_present=%s storage_purged=%s%n",
+                            resp.getSegment(), resp.getRemoved(), resp.getVectorsLost(),
+                            resp.getGraphFilePresent(), resp.getStoragePurged());
+                }
             }
             return resp.getRemoved() ? 0 : 1;
         }

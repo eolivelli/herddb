@@ -133,6 +133,33 @@ public class ReadReplicaDataStorageManager extends DataStorageManager {
         throw readOnly("deleteMultipartIndexFile");
     }
 
+    /**
+     * Issue #617 + pr-reviewer follow-up #5: same {@code readFileRange}
+     * shortcut as {@link RemoteFileDataStorageManager#multipartIndexFileExists}
+     * — the default supplier-based fallback would also work (now that the base
+     * class uses a 1 GiB sentinel for the synthetic {@code fileSize}), but it
+     * routes the 4-byte probe through {@link RemoteRandomAccessReader} which
+     * is heavier than a direct block-range read. A null/empty response means
+     * block-0 is absent.
+     */
+    @Override
+    public boolean multipartIndexFileExists(String tableSpace, String uuid, String fileType) {
+        String logicalPath = remoteMultipartPath(tableSpace, uuid, fileType);
+        int blockSize = client.getBlockSize();
+        try {
+            byte[] head = client.readFileRange(logicalPath, 0L, 4, blockSize);
+            return head != null && head.length > 0;
+        } catch (RuntimeException e) {
+            // Some backends wrap NoSuchKey-style errors as unchecked
+            // exceptions; treat any failure during the probe as "missing"
+            // per the base contract.
+            LOGGER.log(Level.FINE,
+                    "multipartIndexFileExists: probe failed for {0}: {1}",
+                    new Object[]{logicalPath, e.getMessage()});
+            return false;
+        }
+    }
+
     // -------------------------------------------------------------------------
     // Page deserialization (matches FileDataStorageManager format)
     // -------------------------------------------------------------------------

@@ -2338,7 +2338,7 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             // .deleteSegment normally short-circuits these RPCs before they
             // reach the engine, but we keep belt-and-braces here in case a
             // future caller bypasses the gRPC layer.
-            if (store instanceof herddb.indexing.vector.ReadOnlyVectorStore) {
+            if (store instanceof ReadOnlyVectorStore) {
                 throw new DeleteSegmentException(
                         "index " + table + "." + indexName
                                 + ": this instance is a shadow replica — target the primary"
@@ -2382,6 +2382,18 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                         + " — issue #617",
                 new Object[]{segmentStorageKey, table, indexName,
                     graphPresent, force, purgeStorage});
+
+        // pr-reviewer follow-up #1: test-only hook fired AFTER the engine has
+        // taken its snapshot+probe but BEFORE the engine's own drop call. A
+        // test can use this to simulate a concurrent compaction (or another
+        // operator-driven drop) racing the engine, and then assert that the
+        // engine reports the resulting "segment disappeared" race path
+        // correctly (removed=false, vectors_lost=-1). Strictly test-only,
+        // package-private — production callers never set this.
+        Runnable preDropHook = preDropRaceHookForTests;
+        if (preDropHook != null) {
+            preDropHook.run();
+        }
 
         AbstractVectorStore.SegmentDropResult drop = pvs.dropSegmentByStorageKey(segmentStorageKey);
         if (!drop.removed) {
@@ -3613,6 +3625,27 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
     }
 
     /**
+     * pr-reviewer follow-up #1 (issue #617): test-only hook fired inside
+     * {@link #deleteSegment} AFTER the engine has snapshotted the segment
+     * list and probed the multipart graph, but BEFORE the engine calls
+     * {@link PersistentVectorStore#dropSegmentByStorageKey} itself. Tests
+     * use this to drop the same segment from a parallel actor and then
+     * assert that {@code deleteSegment} reports the "segment disappeared
+     * between snapshot and drop" race path (removed=false, vectors_lost=-1).
+     * Strictly test-only — production never sets this.
+     */
+    private volatile Runnable preDropRaceHookForTests = null;
+
+    /**
+     * Installs (or clears) the pre-drop race hook above. Package-private:
+     * production code never calls this.
+     */
+    // package-private for testing
+    void setPreDropRaceHookForTests(Runnable hook) {
+        this.preDropRaceHookForTests = hook;
+    }
+
+    /**
      * Body of the async warmup task: iterates the snapshot of persistent
      * stores and calls {@link PersistentVectorStore#warmUpBlockCache} on each.
      * Per-store {@link RuntimeException}s are caught so a single store's
@@ -4001,8 +4034,8 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         if (store instanceof PersistentVectorStore) {
             return ((PersistentVectorStore) store).getSegmentCount();
         }
-        if (store instanceof herddb.indexing.vector.ReadOnlyVectorStore) {
-            return ((herddb.indexing.vector.ReadOnlyVectorStore) store).getSegmentCount();
+        if (store instanceof ReadOnlyVectorStore) {
+            return ((ReadOnlyVectorStore) store).getSegmentCount();
         }
         return -1;
     }

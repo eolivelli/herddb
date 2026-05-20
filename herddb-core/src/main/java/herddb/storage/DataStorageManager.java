@@ -302,7 +302,7 @@ public abstract class DataStorageManager implements AutoCloseable {
             // only affects the reader's internal end-of-file accounting and
             // never causes the backend to fetch more bytes than necessary.
             rs = multipartIndexReaderSupplier(tableSpace, uuid, fileType,
-                    1L * 1024 * 1024 * 1024);
+                    1L << 30);
         } catch (DataStorageManagerException e) {
             return false;
         }

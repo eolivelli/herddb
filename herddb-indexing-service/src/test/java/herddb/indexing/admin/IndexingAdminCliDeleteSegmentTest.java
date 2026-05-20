@@ -381,6 +381,96 @@ public class IndexingAdminCliDeleteSegmentTest {
     }
 
     /**
+     * pr-reviewer follow-up #3 (text output): when the server returns
+     * {@code vectors_lost=-1} (the engine's race-sentinel for "the segment
+     * disappeared between the snapshot and the drop call — count is
+     * unknown"), the CLI must NOT print the raw {@code -1} number. Operators
+     * read the field as a count, so {@code -1} would be confusing.
+     * Instead emit {@code vectors_lost=unknown (race)}.
+     */
+    @Test
+    public void textOutputRendersNegativeVectorsLostAsUnknownRace() throws Exception {
+        fakeServer = new FakeDeleteSegmentServer(
+                req -> DeleteSegmentResponse.newBuilder()
+                        .setSegment(req.getSegment())
+                        .setRemoved(false)
+                        .setVectorsLost(-1L)
+                        .setGraphFilePresent(false)
+                        .setStoragePurged(false)
+                        .build());
+        fakeServer.start();
+
+        int rc = cli.run(new String[]{
+            "delete-segment",
+            "--server", fakeServer.address(),
+            "--table", "vectable",
+            "--index", "vidx",
+            "--segment", "vidx_race_seg",
+            "--yes"
+        });
+        // removed=false → rc=1 (existing contract from removedFalseExitsWithCode1).
+        assertEquals("removed=false must still map to rc=1", 1, rc);
+
+        String out = stdout();
+        assertTrue("text output must render -1 as 'unknown (race)', got:\n" + out,
+                out.contains("vectors_lost=unknown (race)"));
+        // And it must NOT include the raw -1, which would be visually
+        // misleading next to the other numeric fields.
+        assertFalse("text output must not include the raw -1 sentinel, got:\n" + out,
+                out.contains("vectors_lost=-1"));
+        // The other fields are still rendered.
+        assertTrue(out.contains("segment=vidx_race_seg"));
+        assertTrue(out.contains("removed=false"));
+    }
+
+    /**
+     * pr-reviewer follow-up #3 (JSON output): same input as above (server
+     * returns {@code vectors_lost=-1}). The JSON form keeps the
+     * {@code vectors_lost} key in the object (so the schema stays stable)
+     * but emits the string {@code "unknown"} instead of the raw number.
+     * Wrapper scripts that consume the JSON can distinguish a real count
+     * from "we don't know" by type-checking the field.
+     */
+    @Test
+    public void jsonOutputRendersNegativeVectorsLostAsUnknownString() throws Exception {
+        fakeServer = new FakeDeleteSegmentServer(
+                req -> DeleteSegmentResponse.newBuilder()
+                        .setSegment(req.getSegment())
+                        .setRemoved(false)
+                        .setVectorsLost(-1L)
+                        .setGraphFilePresent(false)
+                        .setStoragePurged(false)
+                        .build());
+        fakeServer.start();
+
+        int rc = cli.run(new String[]{
+            "delete-segment",
+            "--server", fakeServer.address(),
+            "--table", "vectable",
+            "--index", "vidx",
+            "--segment", "vidx_race_seg_json",
+            "--yes",
+            "--json"
+        });
+        assertEquals("removed=false must still map to rc=1", 1, rc);
+
+        String out = stdout().trim();
+        assertTrue("expected JSON object, got:\n" + out,
+                out.startsWith("{") && out.endsWith("}"));
+        // The vectors_lost key MUST still be present (stable schema), but as
+        // a JSON string, not a number. So the substring is the
+        // quoted-key-and-value form.
+        assertTrue("JSON must carry vectors_lost as the string \"unknown\", got:\n" + out,
+                out.contains("\"vectors_lost\":\"unknown\""));
+        // And it must NOT carry the raw -1 sentinel.
+        assertFalse("JSON must not carry the raw -1 vectors_lost value, got:\n" + out,
+                out.contains("\"vectors_lost\":-1"));
+        // Other fields still render correctly.
+        assertTrue(out.contains("\"segment\":\"vidx_race_seg_json\""));
+        assertTrue(out.contains("\"removed\":false"));
+    }
+
+    /**
      * Missing {@code --segment} flag must exit with usage code 2, not
      * with a stack trace.
      */
