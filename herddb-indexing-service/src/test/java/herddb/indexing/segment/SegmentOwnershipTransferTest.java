@@ -126,15 +126,30 @@ public class SegmentOwnershipTransferTest {
         }
     }
 
-    private static void waitFor(java.util.function.BooleanSupplier predicate) throws InterruptedException {
-        long deadline = System.currentTimeMillis() + 10_000L;
+    /**
+     * Polls {@code predicate} until it becomes true or the deadline elapses.
+     *
+     * <p>The deadline is generous (30s) because the watcher's single-thread
+     * dispatch executor must process several ZK watcher fires (children +
+     * per-segment data) and re-list the index between each transition, and
+     * on a contended CI runner those round-trips occasionally exceed a tighter
+     * deadline — see issue #608. A healthy run completes in milliseconds, so
+     * a 30s exhaustion still signals a real regression.
+     *
+     * <p>{@code desc} is included in the failure message so the test reports
+     * exactly which predicate did not stabilise (mirrors the helper in
+     * {@code SegmentTransferCrashRecoveryTest}).
+     */
+    private static void waitFor(java.util.function.BooleanSupplier predicate, String desc)
+            throws InterruptedException {
+        long deadline = System.currentTimeMillis() + 30_000L;
         while (System.currentTimeMillis() < deadline) {
             if (predicate.getAsBoolean()) {
                 return;
             }
             Thread.sleep(20);
         }
-        fail("predicate did not become true within 10s");
+        fail("predicate did not become true within 30s: " + desc);
     }
 
     @Test
@@ -143,7 +158,8 @@ public class SegmentOwnershipTransferTest {
         RecordingListener l0 = new RecordingListener();
         try (SegmentAssignmentWatcher w0 = new SegmentAssignmentWatcher(registry, 0, l0)) {
             w0.watchIndex(TS_UUID, IDX_UUID);
-            waitFor(() -> l0.events.contains("ASSIGNED:" + SEG_UUID));
+            waitFor(() -> l0.events.contains("ASSIGNED:" + SEG_UUID),
+                    "instance 0 sees initial ASSIGNED");
         }
         assertEquals(Collections.singletonList("ASSIGNED:" + SEG_UUID), l0.snapshot());
     }
@@ -158,7 +174,8 @@ public class SegmentOwnershipTransferTest {
              SegmentAssignmentWatcher w1 = new SegmentAssignmentWatcher(registry, 1, l1)) {
             w0.watchIndex(TS_UUID, IDX_UUID);
             w1.watchIndex(TS_UUID, IDX_UUID);
-            waitFor(() -> l0.events.contains("ASSIGNED:" + SEG_UUID));
+            waitFor(() -> l0.events.contains("ASSIGNED:" + SEG_UUID),
+                    "instance 0 sees initial ASSIGNED");
 
             // 1) Optimizer initiates transfer to instance 1.
             VersionedSegmentMetadata v0 = registry.getSegment(TS_UUID, IDX_UUID, SEG_UUID).orElseThrow();
@@ -167,7 +184,8 @@ public class SegmentOwnershipTransferTest {
             assertEquals(1, transferring.metadata().getPendingOwnerInstanceId());
 
             // 2) Watcher 1 sees the pending assignment.
-            waitFor(() -> l1.events.contains("PENDING:" + SEG_UUID));
+            waitFor(() -> l1.events.contains("PENDING:" + SEG_UUID),
+                    "instance 1 sees PENDING after initiate");
 
             // 3) New owner finishes opening locally and CAS-completes the transfer.
             VersionedSegmentMetadata afterComplete = OwnershipTransfer.complete(registry,
@@ -178,8 +196,10 @@ public class SegmentOwnershipTransferTest {
                     afterComplete.metadata().getPendingOwnerInstanceId());
 
             // 4) Watcher 1 now sees ASSIGNED, and watcher 0 sees RELEASED.
-            waitFor(() -> l1.events.contains("ASSIGNED:" + SEG_UUID));
-            waitFor(() -> l0.events.contains("RELEASED:" + SEG_UUID));
+            waitFor(() -> l1.events.contains("ASSIGNED:" + SEG_UUID),
+                    "instance 1 sees ASSIGNED after complete");
+            waitFor(() -> l0.events.contains("RELEASED:" + SEG_UUID),
+                    "instance 0 sees RELEASED after complete");
         }
 
         // Final trace: instance 0 went ASSIGNED → RELEASED; instance 1 went PENDING → ASSIGNED.
@@ -239,14 +259,16 @@ public class SegmentOwnershipTransferTest {
         RecordingListener l0 = new RecordingListener();
         try (SegmentAssignmentWatcher w0 = new SegmentAssignmentWatcher(registry, 0, l0)) {
             w0.watchIndex(TS_UUID, IDX_UUID);
-            waitFor(() -> l0.events.contains("ASSIGNED:" + SEG_UUID));
+            waitFor(() -> l0.events.contains("ASSIGNED:" + SEG_UUID),
+                    "instance 0 sees initial ASSIGNED");
 
             VersionedSegmentMetadata current = registry.getSegment(TS_UUID, IDX_UUID, SEG_UUID).orElseThrow();
             registry.casDeleteSegment(current);
             // The watcher passes the cached pre-deletion metadata (not null) so that
             // downstream listeners (e.g. IndexingServiceEngine) can identify which segment
             // was removed and call dropSegmentByUuid on it.
-            waitFor(() -> l0.events.contains("RELEASED:" + SEG_UUID));
+            waitFor(() -> l0.events.contains("RELEASED:" + SEG_UUID),
+                    "instance 0 sees RELEASED after delete");
         }
     }
 
@@ -271,7 +293,8 @@ public class SegmentOwnershipTransferTest {
             w0.watchIndex(TS_UUID, IDX_UUID);
             w1.watchIndex(TS_UUID, IDX_UUID);
             // Initial assignment to instance 0 — wait for it to land before starting cycles.
-            waitFor(() -> l0.events.contains("ASSIGNED:" + SEG_UUID));
+            waitFor(() -> l0.events.contains("ASSIGNED:" + SEG_UUID),
+                    "instance 0 sees initial ASSIGNED before cycles");
 
             for (int i = 0; i < cycles; i++) {
                 int target = (i % 2 == 0) ? 1 : 0;
@@ -300,7 +323,9 @@ public class SegmentOwnershipTransferTest {
                     long releases = sourceL.events.stream()
                             .filter(e -> e.equals("RELEASED:" + SEG_UUID)).count();
                     return assigns == expectedAssignsTarget && releases == expectedReleasesSource;
-                });
+                }, "cycle " + i + ": target=" + t + " expects "
+                        + expectedAssignsTarget + " ASSIGNED, source=" + s + " expects "
+                        + expectedReleasesSource + " RELEASED");
             }
 
             // Final exact counts:
