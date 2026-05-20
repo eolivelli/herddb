@@ -2413,9 +2413,23 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 if (!running) {
                     return;
                 }
-            } catch (RuntimeException e) {
+            } catch (RuntimeException | Error e) {
                 // Safety net: the cycle itself logs specific failure
                 // reasons, but we must not let the thread die.
+                //
+                // Issue #621: include Error so an unexpected Error escape
+                // (e.g. a jvector code path or future refactor where
+                // VectorIndexCompactor's own per-step Error catches do not
+                // cover the source) does not silently kill the compaction
+                // daemon. Without this branch the IS would stop compacting
+                // until the next restart — the symptom #621 aims to prevent.
+                // The catch already logs SEVERE and bumps
+                // compactionConsecutiveFailures, which drives the
+                // computeBackoffMs back-off so a persistent Error source
+                // does not spin the loop tight. We do NOT rethrow because
+                // the surrounding while(running) loop is the daemon
+                // thread's lifecycle — letting an Error escape here ends
+                // the only retry path the compaction subsystem has.
                 LOGGER.log(Level.SEVERE,
                         "vector store " + indexName + ": unexpected compaction failure", e);
                 compactionConsecutiveFailures.incrementAndGet();
@@ -2592,6 +2606,18 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 long vectorsWritten = 0;
                 long vectorsFiltered = 0;
                 VectorIndexCompactor.RebuildResult rebuild = null;
+                // Issue #621 review item: tracks whether the merged segment has
+                // been published into {@code this.segments} via
+                // {@link #atomicSwapCompactionResult}. Flipped to true the
+                // instant that call returns successfully. The new
+                // {@code catch (Error)} arm below uses this flag to decide
+                // whether to drain {@code rebuild.orphanPaths} into
+                // {@code pendingDeletes}: when {@code !published}, the merged
+                // segment's files are still orphan candidates and the drain is
+                // correct; when {@code published}, the segment is LIVE and its
+                // files MUST NOT be queued for retention deletion (would be
+                // silent data loss on an already-successful compaction).
+                boolean published = false;
                 // Issue #535 — test hook: fires AFTER candidates + authority are
                 // built but BEFORE rebuildSegment iterates the candidates'
                 // onDiskGraph references. Lets a reproducer test simulate the
@@ -2653,6 +2679,12 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
                     atomicSwapCompactionResult(candidates, rebuild.mergedSegment,
                             rebuild.bytesWritten, rebuild.vectorCount);
+                    // Issue #621 review item: the merged segment is now LIVE in
+                    // this.segments. The orphan list now references files that
+                    // back the searchable segment, so the catch (Error) arm
+                    // below must NOT drain it. See the published-flag comment
+                    // at the declaration site.
+                    published = true;
 
                     compactionSuccessesTotal.incrementAndGet();
                     compactionConsecutiveFailures.set(0);
@@ -2715,6 +2747,56 @@ public class PersistentVectorStore extends AbstractVectorStore {
                     LOGGER.log(Level.WARNING,
                             "vector store " + indexName + ": compaction metadata failure", e);
                     notifySegmentCountMonitor(); // immediate wakeup (issue #370)
+                } catch (Error e) {
+                    // Issue #621: an Error (e.g. Netty OutOfDirectMemoryError)
+                    // thrown by the post-rebuild section above —
+                    // lateDeletes.forEach(merged::deletePk),
+                    // warmUpNewSegmentsBeforePublish(...), or
+                    // atomicSwapCompactionResult(...) — would otherwise bypass the
+                    // CompactionException arm and leak the rebuild's
+                    // already-uploaded merged-output multipart blocks in remote
+                    // storage. The per-step Error catches in
+                    // VectorIndexCompactor.rebuildSegmentStreaming /
+                    // rebuildSegmentLegacy close the same gap one frame deeper;
+                    // this arm closes the symmetric gap when the failure surfaces
+                    // AFTER a successful rebuild but BEFORE
+                    // atomicSwapCompactionResult publishes the merged segment.
+                    //
+                    // Critical: we only drain rebuild.orphanPaths when
+                    // !published. If the Error fired AFTER
+                    // atomicSwapCompactionResult returned successfully (or from
+                    // its own post-publish work — best-effort commit / deprecate),
+                    // the merged segment is LIVE in this.segments and its files
+                    // are NOT orphans; draining them would silently delete a
+                    // searchable segment on the next retention reap. In the
+                    // post-publish case we just rethrow — the daemon safety net
+                    // at vectorIndexCompactionLoop logs SEVERE and bumps the
+                    // failure counter; ZK reconcile-on-restart heals any
+                    // post-publish registry hiccup. This matches the pre-#621
+                    // post-publish recovery shape (Error escaped uncaught,
+                    // segment intact).
+                    //
+                    // We rethrow rather than swallow because an Error caught here
+                    // may still leave the JVM in a degraded state where the next
+                    // cycle is not safe to start without the loop's back-off
+                    // pause. The daemon safety net at
+                    // vectorIndexCompactionLoop:2416 — itself Error-aware
+                    // (issue #621) — is the SINGLE place that logs SEVERE and
+                    // bumps compactionConsecutiveFailures for Error escapes, to
+                    // avoid double-counting (review item).
+                    if (!published) {
+                        long now = System.currentTimeMillis();
+                        long sinceGen = currentIndexStatusGeneration.get();
+                        if (rebuild != null && rebuild.orphanPaths != null) {
+                            for (String[] orphan : rebuild.orphanPaths) {
+                                this.pendingDeletes.add(new PendingDelete(
+                                        encodeMultipartPath(orphan[0], orphan[1]),
+                                        now, sinceGen));
+                            }
+                        }
+                    }
+                    notifySegmentCountMonitor();
+                    throw e;
                 }
             } finally {
                 // Drop the temporary BLink storages regardless of outcome so
@@ -2962,12 +3044,25 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
             try {
                 publisherSnapshot.stageNewSegments(stagedInfo);
-            } catch (RuntimeException stageFailed) {
+            } catch (RuntimeException | Error stageFailed) {
                 // Stage failed (e.g. ZK unreachable). Abort the local merge.
                 // Stage failure means no PROVISIONAL znode was created (or
                 // creation was interrupted), so unstage is a no-op; we MUST
                 // still queue the rebuild's already-uploaded multipart files
                 // for cleanup, otherwise they leak indefinitely.
+                //
+                // Issue #621: include Error in the catch list so a Netty
+                // OutOfDirectMemoryError (or any other Error sub-class) from
+                // the publisher boundary still drives queueMergedOutputForDeletion
+                // — without this, an Error would bypass the queue and the
+                // already-uploaded merged-output multipart blocks would leak
+                // (same data-loss shape as the streaming-rebuild Error gap
+                // closed by the per-step catches in
+                // VectorIndexCompactor.rebuildSegmentStreaming /
+                // rebuildSegmentLegacy). We rewrap as CompactionException so the
+                // outer runCompactionCycle catch arm records a clean
+                // METADATA_IO failure reason rather than letting the Error
+                // escape to the daemon safety net unattributed.
                 LOGGER.log(Level.WARNING,
                         "vector store {0}: stage of merged segment failed; aborting"
                                 + " local compaction merge",
@@ -2975,7 +3070,8 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 queueMergedOutputForDeletion(mergedOutput);
                 throw new VectorIndexCompactor.CompactionException(
                         VectorIndexCompactor.FailureReason.METADATA_IO,
-                        "stage of merged segment failed: " + stageFailed.getMessage());
+                        "stage of merged segment failed: " + stageFailed.getMessage(),
+                        stageFailed);
             }
 
             // Revalidate inputs are still ACTIVE in the registry. If a
@@ -3265,10 +3361,28 @@ public class PersistentVectorStore extends AbstractVectorStore {
             for (VectorSegment in : inputs) {
                 try {
                     in.close();
-                } catch (RuntimeException e) {
+                } catch (RuntimeException | Error e) {
                     // Narrow catch would be ideal but seg.close() can
                     // surface BLink close failures and we must not let
                     // the swap fail afterwards.
+                    //
+                    // Issue #621 review item: include Error too. This loop
+                    // runs AFTER the volatile publish at the top of Stage 3
+                    // (this.segments = new CopyOnWriteArrayList<>(...)) — at
+                    // this point the merged segment is LIVE. If an Error
+                    // (e.g. Netty OOM from a BLink page release, OOM from an
+                    // OnDiskGraph mmap Arena cleanup hook) escaped this catch
+                    // it would propagate back into the caller's catch (Error)
+                    // arm at runCompactionCycle, which only flips its
+                    // `published` flag AFTER atomicSwapCompactionResult
+                    // returns. With published == false the caller would drain
+                    // rebuild.orphanPaths — which back the now-LIVE merged
+                    // segment — into pendingDeletes, scheduling the live
+                    // segment's files for retention deletion. Same
+                    // silent-data-loss shape that #621 set out to close.
+                    // Swallowing here matches the existing RuntimeException
+                    // semantics: log and continue; the next close() in the
+                    // loop still runs.
                     LOGGER.log(Level.FINE,
                             "vector store " + indexName
                                     + ": ignoring close failure for compacted input segment",
@@ -3333,7 +3447,14 @@ public class PersistentVectorStore extends AbstractVectorStore {
             // merged-output path.
             try {
                 publisherSnapshot.commitStagedSegments(stagedInfo);
-            } catch (RuntimeException e) {
+            } catch (RuntimeException | Error e) {
+                // Issue #621: include Error so a post-publish Netty OOM from the
+                // ZK / publisher boundary does NOT escape into the caller's
+                // catch (Error) arm — that would erroneously interpret the
+                // already-published merged segment's orphan paths as deletable
+                // (review BLOCK on PR #624). The merged segment is already live
+                // at this point; reconcile-on-restart heals any registry hiccup
+                // — same recovery semantics as for the RuntimeException case.
                 LOGGER.log(Level.WARNING,
                         "vector store {0}: commit of merged segment failed; reconcile"
                                 + " on restart will heal: {1}",
@@ -3350,7 +3471,14 @@ public class PersistentVectorStore extends AbstractVectorStore {
                     // committed (IndexStatus + ZK) so it is safe to schedule the
                     // input files for deletion.
                     inputsSafeToDelete = true;
-                } catch (RuntimeException e) {
+                } catch (RuntimeException | Error e) {
+                    // Issue #621: include Error for the same reason as the
+                    // commitStagedSegments catch above — an Error from the ZK
+                    // boundary post-publish must not escape into the caller's
+                    // catch (Error) arm where it would be misinterpreted as a
+                    // pre-publish failure. inputsSafeToDelete intentionally
+                    // stays false; the optimizer's orphan-ACTIVE fold reclaims
+                    // the inputs on the next merge covering this region.
                     LOGGER.log(Level.WARNING,
                             "vector store {0}: deprecate of {1} input segments failed;"
                                     + " input files will NOT be queued for deletion to"
@@ -3377,8 +3505,30 @@ public class PersistentVectorStore extends AbstractVectorStore {
         }
 
         if (inputsSafeToDelete) {
-            for (VectorSegment in : inputs) {
-                queueSegmentPendingDelete(in, vectorIndexCompactionRetentionMs);
+            try {
+                for (VectorSegment in : inputs) {
+                    queueSegmentPendingDelete(in, vectorIndexCompactionRetentionMs);
+                }
+            } catch (RuntimeException | Error e) {
+                // Issue #621 review item: this loop runs AFTER the publish
+                // (Stage 3) and AFTER the post-publish ZK coordination above.
+                // queueSegmentPendingDelete does small allocations
+                // (new PendingDelete + pendingDeletes.add), but in principle an
+                // OOM here would escape atomicSwapCompactionResult into the
+                // caller's catch (Error) arm — which has not yet flipped
+                // `published = true` (that happens upon successful return).
+                // The caller would then drain rebuild.orphanPaths, scheduling
+                // the LIVE merged segment's files for retention deletion —
+                // silent data loss. Swallow the failure: the input segments
+                // stay in MinIO as orphans-but-intact (no zombie). The
+                // optimizer's orphan-ACTIVE fold path or a manual reaper
+                // reclaims them on the next pass.
+                LOGGER.log(Level.WARNING,
+                        "vector store {0}: failed to queue all {1} compacted-input"
+                                + " segments for retention-aware deletion;"
+                                + " input files stay in MinIO until the next"
+                                + " optimizer fold or reaper pass: {2}",
+                        new Object[]{indexName, inputs.size(), e.getMessage()});
             }
         }
     }
