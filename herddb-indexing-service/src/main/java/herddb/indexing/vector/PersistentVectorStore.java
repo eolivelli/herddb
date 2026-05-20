@@ -6024,6 +6024,25 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
         long phaseBStartMs = System.currentTimeMillis();
 
+        // Heap snapshot at Phase B entry. Phase B duration is provably
+        // O(N_live_shards) in this implementation (each shard is written from
+        // its already-built per-shard OnHeapGraphIndex with no global-graph
+        // search — see writeShardAsFusedPQSegment), so an unusually slow
+        // Phase B is almost always GC-pressure driven, not algorithmic
+        // (issue #614). Logging the heap utilisation at start and end makes
+        // such events unambiguous in the logs without needing a heap dump.
+        Runtime rt = Runtime.getRuntime();
+        long heapUsedAtStart = rt.totalMemory() - rt.freeMemory();
+        long heapMaxAtStart = rt.maxMemory();
+        long heapPctAtStart = heapMaxAtStart > 0
+                ? (heapUsedAtStart * 100L / heapMaxAtStart) : -1L;
+        LOGGER.log(Level.INFO,
+                "checkpoint {0} Phase B: starting ({1} shards, heap used={2} MB / max={3} MB = {4}%)",
+                new Object[]{indexName, snapshotShards.size(),
+                        heapUsedAtStart / (1024L * 1024L),
+                        heapMaxAtStart / (1024L * 1024L),
+                        heapPctAtStart});
+
         // Cleanup all shard builders first (finalizes HNSW diversity/refine)
         for (LiveGraphShard shard : snapshotShards) {
             if (shard.builder != null) {
@@ -6116,10 +6135,19 @@ public class PersistentVectorStore extends AbstractVectorStore {
             bytesWritten += r.graphFileSize + r.mapFileSize;
         }
         lastPhaseBBytesWritten.set(bytesWritten);
+        long heapUsedAtEnd = rt.totalMemory() - rt.freeMemory();
+        long heapMaxAtEnd = rt.maxMemory();
+        long heapPctAtEnd = heapMaxAtEnd > 0
+                ? (heapUsedAtEnd * 100L / heapMaxAtEnd) : -1L;
         LOGGER.log(Level.INFO,
-                "checkpoint {0} Phase B: completed in {1} ms ({2} shard segments, {3} total vectors, {4} bytes)",
+                "checkpoint {0} Phase B: completed in {1} ms ({2} shard segments, {3} total vectors, {4} bytes;"
+                        + " heap used={5} MB / max={6} MB = {7}%, delta {8}%)",
                 new Object[]{indexName, phaseBElapsedMs, newSegmentResults.size(),
-                        totalShardVectors, bytesWritten});
+                        totalShardVectors, bytesWritten,
+                        heapUsedAtEnd / (1024L * 1024L),
+                        heapMaxAtEnd / (1024L * 1024L),
+                        heapPctAtEnd,
+                        heapPctAtEnd - heapPctAtStart});
 
         // Order the results by segmentId so that the persisted IndexStatus and
         // the in-memory segment list are both deterministic.
@@ -6591,6 +6619,15 @@ public class PersistentVectorStore extends AbstractVectorStore {
         // Update compaction metrics for this shard
         compactionNodesTotal.addAndGet(shardSize);
 
+        // Per-step timing for the four sub-phases of a shard write
+        // (issue #614 observability). Initialised to start so a thrown
+        // exception leaves them as a deterministic "0 ms for everything
+        // after the throw" view in any future telemetry that consumes them.
+        long shardStartNanos = System.nanoTime();
+        long pqDoneNanos = shardStartNanos;
+        long graphWriteDoneNanos = shardStartNanos;
+        long graphUploadDoneNanos = shardStartNanos;
+
         writingGraphActive.incrementAndGet();
         try {
             // Get the shard's already-built OnHeapGraphIndex (no rebuild!)
@@ -6626,6 +6663,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
             ProductQuantization pq = useFusedPQForShard
                     ? getOrTrainPQ(shardView, pqSubspaces) : null;
             PQVectors pqv = (pq != null) ? pq.encodeAll(shardView, PhysicalCoreExecutor.pool()) : null;
+            pqDoneNanos = System.nanoTime();
 
             // Write graph + features to temp file, streaming via suppliers
             Path tempFile = Files.createTempFile(
@@ -6658,6 +6696,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
                     writtenFeatureIds = RemoteSegmentGraphMerger.featureSetToStringList(suppliers.keySet());
                 }
                 success = true;
+                graphWriteDoneNanos = System.nanoTime();
 
                 // Upload graph file
                 long graphSize = Files.size(tempFile);
@@ -6674,6 +6713,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
                     uploadingActive.decrementAndGet();
                 }
                 trackProvisionalMultipartFile(segUuid, "graph");
+                graphUploadDoneNanos = System.nanoTime();
 
                 ConcurrentHashMap<Integer, Bytes> ordinalToPk = buildOrdinalToPk(shard);
                 Path mapFile = writeFusedPQMapDataToTempFile(shardView, ordinalToPk);
@@ -6702,6 +6742,23 @@ public class PersistentVectorStore extends AbstractVectorStore {
                     // writtenFeatureIds was derived from suppliers.keySet() inside the
                     // writer block so it cannot drift if future code adds/removes features.
                     swr.jvectorFeatureIds = writtenFeatureIds;
+                    // Per-step timing breakdown for the shard write (issue #614).
+                    // Helps distinguish CPU-bound work (PQ train/encode, graph build)
+                    // from I/O-bound work (uploads) when a Phase B runs unusually
+                    // long. All four sub-steps are local to this shard — none of
+                    // them touch the global on-disk graph.
+                    long mapWriteUploadDoneNanos = System.nanoTime();
+                    long pqMs = (pqDoneNanos - shardStartNanos) / 1_000_000L;
+                    long graphWriteMs = (graphWriteDoneNanos - pqDoneNanos) / 1_000_000L;
+                    long graphUploadMs = (graphUploadDoneNanos - graphWriteDoneNanos) / 1_000_000L;
+                    long mapMs = (mapWriteUploadDoneNanos - graphUploadDoneNanos) / 1_000_000L;
+                    long totalMs = (mapWriteUploadDoneNanos - shardStartNanos) / 1_000_000L;
+                    LOGGER.log(Level.INFO,
+                            "checkpoint {0} Phase B: shard segment {1} ({2} vectors) written —"
+                                    + " pq={3} ms, graph-write={4} ms, graph-upload={5} ms,"
+                                    + " map-write+upload={6} ms, total={7} ms",
+                            new Object[]{indexName, segmentId, shardSize,
+                                    pqMs, graphWriteMs, graphUploadMs, mapMs, totalMs});
                     return swr;
                 } finally {
                     Files.deleteIfExists(mapFile);
