@@ -317,13 +317,12 @@ public class CachingObjectStorageTest {
         CachingObjectStorage caching = new CachingObjectStorage(inner, cacheDir, executor, 250);
 
         byte[] blob = new byte[100];
-        caching.write("blobs/a", blob).get();
-        caching.write("blobs/b", blob).get();
-        caching.write("blobs/c", blob).get();
-
-        // Let Caffeine run maintenance and the async removal listener drain on the executor.
-        caching.cleanUp();
-        flushExecutor();
+        // Use writeAndDrain so Caffeine's policy accounts for each put before the next
+        // arrives — guarantees the LRU age order a < b < c the assertion relies on
+        // (see issue #630).
+        writeAndDrain(caching, "blobs/a", blob);
+        writeAndDrain(caching, "blobs/b", blob);
+        writeAndDrain(caching, "blobs/c", blob);
 
         assertFalse("oldest entry should have been evicted", caching.isInCache("blobs/a"));
         assertTrue("newer entry should remain", caching.isInCache("blobs/b"));
@@ -338,9 +337,9 @@ public class CachingObjectStorageTest {
         Path cacheDir = folder.newFolder("cache3b").toPath();
         CachingObjectStorage caching = new CachingObjectStorage(inner, cacheDir, executor, 1);
 
-        caching.write("evict/big.page", new byte[100]).get();
-        caching.cleanUp();
-        flushExecutor();
+        // writeAndDrain runs cleanUp + flushExecutor synchronously after the put, so
+        // the size-policy decision is observable here (see issue #630).
+        writeAndDrain(caching, "evict/big.page", new byte[100]);
 
         assertFalse("evicted entry should no longer be resident",
                 caching.isInCache("evict/big.page"));
@@ -449,6 +448,36 @@ public class CachingObjectStorageTest {
         for (int i = 0; i < 8; i++) {
             CompletableFuture.runAsync(() -> { }, executor).get();
         }
+    }
+
+    /**
+     * Submits one write and drives Caffeine's per-thread write buffer + maintenance
+     * pass to a stable state before returning. Use this in size-budget eviction
+     * tests instead of a bare {@code write(...).get()} — see issue #630.
+     *
+     * <p>The race that motivates this helper: {@code write(...).get()} only waits for
+     * the disk-write completion and the synchronous {@code diskLru.asMap().put(...)}
+     * to return. Caffeine's size-policy accounting goes through a per-thread
+     * write buffer that is drained lazily by maintenance. Under contention (slow
+     * CPU, busy ForkJoinPool common pool — which is what CI looks like), the
+     * write buffer may still hold a pending record for the just-finished put by
+     * the time the next put arrives. When the test eventually calls
+     * {@code cleanUp()} just once at the end, the policy may then observe puts
+     * out of write-order and pick a different LRU victim — or in the worst case
+     * fail to reach the budget threshold at all — leaving the oldest entry
+     * resident and the assertion fails. Calling {@code cleanUp()} after each
+     * write forces the policy to drain the buffer and account for that put's
+     * weight before the next one arrives, so the LRU ordering of A &lt; B &lt; C
+     * is preserved deterministically.
+     */
+    private void writeAndDrain(CachingObjectStorage caching, String path, byte[] blob) throws Exception {
+        caching.write(path, blob).get();
+        // Drain Caffeine's write buffer + run any pending eviction now, while the
+        // newly-admitted entry is the freshest one — so the policy's LRU age order
+        // matches real-time put order. Pair with flushExecutor() to also drain any
+        // async removal-listener work the policy may have scheduled.
+        caching.cleanUp();
+        flushExecutor();
     }
 
     @Test
@@ -620,12 +649,12 @@ public class CachingObjectStorageTest {
         CachingObjectStorage caching = new CachingObjectStorage(inner, cacheDir, executor, 250);
 
         byte[] blob = new byte[100];
-        caching.write("blobs/a", blob).get();
-        caching.write("blobs/b", blob).get();
-        caching.write("blobs/c", blob).get();
-
-        caching.cleanUp();
-        flushExecutor();
+        // writeAndDrain drains Caffeine's write buffer after each put, so the size
+        // policy observes the puts in real-time order — the assertion that 'a' (the
+        // oldest) is evicted is otherwise flaky under CPU contention (issue #630).
+        writeAndDrain(caching, "blobs/a", blob);
+        writeAndDrain(caching, "blobs/b", blob);
+        writeAndDrain(caching, "blobs/c", blob);
 
         // Oldest blob should be evicted; newer ones should remain resident.
         assertFalse("oldest entry should have been evicted", caching.isInCache("blobs/a"));
