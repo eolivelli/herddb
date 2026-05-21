@@ -21,6 +21,7 @@
 package herddb.indexing.admin;
 
 import com.google.protobuf.ByteString;
+import herddb.indexing.proto.DeleteSegmentResponse;
 import herddb.indexing.proto.DescribeIndexResponse;
 import herddb.indexing.proto.GetEngineStatsResponse;
 import herddb.indexing.proto.GetIndexStatusResponse;
@@ -84,6 +85,7 @@ public final class IndexingAdminCli {
     static final String COMMAND_LIST_SHADOWS = "list-shadows";
     static final String COMMAND_SHADOW_STATUS = "shadow-status";
     static final String COMMAND_WAIT_SHADOW = "wait-shadow";
+    static final String COMMAND_DELETE_SEGMENT = "delete-segment";
 
     private final PrintStream out;
     private final PrintStream err;
@@ -131,6 +133,8 @@ public final class IndexingAdminCli {
                     return runShadowStatus(rest);
                 case COMMAND_WAIT_SHADOW:
                     return runWaitShadow(rest);
+                case COMMAND_DELETE_SEGMENT:
+                    return runDeleteSegment(rest);
                 default:
                     err.println("Unknown command: " + command);
                     printUsage();
@@ -162,6 +166,7 @@ public final class IndexingAdminCli {
         out.println("  list-shadows     Read ZooKeeper and print registered shadow replicas");
         out.println("  shadow-status    Print shadow-replica catch-up state of one instance");
         out.println("  wait-shadow      Block until an instance has caught up to a target LSN");
+        out.println("  delete-segment   Remove a corrupted segment from an index's IS metadata (#617)");
         out.println();
         out.println("Run 'indexing-admin <command> --help' for command-specific flags.");
     }
@@ -776,6 +781,115 @@ public final class IndexingAdminCli {
                         + ") reached=" + resp.getReached());
             }
             return resp.getReached() ? 0 : 1;
+        }
+    }
+
+    /**
+     * Issue #617: {@code delete-segment} command. Runs against a single IS
+     * instance and removes one segment from its in-memory metadata.
+     *
+     * <p>Safety: the CLI prompts on stdin (unless {@code --yes} is given)
+     * before submitting the RPC, and again when the operator supplies
+     * {@code --force} (which overrides the server-side refusal to delete a
+     * segment whose graph file IS reachable in storage). The default exit
+     * code is {@code 0} only when the server reports {@code removed=true};
+     * a presence-only "no-op" response returns {@code 1} so wrapper scripts
+     * can distinguish "I successfully removed it" from "it was already gone".
+     */
+    private int runDeleteSegment(String[] args) throws Exception {
+        Options opts = new Options();
+        addCommonOptions(opts);
+        addServerOption(opts);
+        addIndexOptions(opts);
+        opts.addOption(Option.builder().longOpt("segment").hasArg().argName("NAME")
+                .desc("segment storage key to remove (required, e.g. vidx_<UUID>_seg627)")
+                .required().build());
+        opts.addOption(Option.builder().longOpt("purge-storage")
+                .desc("also delete the segment's multipart graph + map files from storage").build());
+        opts.addOption(Option.builder().longOpt("force")
+                .desc("delete even when the graph file IS reachable in remote storage "
+                        + "(extra confirmation required unless --yes is set)").build());
+        opts.addOption(Option.builder().longOpt("yes")
+                .desc("skip interactive confirmation prompts (use in scripts)").build());
+
+        CommandLine cli = parse(opts, args, COMMAND_DELETE_SEGMENT);
+        if (cli == null) {
+            return 0;
+        }
+        String segment = cli.getOptionValue("segment");
+        boolean purge = cli.hasOption("purge-storage");
+        boolean force = cli.hasOption("force");
+        boolean yes = cli.hasOption("yes");
+
+        if (!yes) {
+            if (force) {
+                err.println("WARNING: --force will delete segment " + segment
+                        + " even if its graph file is reachable in storage.");
+                err.println("This usually means you are targeting the wrong segment.");
+            }
+            err.println("About to delete segment '" + segment + "' from "
+                    + cli.getOptionValue("table") + "." + cli.getOptionValue("index")
+                    + " on " + cli.getOptionValue("server")
+                    + (purge ? " (and purge multipart files from storage)" : "")
+                    + ". Continue? [y/N] ");
+            err.flush();
+            // Read from System.in directly rather than capture it via a CLI
+            // option: the CLI's stdin is exactly what the operator typed.
+            int ch = -1;
+            try {
+                ch = System.in.read();
+            } catch (java.io.IOException e) {
+                err.println("aborting: stdin not available (" + e + "); re-run with --yes");
+                return 1;
+            }
+            if (ch != 'y' && ch != 'Y') {
+                err.println("aborted by user");
+                return 1;
+            }
+        }
+
+        try (IndexingAdminClient client = buildClient(cli)) {
+            DeleteSegmentResponse resp = client.deleteSegment(
+                    cli.getOptionValue("tablespace"),
+                    cli.getOptionValue("table"),
+                    cli.getOptionValue("index"),
+                    segment, purge, force);
+            // pr-reviewer follow-up #3: the engine emits vectors_lost=-1 on the
+            // race path (segment dropped by a concurrent compaction between the
+            // engine's snapshot and the engine's drop call — the count is
+            // genuinely unknown, NOT zero). Render the sentinel as the explicit
+            // "unknown" string in both text and JSON so wrapper scripts don't
+            // mistake it for a real zero. We keep the field present in JSON
+            // (rather than omitting it) so the schema is stable; the field
+            // type widens from number to "number | \"unknown\"".
+            boolean vectorsLostUnknown = resp.getVectorsLost() < 0L;
+            if (cli.hasOption("json")) {
+                Map<String, Object> m = new LinkedHashMap<>();
+                m.put("segment", resp.getSegment());
+                m.put("removed", resp.getRemoved());
+                if (vectorsLostUnknown) {
+                    m.put("vectors_lost", "unknown");
+                } else {
+                    m.put("vectors_lost", resp.getVectorsLost());
+                }
+                m.put("graph_file_present", resp.getGraphFilePresent());
+                m.put("storage_purged", resp.getStoragePurged());
+                out.println(JsonWriter.toJson(m));
+            } else {
+                if (vectorsLostUnknown) {
+                    out.printf(Locale.ROOT,
+                            "segment=%s removed=%s vectors_lost=unknown (race) "
+                                    + "graph_file_present=%s storage_purged=%s%n",
+                            resp.getSegment(), resp.getRemoved(),
+                            resp.getGraphFilePresent(), resp.getStoragePurged());
+                } else {
+                    out.printf(Locale.ROOT,
+                            "segment=%s removed=%s vectors_lost=%d graph_file_present=%s storage_purged=%s%n",
+                            resp.getSegment(), resp.getRemoved(), resp.getVectorsLost(),
+                            resp.getGraphFilePresent(), resp.getStoragePurged());
+                }
+            }
+            return resp.getRemoved() ? 0 : 1;
         }
     }
 

@@ -23,6 +23,8 @@ package herddb.indexing;
 import com.google.protobuf.ByteString;
 import herddb.indexing.proto.DescribeIndexRequest;
 import herddb.indexing.proto.DescribeIndexResponse;
+import herddb.indexing.proto.DeleteSegmentRequest;
+import herddb.indexing.proto.DeleteSegmentResponse;
 import herddb.indexing.proto.DropIndexRequest;
 import herddb.indexing.proto.DropIndexResponse;
 import herddb.indexing.proto.GetEngineStatsRequest;
@@ -672,6 +674,76 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
             responseObserver.onCompleted();
         } catch (RuntimeException e) {
             LOGGER.log(Level.SEVERE, "DropIndex RPC failed for index " + indexName, e);
+            responseObserver.onError(Status.INTERNAL
+                    .withDescription(e.getMessage())
+                    .withCause(e)
+                    .asRuntimeException());
+        }
+    }
+
+    /**
+     * Issue #617: operator remediation tool. Removes a single corrupted
+     * segment from the IS in-memory metadata, with optional purge of its
+     * multipart files in the underlying {@link herddb.storage.DataStorageManager}.
+     *
+     * <p>Maps engine-level outcomes to gRPC status codes:
+     * <ul>
+     *   <li>{@code IndexingServiceEngine.DeleteSegmentException} →
+     *       {@code FAILED_PRECONDITION} (the request is well-formed but the
+     *       IS refuses to act — wrong index, wrong segment, or graph file
+     *       still present without {@code force=true}).</li>
+     *   <li>Other {@code RuntimeException} → {@code INTERNAL} (unexpected
+     *       failure during the in-memory mutation or storage purge).</li>
+     * </ul>
+     */
+    @Override
+    public void deleteSegment(DeleteSegmentRequest request,
+                              StreamObserver<DeleteSegmentResponse> responseObserver) {
+        String table = request.getTable();
+        String indexName = request.getIndex();
+        String segment = request.getSegment();
+        LOGGER.log(Level.WARNING,
+                "DeleteSegment RPC: index={0} table={1} tablespace={2} segment={3}"
+                        + " purge_storage={4} force={5} (issue #617)",
+                new Object[]{indexName, table, request.getTablespace(), segment,
+                    request.getPurgeStorage(), request.getForce()});
+        // pr-reviewer follow-up #1: refuse the RPC up-front when this instance
+        // is configured as a shadow replica. Shadow instances mirror their
+        // primary's segment list via reloadFromIndexStatus(); accepting a
+        // delete-segment write on a shadow would silently diverge the two
+        // copies and the next reload would just put the segment back. The
+        // operator must target the primary instead.
+        if (engine.isConfiguredAsShadow()) {
+            String desc = "not_primary: this indexing-service instance is a shadow replica "
+                    + "(shadowOf=" + engine.getShadowOfOrMinusOne()
+                    + "); target the primary instead";
+            LOGGER.log(Level.WARNING,
+                    "DeleteSegment RPC rejected on shadow instance: {0}", desc);
+            responseObserver.onError(Status.FAILED_PRECONDITION
+                    .withDescription(desc)
+                    .asRuntimeException());
+            return;
+        }
+        try {
+            IndexingServiceEngine.DeleteSegmentResult result = engine.deleteSegment(
+                    table, indexName, segment,
+                    request.getPurgeStorage(), request.getForce());
+            responseObserver.onNext(DeleteSegmentResponse.newBuilder()
+                    .setSegment(result.segment)
+                    .setRemoved(result.removed)
+                    .setVectorsLost(result.vectorsLost)
+                    .setGraphFilePresent(result.graphFilePresent)
+                    .setStoragePurged(result.storagePurged)
+                    .build());
+            responseObserver.onCompleted();
+        } catch (IndexingServiceEngine.DeleteSegmentException e) {
+            LOGGER.log(Level.WARNING,
+                    "DeleteSegment RPC rejected for segment " + segment + ": " + e.getMessage());
+            responseObserver.onError(Status.FAILED_PRECONDITION
+                    .withDescription(e.getMessage())
+                    .asRuntimeException());
+        } catch (RuntimeException e) {
+            LOGGER.log(Level.SEVERE, "DeleteSegment RPC failed for segment " + segment, e);
             responseObserver.onError(Status.INTERNAL
                     .withDescription(e.getMessage())
                     .withCause(e)

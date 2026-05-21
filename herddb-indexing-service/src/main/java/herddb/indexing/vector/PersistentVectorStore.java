@@ -3854,6 +3854,17 @@ public class PersistentVectorStore extends AbstractVectorStore {
         return segments.get(idx).externalStorageKey;
     }
 
+    /**
+     * Test-only accessor for the deferred-close queue used by
+     * {@link #dropSegmentByUuid} and {@link #dropSegmentByStorageKey}.
+     * Returns the current number of queued (not-yet-closed) segments.
+     * Pr-reviewer follow-up #3 for issue #617 uses this to assert the
+     * queue eventually drains after the operator-driven drop.
+     */
+    public int getPendingSegmentClosesSizeForTest() {
+        return pendingSegmentCloses.size();
+    }
+
     VectorSegment preloadCompactedSegment(SegmentWriteResult swr) throws IOException, DataStorageManagerException {
         VectorSegment seg = new VectorSegment(swr.segmentId);
         seg.segmentUuid = swr.segmentUuid;
@@ -4089,6 +4100,64 @@ public class PersistentVectorStore extends AbstractVectorStore {
             //
             // The drain is outside the writeLock to keep the writeLock window
             // tight and avoid lock-order inversion against compactionLock.
+            drainPendingSegmentClosesOpportunistically();
+        }
+    }
+
+    /**
+     * Issue #617: removes a segment from the active list by its
+     * <em>multipart storage key</em>. Shares the same lock discipline and
+     * deferred-close machinery as {@link #dropSegmentByUuid}.
+     *
+     * <p>Matching is by {@link #segmentStorageKey(VectorSegment)}, so this
+     * method works for both IS-locally-produced segments (legacy key
+     * {@code indexUUID + "_seg" + segmentId}) and adopted ones
+     * ({@code externalStorageKey}).
+     *
+     * <p>Idempotent: when no segment matches, returns
+     * {@link SegmentDropResult#NOT_FOUND} without mutating state.
+     */
+    @Override
+    public SegmentDropResult dropSegmentByStorageKey(String storageKey) {
+        if (storageKey == null || storageKey.isEmpty()) {
+            return SegmentDropResult.NOT_FOUND;
+        }
+        try {
+            VectorSegment found = null;
+            stateLock.writeLock().lock();
+            try {
+                List<VectorSegment> newList = new java.util.concurrent.CopyOnWriteArrayList<>();
+                for (VectorSegment s : segments) {
+                    if (found == null && storageKey.equals(segmentStorageKey(s))) {
+                        found = s;
+                    } else {
+                        newList.add(s);
+                    }
+                }
+                if (found == null) {
+                    return SegmentDropResult.NOT_FOUND;
+                }
+                segments = newList;
+                // Mirror dropSegmentByUuid: mark dirty so the next checkpoint
+                // serialises the reduced segment list. Without this the
+                // checkpoint gate would skip and leave a stale entry on disk.
+                dirty.set(true);
+                long vectorsLost = found.liveCount.get();
+                LOGGER.log(Level.SEVERE,
+                        "dropSegmentByStorageKey: operator removed segment {0} from"
+                                + " store {1} (vectors_lost={2}); total on-disk"
+                                + " segments now {3}",
+                        new Object[]{storageKey, indexName, vectorsLost, segments.size()});
+                // Same deferred-close protocol as dropSegmentByUuid (issue #535):
+                // a concurrent compaction cycle may still hold a reference to
+                // `found.onDiskGraph`; queue the close so it runs after the
+                // cycle releases its compactionLock.
+                pendingSegmentCloses.add(found);
+                return new SegmentDropResult(true, vectorsLost);
+            } finally {
+                stateLock.writeLock().unlock();
+            }
+        } finally {
             drainPendingSegmentClosesOpportunistically();
         }
     }
@@ -8919,6 +8988,30 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
     public int getOnDiskNodeCount() {
         return (int) onDiskNodeToPkSize();
+    }
+
+    /**
+     * Issue #617: snapshot of the multipart storage keys of every on-disk
+     * segment currently registered in this store. Used by the operator-
+     * facing {@code DeleteSegment} RPC handler to enumerate candidates
+     * (via {@code describe-index --json}'s {@code corrupted_segments} list)
+     * and to verify presence before mutating state.
+     *
+     * <p>The returned list is a defensive copy and is stable across
+     * concurrent {@link #dropSegmentByStorageKey} / compaction swaps. It
+     * may legitimately contain duplicate-looking entries on a transient
+     * adoption race: callers MUST treat the result as a snapshot and
+     * re-read it if they need a fresh view.
+     */
+    public java.util.List<String> getSegmentStorageKeysSnapshot() {
+        // CopyOnWriteArrayList iterator is snapshot-safe; no readLock needed
+        // for the enumeration itself, only for any subsequent mutation that
+        // wants to act on the snapshot atomically (that is the caller's job).
+        java.util.List<String> out = new java.util.ArrayList<>(segments.size());
+        for (VectorSegment s : segments) {
+            out.add(segmentStorageKey(s));
+        }
+        return out;
     }
 
     /**
