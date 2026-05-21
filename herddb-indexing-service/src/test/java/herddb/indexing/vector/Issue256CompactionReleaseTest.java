@@ -241,7 +241,11 @@ public class Issue256CompactionReleaseTest {
             store.start();
             seedFiveSegments(store);
 
-            // 3 cycles: fail, succeed, succeed (with fresh ingestion between).
+            // 3 attempts: fail, succeed, decline (fresh ingest between attempts 1
+            // and 2). Cycle 3 declines under {@code minCount=4} because attempt 2
+            // collapses every heterogeneous candidate into a single merged
+            // segment. The assertion {@code observerFires >= 2} still holds via
+            // the two non-decline attempts.
             dsm.failNextMultipartWrites.set(1);
             store.runCompactionCycle();
 

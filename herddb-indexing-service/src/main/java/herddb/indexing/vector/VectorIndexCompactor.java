@@ -879,17 +879,19 @@ final class VectorIndexCompactor {
 
     /**
      * Fills the synthetic shard by reading authoritative vectors from
-     * every candidate segment's on-disk graph.
+     * every candidate segment's eagerly-downloaded local-file graph.
      *
-     * <p>Issue #628: when {@code localSources} is non-null, vector reads come
-     * from the pre-downloaded local-file-backed {@link OnDiskGraphIndex}
-     * objects (built by {@link #eagerlyDownloadCandidates}) instead of
-     * {@code seg.onDiskGraph}. The two lists are parallel — index {@code i}
-     * in {@code localSources} corresponds to {@code candidates.get(i)}. The
-     * local-source path bypasses {@code SegmentBlockCache} / gRPC entirely,
-     * which is the root-cause fix: the previous behaviour issued tens of
-     * millions of small remote block reads per cycle at large segment
-     * counts, stalling Phase B for hours.
+     * <p>{@code localSources} runs parallel to {@code candidates}: index
+     * {@code i} in {@code localSources} corresponds to
+     * {@code candidates.get(i)}. Reading vectors from the local files
+     * bypasses {@code SegmentBlockCache} / gRPC entirely, which is the
+     * root-cause fix for the Phase-B stall described in the issue tracker:
+     * the previous behaviour issued tens of millions of small remote block
+     * reads per cycle at large segment counts.
+     *
+     * @param localSources non-null, same length as {@code candidates};
+     *     guaranteed by the caller ({@link #rebuildSegmentLegacy}, which
+     *     validates the contract before delegation).
      */
     private static void populateSyntheticShard(
             PersistentVectorStore store,
@@ -901,11 +903,7 @@ final class VectorIndexCompactor {
 
         for (int s = 0; s < candidates.size(); s++) {
             VectorSegment seg = candidates.get(s);
-            // Prefer the eagerly-downloaded local-file graph (issue #628);
-            // fall back to seg.onDiskGraph only when no local source was
-            // provided (legacy callers — currently none in production, but
-            // kept defensively so an unexpected null doesn't NPE here).
-            OnDiskGraphIndex odg = (localSources != null) ? localSources.get(s) : seg.onDiskGraph;
+            OnDiskGraphIndex odg = localSources.get(s);
             if (odg == null) {
                 throw new CompactionException(FailureReason.CORRUPTION,
                         "candidate segment " + seg.segmentId + " has no on-disk graph");
