@@ -78,23 +78,15 @@ public class RemoteSegmentMergerLegacyOverlayTest {
 
     private MemoryDataStorageManager dsm;
     private Path tmpDir;
-    private boolean savedStreamingFlag;
 
     @Before
     public void setUp() throws Exception {
         dsm = new MemoryDataStorageManager();
         tmpDir = tmp.newFolder("merger-tmp").toPath();
-        // Issue #485: synthetic inputs with no real graph multipart file —
-        // force the legacy in-memory rebuild path.
-        savedStreamingFlag =
-                herddb.indexing.vector.PersistentVectorStore.isStreamingCompactionEnabled();
-        herddb.indexing.vector.PersistentVectorStore.setStreamingCompactionEnabled(false);
-    }
-
-    @org.junit.After
-    public void tearDown() {
-        herddb.indexing.vector.PersistentVectorStore.setStreamingCompactionEnabled(
-                savedStreamingFlag);
+        // Synthetic inputs carry no real graph multipart file — the
+        // streaming dispatch in {@code RemoteSegmentGraphMerger.merge}
+        // automatically routes to {@code mergeLegacy} when
+        // {@code graphFileSize <= 0} for any input.
     }
 
     private SegmentMetadata writeInputAndPublishOverlay(
@@ -153,7 +145,9 @@ public class RemoteSegmentMergerLegacyOverlayTest {
                 .mapPath(mapPath)
                 .tombstonePath(tombstonePath)
                 .baseLsn(new LogSequenceNumber(1L, 100L))
-                .sizeBytes(mapSize * 2L).mapFileSize(mapSize)
+                // sizeBytes == mapFileSize → derived graphFileSize == 0
+                // forces RemoteSegmentGraphMerger.merge into mergeLegacy
+                .sizeBytes(mapSize).mapFileSize(mapSize)
                 .vectorCount(VECTORS_PER_SEGMENT).generation(1L)
                 .createdAtEpochMillis(0L)
                 // Legacy: no overlayGeneration set (defaults to 0L).

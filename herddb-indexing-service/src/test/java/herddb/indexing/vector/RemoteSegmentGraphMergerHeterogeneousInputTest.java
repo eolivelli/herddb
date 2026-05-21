@@ -63,18 +63,14 @@ public class RemoteSegmentGraphMergerHeterogeneousInputTest {
     @Rule
     public TemporaryFolder tmpFolder = new TemporaryFolder();
 
-    private boolean savedStreamingFlag;
-
     @Before
     public void setUp() {
         PersistentVectorStore.minLiveVectorsForCheckpoint = 0;
-        savedStreamingFlag = VectorIndexCompactor.streamingCompactionEnabled;
     }
 
     @After
     public void tearDown() {
         PersistentVectorStore.minLiveVectorsForCheckpoint = 50_000;
-        VectorIndexCompactor.streamingCompactionEnabled = savedStreamingFlag;
     }
 
     /**
@@ -208,10 +204,9 @@ public class RemoteSegmentGraphMergerHeterogeneousInputTest {
         String outIdx = "idx-merged";
         long outSegId = 999L;
 
-        // Enable streaming so the heterogeneous-detection code path in mergeStreaming
-        // is exercised (it detects feature-set mismatch and falls back to mergeLegacy).
-        VectorIndexCompactor.streamingCompactionEnabled = true;
-
+        // Streaming compaction is unconditional — the heterogeneous-detection
+        // code path in mergeStreaming detects the feature-set mismatch and
+        // falls back to mergeLegacy automatically.
         RemoteSegmentGraphMerger merger = new RemoteSegmentGraphMerger(
                 dsm, tmpFolder.newFolder().toPath(),
                 /* graphM */ 16, /* beamWidth */ 100,
@@ -302,8 +297,6 @@ public class RemoteSegmentGraphMergerHeterogeneousInputTest {
                         /* tombstones  */ new int[0]));
             }
         }
-
-        VectorIndexCompactor.streamingCompactionEnabled = true;
 
         RemoteSegmentGraphMerger merger = new RemoteSegmentGraphMerger(
                 dsm, tmpFolder.newFolder().toPath(),

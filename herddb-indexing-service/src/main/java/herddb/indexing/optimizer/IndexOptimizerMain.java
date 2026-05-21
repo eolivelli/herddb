@@ -289,23 +289,6 @@ public final class IndexOptimizerMain {
         if (engine != null) {
             return;
         }
-        // Streaming compaction (issue #485): config key takes precedence over
-        // the herddb.vectorindex.streamingCompactionEnabled system property
-        // at optimizer-pod startup. The flag is process-wide because
-        // RemoteSegmentGraphMerger consults the same static
-        // (VectorIndexCompactor.streamingCompactionEnabled). The optimizer
-        // pod runs in a separate process from the IS, so the IS-side config
-        // key vector.index.compaction.streaming.enabled does NOT reach this
-        // pod — operators must set indexoptimizer.merge.streaming.enabled on
-        // the optimizer config to honor the escape hatch here.
-        boolean streamingEnabled = configuration.getBoolean(
-                OptimizerConfiguration.PROPERTY_MERGE_STREAMING_ENABLED,
-                OptimizerConfiguration.PROPERTY_MERGE_STREAMING_ENABLED_DEFAULT);
-        herddb.indexing.vector.PersistentVectorStore.setStreamingCompactionEnabled(streamingEnabled);
-        LOGGER.log(Level.INFO,
-                "optimizer-pod streaming compaction: enabled={0} (config key {1})",
-                new Object[]{streamingEnabled,
-                        OptimizerConfiguration.PROPERTY_MERGE_STREAMING_ENABLED});
 
         this.zkAddress = configuration.getString(
                 OptimizerConfiguration.PROPERTY_ZOOKEEPER_ADDRESS,

@@ -133,6 +133,21 @@ catch is unavoidable (e.g. isolating a plugin boundary, preventing a background 
 from dying, top-level request handlers), add a comment explaining *why* the broad catch
 is required.
 
+## Vector Search Documentation (VECTOR.md)
+`VECTOR.md` at the repository root is the operator-facing contract for the
+vector search subsystem — architecture, configuration keys, compaction
+pipeline, optimizer-pod protocol, on-disk format, recovery semantics.
+Whenever a change touches the indexing service, `PersistentVectorStore`,
+`VectorIndexCompactor`, `RemoteSegmentGraphMerger`, the
+`index-optimizer` pod, the Remote File Service vector path, or any
+operator-visible configuration key, **update `VECTOR.md` in the same PR**
+so it continues to describe the code as it stands today. The file is
+written as a present-tense reference: state what the code does now, not
+what it used to do — do not add change-history bullets, do not link to
+GitHub issues or PRs, and avoid phrases like "removed", "legacy", or
+"used to". If a behaviour is being replaced, rewrite the affected
+paragraphs in place so they describe only the current behaviour.
+
 ## k3s-local Vector Benchmark
 Monitoring and supervision guidance for the k3s-local vector benchmark lives in the
 `herddb-k3s-bench` agent definition at `.claude/agents/herddb-k3s-bench.md`.

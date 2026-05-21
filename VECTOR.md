@@ -2,6 +2,13 @@
 
 This document describes the vector index feature: its architecture, how to use it, storage format, and implementation details.
 
+> This file documents the Vector Search capabilities as currently available
+> in the code base and is kept up to date contextually with every change
+> that touches the indexing service, the compaction pipeline, or the
+> optimizer pod. Treat it as the operator-facing contract for vector
+> search: anything described here reflects current behaviour, not a
+> roadmap or a historical changelog.
+
 ---
 
 ## Architecture Overview
@@ -183,8 +190,6 @@ The `IndexingServerConfiguration` class provides typed access to all IndexingSer
 | Vector compaction min bytes | `vector.index.compaction.minBytes` | `268435456` | Minimum total size of compaction candidates before firing (256 MB) |
 | Vector compaction max bytes | `vector.index.compaction.maxBytes` | `1073741824` | Hard cap on bytes read per compaction run (1 GB) |
 | Vector compaction retention | `vector.index.compaction.retentionMs` | `600000` | Retention deadline for old segment files after a compaction swap (10 min) |
-| Vector streaming compaction (IS) | `vector.index.compaction.streaming.enabled` | `true` | Use jvector's `OnDiskGraphIndexCompactor` (issue #485) for IS-local vector-index compaction instead of the in-memory `GraphIndexBuilder` rebuild. Memory cost is bounded by `taskWindowSize × maxDegree` instead of `numTotalNodes × dimension`, so the historical 1 GB cap on `vector.index.compaction.maxBytes` is no longer dictated by heap pressure. Setting to `false` falls back to the legacy in-memory rebuild path (operator escape hatch). The same value can also be set via the JVM system property `herddb.vectorindex.streamingCompactionEnabled` (the config key wins at IS startup). **This key only affects the IS process; the optimizer pod has its own knob (next row).** |
-| Vector streaming compaction (optimizer pod) | `indexoptimizer.merge.streaming.enabled` | `true` | Same flag as `vector.index.compaction.streaming.enabled` but consumed by the external `index-optimizer` pod (`IndexOptimizerMain.start()`). The optimizer runs in a separate process and does not see the IS-side config map, so operators must set this key on the optimizer's own configuration to flip the streaming engine off there. Setting only the IS-side key with the optimizer enabled leaves the optimizer pod on streaming (or whatever the JVM system property `herddb.vectorindex.streamingCompactionEnabled` was set to at optimizer-pod JVM startup). |
 | Storage type | `indexing.storage.type` | `file` | `file` (persistent) or `memory` (testing) |
 | Memory multiplier | `indexing.vector.memoryMultiplier` | `5.0` | Multiplier for memory estimation |
 | Apply parallelism | `indexing.apply.parallelism` | `auto` | Number of DML apply worker threads (default: max(1, availableProcessors/2)) |
@@ -617,22 +622,24 @@ This reclaims storage held by deleted or superseded PKs — the previous design 
 
 **Shadow acknowledgement.** Shadow replicas expose their loaded generation via the `GetShadowStatus` RPC; `IndexingServiceEngine` aggregates `min(appliedIndexStatusGeneration)` across all registered shadows. The leader passes that minimum to `reapExpiredPendingDeletes` before every physical delete pass.
 
-### Streaming compaction engine (issue #485)
+### Streaming compaction engine
 
-By default (`vector.index.compaction.streaming.enabled=true`), HerdDB drives compaction through jvector's `OnDiskGraphIndexCompactor` — a streaming N:1 graph-merge engine that works directly on the candidates' on-disk graphs, never materialising a full `OnHeapGraphIndex` in heap. Memory cost is bounded by `O(taskWindowSize × maxDegree × float[dim])` instead of `O(numTotalNodes × dimension)`, lifting the historical 1 GB cap on `vector.index.compaction.maxBytes` (the cap was sized for the in-memory rebuild's heap budget, not for I/O or disk).
+Compaction is driven through jvector's `OnDiskGraphIndexCompactor` — a streaming N:1 graph-merge engine that works directly on the candidates' on-disk graphs, never materialising a full `OnHeapGraphIndex` in heap. Memory cost is bounded by `O(taskWindowSize × maxDegree × float[dim])` instead of `O(numTotalNodes × dimension)`, so the in-memory rebuild's heap budget no longer dictates `vector.index.compaction.maxBytes`. There is no toggle: every compaction cycle attempts the streaming path first.
 
-The same flag governs both compaction sites:
+Both compaction sites share the same engine:
 
-- **IS-local path** — `VectorIndexCompactor.rebuildSegment` opens each candidate's already-loaded `seg.onDiskGraph`, builds per-source `FixedBitSet` of authoritative live ordinals, hands them to `OnDiskGraphIndexCompactor.compact(localTempFile)`, then walks each surviving ordinal to emit the merged map file. Output ordinals are dense `0..keptCount-1` via a primitive-int `DenseLiveOrdinalMapper` (avoids the per-source-record-sized waste a sparse `OffsetMapper` would leave behind). The merged segment's PQ codebook is retrained internally by jvector's `PQRetrainer` on a balanced sample of the compaction inputs; HerdDB invalidates `cachedPQ` after a successful streaming swap so the next checkpoint trains a fresh codebook from the current global distribution.
+- **IS-local path** — `VectorIndexCompactor.rebuildSegmentStreaming` first eagerly downloads each candidate's graph file to a local temp file (or opens a sequential reader copy for in-memory DSMs), so every subsequent read during compaction comes from local storage rather than the per-node `SegmentBlockCache` / gRPC round-trip. It then builds per-source `FixedBitSet` of authoritative live ordinals, hands them to `OnDiskGraphIndexCompactor.compact(localTempFile)`, and walks each surviving ordinal to emit the merged map file. Output ordinals are dense `0..keptCount-1` via a primitive-int `DenseLiveOrdinalMapper` (avoids the per-source-record-sized waste a sparse `OffsetMapper` would leave behind). The merged segment's PQ codebook is retrained internally by jvector's `PQRetrainer` on a balanced sample of the compaction inputs; HerdDB invalidates `cachedPQ` after a successful streaming swap so the next checkpoint trains a fresh codebook from the current global distribution.
 - **Optimizer-pod path** — `RemoteSegmentGraphMerger.mergeStreaming` downloads each input's graph + map files into a local scratch directory, opens the graph as `OnDiskGraphIndex`, builds the same authority + dense-mapper machinery, runs `OnDiskGraphIndexCompactor.compact(...)`, and uploads both the merged graph and a freshly-emitted map file. The optimizer pod's heap can be sized for the streaming cost rather than the full graph size. `RemoteSegmentMerger` derives each input's `graphFileSize` as `metadata.sizeBytes - metadata.mapFileSize` (no on-disk schema change required — `sizeBytes` already aggregates both files).
 
-Both paths assert the candidate carries the `INLINE_VECTORS` feature (required by `OnDiskGraphIndexCompactor` to read source vectors during the graph rewrite). HerdDB writes the feature unconditionally at every checkpoint site, so the assertion is a fail-fast invariant guard rather than a fallback gate. The flag may be flipped to `false` to revert to the legacy in-memory rebuild — kept as an operator escape hatch for the lifetime of the rollout. **Two config keys exist because the IS and the optimizer pod run in separate JVMs**: `vector.index.compaction.streaming.enabled` (IS only) and `indexoptimizer.merge.streaming.enabled` (optimizer-pod only). Both default to `true` and both may be overridden by the JVM system property `herddb.vectorindex.streamingCompactionEnabled` set at process JVM startup; the per-process config key wins at `start()`.
+Both paths assert the candidate carries the `INLINE_VECTORS` feature (required by `OnDiskGraphIndexCompactor` to read source vectors during the graph rewrite). HerdDB writes the feature unconditionally at every checkpoint site, so the assertion is a fail-fast invariant guard rather than a fallback gate.
 
-**Fallback to legacy.** Three guard rails route a cycle to the legacy in-memory path even when the flag is on:
+**Automatic fallback to the in-memory rebuild.** Three conditions route a cycle to `rebuildSegmentLegacy` (IS-local) or `mergeLegacy` (optimizer-pod) — the in-memory `GraphIndexBuilder` rebuild that walks each candidate's authoritative PKs and inserts the vectors into a fresh graph:
 
-- The IS-local path falls through if only one candidate survives the policy filter (jvector's `OnDiskGraphIndexCompactor` requires `sources.size() >= 2`). The fallback increments `VectorIndexCompactor.STREAMING_FALLBACK_TO_LEGACY_TOTAL` and logs at `INFO` for operational visibility.
-- The optimizer-pod path falls through when any input has `graphFileSize <= 0` (defensive against legacy znodes; `RemoteSegmentMerger` rejects such inputs at the SPI boundary in production).
-- Both paths surface a missing `INLINE_VECTORS` as `CompactionException(CORRUPTION, ...)` rather than masking it: HerdDB writes the feature unconditionally, so a missing entry signals a regression that should fail the cycle loudly.
+- **Heterogeneous candidate feature sets** — `OnDiskGraphIndexCompactor.validateFeatures()` requires all source segments to share the same `FeatureId` keyset. Mixed `FusedPQ` / `INLINE_VECTORS`-only inputs (which arise naturally when some segments fall below `MIN_VECTORS_FOR_FUSED_PQ`) are detected by `allCandidatesHaveUniformFeatures` before handing control to the compactor.
+- **Fewer than two valid sources** — `OnDiskGraphIndexCompactor` rejects single-source construction. When the policy hands a single-candidate cycle to the streaming entry point the fallback fires, increments `VectorIndexCompactor.STREAMING_FALLBACK_TO_LEGACY_TOTAL`, and logs at `INFO`.
+- **Missing or zero `graphFileSize` on the optimizer-pod path** — the streaming dispatch needs the exact graph size to drive the multipart reader. Inputs without it (legacy znodes that predate the per-file size split, or partial uploads) bypass `mergeStreaming` and route to `mergeLegacy` automatically.
+
+The fallback path benefits from the same eager-download step: `rebuildSegmentLegacy` reads its source vectors from the pre-downloaded local graph files (not `seg.onDiskGraph`), so even the in-memory rebuild bypasses `SegmentBlockCache` and gRPC. A missing `INLINE_VECTORS` feature surfaces as `CompactionException(CORRUPTION, ...)` on both paths rather than being masked — HerdDB writes the feature unconditionally, so absence signals a regression that should fail the cycle loudly.
 
 **Orphan tracking on partial upload.** Upload of the merged graph and map files is two sequential remote calls. Either may succeed independently; if the second fails, the first's multipart object is queued in `pendingDeletes` (IS-local path) or best-effort-deleted from the DSM (optimizer path) so the retention reaper sweeps the leak. `CompactionException` carries an `orphanPaths` field that `runCompactionCycle`'s `catch (CompactionException)` arm drains into the same retention pipeline as the swap-out inputs.
 
@@ -715,10 +722,10 @@ Three fencing primitives guard the leader / worker invariants:
 3. For each index, partition segments into `ACTIVE` / `DEPRECATED` (others ignored).
 4. **Reap** any DEPRECATED segments whose `retentionUntilEpochMillis` has elapsed: CAS to `DELETED`, then delete the znode. When `indexoptimizer.safeMode.fileDeletion=true` (the default) the reaper only progresses the znode lifecycle and leaves the multipart files for the IS-side `SegmentAssignmentWatcher` to clean up; flipping safe-mode to `false` makes the reaper also call `DataStorageManager.deleteMultipartIndexFile`.
 5. **Pick merge candidates** using the configured `MergePolicy` (see "Merge policies" below).
-6. **Run the merger**: `SegmentMerger.merge(inputs, newOwnerInstance)`. The production merger is `RemoteSegmentMerger` — it downloads each input's graph + map (and any tombstone overlay) from the Remote File Service via `RemoteFileClient`, runs `RemoteSegmentGraphMerger.mergeStreaming` (jvector's `OnDiskGraphIndexCompactor`, see "Streaming compaction engine" above), uploads the merged output and a fresh empty tombstone overlay, and returns a new `SegmentMetadata`. Per-index jvector build parameters (M, beamWidth, alpha, …) are read from the index's checkpoint metadata on the Remote File Service (#516), not from a local IS configmap — the optimizer pod stays stateless w.r.t. per-index tuning.
+6. **Run the merger**: `SegmentMerger.merge(inputs, newOwnerInstance)`. The production merger is `RemoteSegmentMerger` — it downloads each input's graph + map (and any tombstone overlay) from the Remote File Service via `RemoteFileClient`, runs `RemoteSegmentGraphMerger.mergeStreaming` (jvector's `OnDiskGraphIndexCompactor`, see "Streaming compaction engine" above), uploads the merged output and a fresh empty tombstone overlay, and returns a new `SegmentMetadata`. Per-index jvector build parameters (M, beamWidth, alpha, …) are read from the index's checkpoint metadata on the Remote File Service, not from a local IS configmap — the optimizer pod stays stateless w.r.t. per-index tuning.
 7. **Publish** the output (`createSegment`, state = `ACTIVE`) and CAS-deprecate the inputs (`state = DEPRECATED, replacedBy = [output.uuid], retentionUntilEpochMillis`).
 
-Crash-recovery is implicit: the engine is stateless across runs, so a partial state at restart (e.g. output published but inputs not yet deprecated) is observed on the next tick and either re-attempted or healed by the next compaction cycle. ZK CAS prevents corruption. A ZK session expiry is recovered in-process (#504) — the optimizer reopens its session and rebuilds its watches without a pod restart.
+Crash-recovery is implicit: the engine is stateless across runs, so a partial state at restart (e.g. output published but inputs not yet deprecated) is observed on the next tick and either re-attempted or healed by the next compaction cycle. ZK CAS prevents corruption. A ZK session expiry is recovered in-process — the optimizer reopens its session and rebuilds its watches without a pod restart.
 
 #### Merger SPI and late-binding upgrade
 
@@ -728,14 +735,14 @@ The merger is discovered via `ServiceLoader<SegmentMerger>`. The resolution orde
 2. `RemoteSegmentMerger`, instantiated when at least one Remote File Service has registered at `/{basePath}/fileServers` in ZK.
 3. `NoopMerger` — a logging fallback that declines every merge; used at startup before any file server is visible.
 
-**Late-binding upgrade (#507).** If the optimizer starts before any file server has registered (which is common during a cold cluster boot), it begins with the `NoopMerger`. A watch on `/{basePath}/fileServers` fires the moment a server registers; the optimizer atomically swaps the merger to `RemoteSegmentMerger` for the next tick — no pod restart required.
+**Late-binding upgrade.** If the optimizer starts before any file server has registered (which is common during a cold cluster boot), it begins with the `NoopMerger`. A watch on `/{basePath}/fileServers` fires the moment a server registers; the optimizer atomically swaps the merger to `RemoteSegmentMerger` for the next tick — no pod restart required.
 
 #### Merge policies
 
 The active policy is selected by configuration. Two are shipped:
 
-- **`AggressivePolicy` (default).** Treats any segment at or above `indexoptimizer.merge.target.bytes` (default 8 GiB) as "graduated" — it is never merged again. Of the remaining sub-target segments, the policy fires as soon as ≥ 2 exist, picks them smallest-first, and stops when adding another input would exceed `perCycleMaxBytes` (a per-cycle write-amplification budget derived from `indexoptimizer.merge.max.bytes`) or `maxCount` segments are queued. Issue #524 made the candidate set a single k-way merge per tick instead of repeated 2-way passes. There are deliberately no minimum count or minimum aggregate-size gates — small segments are absorbed eagerly, which is what most workloads want.
-- **`SmallestFirstPolicy` (legacy).** Smallest-first up to `maxBytes`, fired when either segment count ≥ `maxCount` (the issue #285 ceiling, force-fires regardless of size) or count ≥ `minCount` AND aggregate size ≥ `minBytes`. Kept as an operator escape hatch for workloads that need explicit gating.
+- **`AggressivePolicy` (default).** Treats any segment at or above `indexoptimizer.merge.target.bytes` (default 8 GiB) as "graduated" — it is never merged again. Of the remaining sub-target segments, the policy fires as soon as ≥ 2 exist, picks them smallest-first, and stops when adding another input would exceed `perCycleMaxBytes` (a per-cycle write-amplification budget derived from `indexoptimizer.merge.max.bytes`) or `maxCount` segments are queued. The candidate set is a single k-way merge per tick rather than repeated 2-way passes. There are deliberately no minimum count or minimum aggregate-size gates — small segments are absorbed eagerly, which is what most workloads want.
+- **`SmallestFirstPolicy`.** Smallest-first up to `maxBytes`, fired when either segment count ≥ `maxCount` (force-fires regardless of size) or count ≥ `minCount` AND aggregate size ≥ `minBytes`. Available for workloads that need explicit gating.
 
 Both policies skip graduated segments and never re-merge the same output.
 
@@ -743,7 +750,7 @@ Both policies skip graduated segments and never re-merge the same output.
 
 Two scheduling sources fire ticks; either may cause `runOnce()` to run.
 
-- **Event-driven (default, #484).** A persistent-recursive ZK watch on `/{basePath}/index-segments/{tablespaceUuid}` fires whenever any segment is created, mutated, or deleted. Bursts of events (e.g. a checkpoint that publishes a dozen sealed segments at once) are coalesced via a single-flag debouncer — the optimizer waits `indexoptimizer.event.debounce.ms` (default 500 ms) of quiet before running the next tick, so it reacts within a second of a workload change without melting under chatter.
+- **Event-driven (default).** A persistent-recursive ZK watch on `/{basePath}/index-segments/{tablespaceUuid}` fires whenever any segment is created, mutated, or deleted. Bursts of events (e.g. a checkpoint that publishes a dozen sealed segments at once) are coalesced via a single-flag debouncer — the optimizer waits `indexoptimizer.event.debounce.ms` (default 500 ms) of quiet before running the next tick, so it reacts within a second of a workload change without melting under chatter.
 - **Periodic safety-net tick.** Every `indexoptimizer.interval.ms` (default 5 min) the optimizer runs an unconditional tick, so any segments missed by the watch (e.g. across a session reconnect) are picked up on the next interval.
 
 #### Admin endpoints (`OptimizerHttpServer`)
@@ -797,19 +804,18 @@ Optimizer-side (`OptimizerConfiguration`, `conf/indexoptimizer.properties`):
 |----------|---------|-------|
 | `indexoptimizer.zookeeper.address` | `localhost:2181` | Must match the cluster's ZK. |
 | `indexoptimizer.zookeeper.path` | `/herd` | Must match `server.zookeeper.path`. |
-| `indexoptimizer.tablespace.name` | *(required)* | Human-readable tablespace name (e.g. `herd`); UUID resolved from ZooKeeper at startup. Issue #481. |
+| `indexoptimizer.tablespace.name` | *(required)* | Human-readable tablespace name (e.g. `herd`); UUID resolved from ZooKeeper at startup. |
 | `indexoptimizer.interval.ms` | `300000` (5 min) | Periodic safety-net tick. Event-driven ticks (next row) fire much more often in practice. |
-| `indexoptimizer.event.debounce.ms` | `500` | Burst-coalescing window for the persistent-recursive ZK watch (#484) — the optimizer waits this long after the last event before running a tick. |
+| `indexoptimizer.event.debounce.ms` | `500` | Burst-coalescing window for the persistent-recursive ZK watch — the optimizer waits this long after the last event before running a tick. |
 | `indexoptimizer.merge.target.bytes` | `8589934592` (8 GiB) | `AggressivePolicy`: graduation cap. Segments at or above this size are never re-merged. |
 | `indexoptimizer.merge.min.count` | `4` | `SmallestFirstPolicy` only: minimum candidate count before a non-force-fire merge runs. |
-| `indexoptimizer.merge.max.count` | `200` | Force-fire ceiling (issue #285 parity) and per-cycle candidate cap. |
+| `indexoptimizer.merge.max.count` | `200` | Force-fire ceiling and per-cycle candidate cap. |
 | `indexoptimizer.merge.min.bytes` | `268435456` (256 MiB) | `SmallestFirstPolicy` only: minimum aggregate-input size before a non-force-fire merge runs. |
 | `indexoptimizer.merge.max.bytes` | `1073741824` (1 GiB) | Per-cycle input cap (write-amplification budget). For `AggressivePolicy` this is the `perCycleMaxBytes` knob. |
-| `indexoptimizer.merge.streaming.enabled` | `true` | Same flag as `vector.index.compaction.streaming.enabled` (see row 187 above) but consumed by the optimizer pod. Drives the streaming compaction engine. |
 | `indexoptimizer.retention.ms` | `600000` (10 min) | DEPRECATED → DELETED window. |
 | `indexoptimizer.safeMode.fileDeletion` | `true` | When `true`, the reaper progresses znodes (DEPRECATED → DELETED) but leaves the multipart files for the IS-side `SegmentAssignmentWatcher` to delete. Flip to `false` only after the IS-side watcher is confirmed healthy. |
 | `indexoptimizer.http.port` | `9853` | Admin endpoint port (`/health`, `/metrics`, `/status`, `/merge-history`). `0` disables. |
-| `indexoptimizer.remote.file.servers` | *(empty)* | Comma-separated static RFS list. Empty → discover via ZK watch on `/{basePath}/fileServers` and late-bind the merger (#507). |
+| `indexoptimizer.remote.file.servers` | *(empty)* | Comma-separated static RFS list. Empty → discover via ZK watch on `/{basePath}/fileServers` and late-bind the merger. |
 | `indexoptimizer.remote.file.client.timeout` | `60` | Per-call gRPC deadline (seconds) for `RemoteFileClient`. |
 | `indexoptimizer.remote.file.client.retries` | `3` | Retry budget for idempotent `RemoteFileClient` ops. |
 | `indexoptimizer.role.is.leader` | `auto` | Pod role override. `auto` (default) → `POD_ORDINAL` env var → hostname regex fallback. `true` / `false` forces LEADER / WORKER (test convenience). |
@@ -830,12 +836,12 @@ Helm values (`indexOptimizer.*`):
 ```yaml
 indexOptimizer:
   enabled: false
-  tablespaceName: ""              # human-readable name, e.g. "herd"; UUID resolved at startup (#481)
+  tablespaceName: ""              # human-readable name, e.g. "herd"; UUID resolved at startup
   intervalMs: 300000
   mergeTargetBytes: "8589934592"  # AggressivePolicy graduation cap, 8 GiB. Quoted to prevent YAML float conversion.
   minCount: 4
   maxCount: 200
-  minBytes: "268435456"           # quoted string to prevent YAML float conversion (#480)
+  minBytes: "268435456"           # quoted string to prevent YAML float conversion
   maxBytes: "1073741824"
   retentionMs: 600000
   httpPort: 9853
@@ -869,11 +875,11 @@ CRUD operations are exposed by `SegmentRegistryClient` (`createSegment`, `getSeg
 
 ### Operational requirements
 
-The optimizer is now production-grade — the historical IS-side wiring gaps tracked in #491, #514, and #516 are closed, and the merger SPI ships with a real `RemoteSegmentMerger` implementation. The remaining requirements are operational, not "is the code there yet":
+The optimizer ships as the production compaction driver with a real `RemoteSegmentMerger` implementation. The remaining requirements are operational:
 
 - **Cluster mode + Remote File Service.** The optimizer cannot operate on local-disk storage. The HerdDB server, the indexing service, the file servers, and the optimizer must all share the same ZK base path and the same object backend (S3 / GCS / MinIO). On any other configuration the merger stays on `NoopMerger` and merges never fire.
-- **Merger SPI.** `RemoteSegmentMerger` is the default. `NoopMerger` is the startup fallback used only until at least one file server registers under `/{basePath}/fileServers`; after that, the merger is upgraded in-place via the late-binding path (#507) without a pod restart. Tests may register `InMemorySegmentMerger` via `META-INF/services/herddb.indexing.optimizer.SegmentMerger`.
-- **IS-side wiring (already shipped).** With `indexing.optimizer.enabled=true`, `IndexingServiceEngine` attaches `SegmentRegistryPublisher` to every `PersistentVectorStore` it creates (#491) and runs a `SegmentAssignmentWatcher` per index so that the primary and shadows reload merged outputs without restart (#514 / #518). The Helm chart's IS ConfigMap auto-emits `indexing.optimizer.enabled=true` whenever `indexOptimizer.enabled=true`, so operators do not have to keep two flags in sync.
+- **Merger SPI.** `RemoteSegmentMerger` is the default. `NoopMerger` is the startup fallback used only until at least one file server registers under `/{basePath}/fileServers`; after that, the merger is upgraded in-place via the late-binding path without a pod restart. Tests may register `InMemorySegmentMerger` via `META-INF/services/herddb.indexing.optimizer.SegmentMerger`.
+- **IS-side wiring.** With `indexing.optimizer.enabled=true`, `IndexingServiceEngine` attaches `SegmentRegistryPublisher` to every `PersistentVectorStore` it creates and runs a `SegmentAssignmentWatcher` per index so that the primary and shadows reload merged outputs without restart. The Helm chart's IS ConfigMap auto-emits `indexing.optimizer.enabled=true` whenever `indexOptimizer.enabled=true`, so operators do not have to keep two flags in sync.
 - **`safeMode.fileDeletion` opt-in.** Ships as `true`: the reaper progresses the znode lifecycle (DEPRECATED → casDelete) but does not call `DataStorageManager.deleteMultipartIndexFile` — the IS-side watcher handles the physical delete after it has closed every local handle on the segment. Flip to `false` only after the IS-side watcher is observed healthy in monitoring; doing so requires a non-null `DataStorageManager` to be wired into `IndexOptimizerEngine`.
 - **Rollback strategy.** Indexes written in v4 IndexStatus format cannot be loaded by a binary that only knows v3 — the v3-only loader fails fast with a clear `DataStorageManagerException`. For a phased rollout, gate `indexOptimizer.enabled` per-tenant and keep at least one tier on the v3-only binary until the rollout completes.
 
@@ -1026,7 +1032,7 @@ On CREATE_INDEX: the engine calls `createVectorStoreIfNeeded()` → `factory.cre
 
 **Duplicate CREATE_INDEX guard.** `createVectorStoreIfNeeded` also tracks the logical `Index.uuid` alongside each store. If the commit-log tailer replays a CREATE_INDEX entry for an index whose store was already created by `installSchemaFromSnapshot` on startup, the duplicate is detected and silently skipped (same UUID → no-op). If a different UUID is seen for the same `(table, index)` key — which should not happen in normal operation but could indicate log divergence — a WARNING is logged and the existing store is kept.
 
-### Schema snapshot in the watermark (issue #368)
+### Schema snapshot in the watermark
 
 When a checkpoint completes, `checkpointAndSaveWatermark` collects the current schema from `SchemaTracker` and embeds it in the `WatermarkSnapshot` before writing it to `WatermarkStore`. Each vector index in the snapshot also carries the property `_is.store.uuid` (key `IndexingServiceEngine.PROP_IS_STORE_UUID`), which is the storage-level UUID of its `PersistentVectorStore` (obtained via `AbstractVectorStore.getStoreUUID()`).
 

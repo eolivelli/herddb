@@ -434,29 +434,6 @@ public final class IndexingServerConfiguration {
     public static final boolean PROPERTY_VECTOR_INDEX_COMPACTION_LOCAL_ENABLED_WITH_OPTIMIZER_DEFAULT = true;
 
     /**
-     * Streaming compaction (issue #485). When {@code true}, vector-index
-     * compaction is driven by jvector's
-     * {@code OnDiskGraphIndexCompactor} — which streams the merge directly
-     * from each candidate's on-disk graph — instead of the legacy in-memory
-     * {@code GraphIndexBuilder} rebuild. Memory cost goes from
-     * {@code O(numTotalNodes × dimension)} to
-     * {@code O(taskWindowSize × maxDegree × float[dim])}, lifting the
-     * historical 1 GB cap on
-     * {@link #PROPERTY_VECTOR_INDEX_COMPACTION_MAX_BYTES}.
-     *
-     * <p>The flag governs both the IS-local path
-     * ({@code VectorIndexCompactor.rebuildSegment}) and the optimizer-pod
-     * path ({@code RemoteSegmentGraphMerger}). Default {@code true};
-     * setting to {@code false} restores the legacy in-memory rebuild as
-     * an operator escape hatch. The same value can also be set via the
-     * {@code herddb.vectorindex.streamingCompactionEnabled} system
-     * property — the config key takes precedence at IS startup.
-     */
-    public static final String PROPERTY_VECTOR_INDEX_COMPACTION_STREAMING_ENABLED =
-            "vector.index.compaction.streaming.enabled";
-    public static final boolean PROPERTY_VECTOR_INDEX_COMPACTION_STREAMING_ENABLED_DEFAULT = true;
-
-    /**
      * Async IO pipeline for FusedPQ vector search (issue #547). When
      * {@code true}, the jvector {@code GraphSearcher} is given a 2-slot
      * speculative-read pipeline: while similarities are computed for the

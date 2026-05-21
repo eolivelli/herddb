@@ -3766,31 +3766,6 @@ public class PersistentVectorStore extends AbstractVectorStore {
     }
 
     /**
-     * Process-wide switch for the streaming compaction engine introduced
-     * in issue #485. When {@code true}, vector-index compaction is driven
-     * by jvector's {@code OnDiskGraphIndexCompactor} (memory bounded by
-     * {@code O(taskWindowSize × maxDegree × float[dim])}); when {@code
-     * false}, the legacy in-memory {@code GraphIndexBuilder} rebuild path
-     * is used instead.
-     *
-     * <p>Public façade over {@link VectorIndexCompactor#streamingCompactionEnabled}
-     * (the underlying class is package-private). Called by
-     * {@code IndexingServiceEngine.start()} when the
-     * {@code vector.index.compaction.streaming.enabled} config key is
-     * resolved at IS startup. Operators may also set the flag via the
-     * {@code herddb.vectorindex.streamingCompactionEnabled} system
-     * property — the config key wins.
-     */
-    public static void setStreamingCompactionEnabled(boolean enabled) {
-        VectorIndexCompactor.streamingCompactionEnabled = enabled;
-    }
-
-    /** Returns the current value of {@link #setStreamingCompactionEnabled(boolean)}. */
-    public static boolean isStreamingCompactionEnabled() {
-        return VectorIndexCompactor.streamingCompactionEnabled;
-    }
-
-    /**
      * Process-wide switch for the jvector async IO pipeline introduced in
      * issue #547. When {@code true}, {@link VectorSegment#search} calls
      * {@link io.github.jbellis.jvector.graph.GraphSearcher#setAsyncPipelineEnabled(boolean)

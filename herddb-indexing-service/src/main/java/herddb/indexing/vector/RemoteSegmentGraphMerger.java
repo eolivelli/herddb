@@ -439,31 +439,28 @@ public final class RemoteSegmentGraphMerger {
             throw new IllegalArgumentException("dim must be positive: " + dim);
         }
 
-        // Issue #485 — streaming compaction. Run the on-disk merge engine
-        // when (a) the streaming flag is on, (b) there are at least two
-        // inputs (jvector's OnDiskGraphIndexCompactor rejects single-source
-        // construction), and (c) every input has a non-zero graphFileSize.
-        // Any other configuration falls back to the legacy in-memory rebuild.
-        if (VectorIndexCompactor.streamingCompactionEnabled
-                && inputs.size() >= 2
-                && allInputsHaveGraphFileSize(inputs)) {
+        // Streaming compaction via jvector's OnDiskGraphIndexCompactor — used
+        // whenever (a) there are at least two inputs (jvector's compactor
+        // rejects single-source construction) and (b) every input has a
+        // non-zero graphFileSize (we need the size to drive the eager
+        // download). The two preconditions trigger the legacy in-memory
+        // rebuild as an automatic fallback.
+        if (inputs.size() >= 2 && allInputsHaveGraphFileSize(inputs)) {
             return mergeStreaming(inputs, outputTablespaceUuid, outputIndexUuid,
                     outputSegmentId, dim);
         }
-        if (VectorIndexCompactor.streamingCompactionEnabled) {
-            // Streaming is on, but the dispatch fence rejected the cycle —
-            // log so operators correlate optimizer-pod compaction behavior with
-            // the IS-side STREAMING_FALLBACK_TO_LEGACY_TOTAL counter.
-            String reason;
-            if (inputs.size() < 2) {
-                reason = "fewer than 2 inputs (got " + inputs.size() + ")";
-            } else {
-                reason = "one or more inputs has graphFileSize <= 0";
-            }
-            LOGGER.log(Level.INFO,
-                    "RemoteSegmentGraphMerger: falling back to legacy in-memory rebuild "
-                            + "(streaming flag is on but {0})", reason);
+        // Log the fallback reason so operators correlate optimizer-pod
+        // compaction behavior with the IS-side STREAMING_FALLBACK_TO_LEGACY_TOTAL
+        // counter.
+        String reason;
+        if (inputs.size() < 2) {
+            reason = "fewer than 2 inputs (got " + inputs.size() + ")";
+        } else {
+            reason = "one or more inputs has graphFileSize <= 0";
         }
+        LOGGER.log(Level.INFO,
+                "RemoteSegmentGraphMerger: falling back to legacy in-memory rebuild ({0})",
+                reason);
         return mergeLegacy(inputs, outputTablespaceUuid, outputIndexUuid,
                 outputSegmentId, dim);
     }

@@ -75,21 +75,16 @@ public class EagerDownloadCompactionTest {
     @Rule
     public TemporaryFolder tmpFolder = new TemporaryFolder();
 
-    private boolean savedStreamingFlag;
-
     @Before
     public void setup() {
         // Disable the checkpoint deferral gate so small test segments are
         // checkpointed immediately.
         PersistentVectorStore.minLiveVectorsForCheckpoint = 0;
-        savedStreamingFlag = VectorIndexCompactor.streamingCompactionEnabled;
-        VectorIndexCompactor.streamingCompactionEnabled = true;
     }
 
     @After
     public void teardown() {
         PersistentVectorStore.minLiveVectorsForCheckpoint = 50_000;
-        VectorIndexCompactor.streamingCompactionEnabled = savedStreamingFlag;
     }
 
     private PersistentVectorStore createStore(Path tmpDir, MemoryDataStorageManager dsm) {
