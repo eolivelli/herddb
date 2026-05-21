@@ -641,7 +641,52 @@ public class PersistentVectorStore extends AbstractVectorStore {
      * small data-directory PVCs.  Set to {@link Long#MAX_VALUE} to disable.
      */
     private volatile long vectorIndexCompactionMaxInputBytes = 100L * 1024 * 1024 * 1024;
+    /**
+     * Per-segment graduation cap (issue #631). Segments whose
+     * {@link VectorSegment#estimatedSizeBytes} is at or above this value are
+     * filtered out by {@link VectorIndexCompactor#chooseSegmentsToMerge}
+     * before any selection logic runs and are never merged again. This mirrors
+     * the external optimizer pod's {@code AggressivePolicy} (same 8 GiB default
+     * via {@code indexoptimizer.merge.target.bytes}) so the IS-local compaction
+     * path converges to the same steady-state segment size — both when the
+     * optimizer is disabled and when the IS-local loop runs as the
+     * pressure-driven fallback. Set to {@link Long#MAX_VALUE} to disable.
+     */
+    private volatile long vectorIndexCompactionTargetBytes =
+            8L * 1024L * 1024L * 1024L;
     private volatile long vectorIndexCompactionRetentionMs = 10L * 60_000L;
+
+    /**
+     * Throttle for the "compaction in steady state" INFO log line (issue #631).
+     * Holds the {@link System#nanoTime()} of the last steady-state log emitted
+     * for this store; the log fires again only after
+     * {@link #STEADY_STATE_LOG_INTERVAL_NANOS} has elapsed, so a quiescent index
+     * does not spam one log line per compaction tick. Initial value
+     * {@link Long#MIN_VALUE} guarantees the very first steady-state cycle logs.
+     */
+    private final java.util.concurrent.atomic.AtomicLong lastSteadyStateLogNanos =
+            new java.util.concurrent.atomic.AtomicLong(Long.MIN_VALUE);
+
+    /**
+     * Throttle for the "BACKPRESSURE DEADLOCK" WARNING log line (issue #631).
+     * Stored separately from {@link #lastSteadyStateLogNanos} so the operator
+     * alert is not suppressed by the steady-state INFO throttle: they cover
+     * different conditions and have different urgency. Initial value
+     * {@link Long#MIN_VALUE} guarantees the first deadlock cycle warns
+     * immediately.
+     */
+    private final java.util.concurrent.atomic.AtomicLong lastBackpressureDeadlockLogNanos =
+            new java.util.concurrent.atomic.AtomicLong(Long.MIN_VALUE);
+
+    /**
+     * Minimum elapsed time between consecutive emissions of the
+     * "compaction in steady state" / "back-pressure deadlock" log lines
+     * (issue #631). 5 minutes matches the default
+     * {@code vector.index.compaction.intervalMs}, so a quiescent index logs
+     * roughly once per cycle rather than every cycle.
+     */
+    static final long STEADY_STATE_LOG_INTERVAL_NANOS =
+            java.util.concurrent.TimeUnit.MINUTES.toNanos(5);
     /**
      * When {@code true} (the default), the per-cycle byte cap and segment
      * count cap are scaled up by {@link VectorIndexCompactor#tieredMultiplier}
@@ -2046,6 +2091,33 @@ public class PersistentVectorStore extends AbstractVectorStore {
     }
 
     /**
+     * Sets the per-segment graduation cap (issue #631). Segments at or above
+     * this byte size are filtered out by
+     * {@link VectorIndexCompactor#chooseSegmentsToMerge} before any selection
+     * logic runs, so they are never merged again — mirroring the optimizer
+     * pod's {@code AggressivePolicy} (default 8 GiB via
+     * {@code indexoptimizer.merge.target.bytes}). This is what makes the
+     * IS-local compaction path converge to a steady state when the external
+     * optimizer is disabled.
+     *
+     * @param targetBytes positive cap in bytes; values {@code <= 0} are
+     *     silently clamped to {@link Long#MAX_VALUE} (disabled). Can be
+     *     called at any time to re-tune a running store.
+     */
+    public void setCompactionTargetBytes(long targetBytes) {
+        this.vectorIndexCompactionTargetBytes =
+                (targetBytes <= 0) ? Long.MAX_VALUE : targetBytes;
+    }
+
+    /**
+     * Returns the current per-segment graduation cap (issue #631).
+     * {@link Long#MAX_VALUE} means the cap is disabled.
+     */
+    public long getCompactionTargetBytes() {
+        return vectorIndexCompactionTargetBytes;
+    }
+
+    /**
      * Sets the segment-count back-pressure threshold (issue #354).
      * {@link #addVectorInternal} will block when {@code segments.size()}
      * exceeds this value, waking the compaction thread first.
@@ -2530,7 +2602,12 @@ public class PersistentVectorStore extends AbstractVectorStore {
                     vectorIndexCompactionMicroSegmentMaxNodes,
                     // Issue #587: hard cap on input segments per cycle, tier-scaled
                     // above so the drain rate keeps pace with the backlog.
-                    effectiveMaxInputs);
+                    effectiveMaxInputs,
+                    // Issue #631: per-segment graduation cap. Filtered upstream
+                    // of every selection step so the policy converges to a fixed
+                    // point once every segment crosses the cap — parity with the
+                    // optimizer pod's AggressivePolicy.
+                    vectorIndexCompactionTargetBytes);
 
             // Issue #602: apply the per-cycle download budget cap AFTER candidate
             // selection. Tiered scaling can push effectiveMaxBytes to 8 GiB; with
@@ -2574,6 +2651,78 @@ public class PersistentVectorStore extends AbstractVectorStore {
                             new Object[]{indexName, snapshot.size(),
                                     vectorIndexCompactionMinBytes,
                                     vectorIndexCompactionMaxCount});
+                }
+                // Issue #631 — emit a clear, structured "nothing to do" / "operator
+                // action required" log line whenever compaction selects no candidates
+                // on a non-empty index. The two log lines are mutually exclusive:
+                //   - BACKPRESSURE DEADLOCK (WARNING): the segment count is at or
+                //     above the back-pressure threshold AND compaction selected
+                //     nothing. Writes are throttled and compaction will not drain
+                //     them — operator intervention is required.
+                //   - Steady state (INFO): the index has segments but compaction
+                //     correctly has nothing to merge (typically every segment has
+                //     graduated). Both lines carry graduated / sub-target counts so
+                //     the operator can immediately tell which side of the cap is
+                //     dominant. Both are throttled to one emission per
+                //     STEADY_STATE_LOG_INTERVAL_NANOS so a quiescent index does not
+                //     spam one entry per compaction tick.
+                if (!snapshot.isEmpty()) {
+                    VectorIndexCompactor.GraduationStats stats =
+                            VectorIndexCompactor.computeGraduationStats(
+                                    snapshot, vectorIndexCompactionTargetBytes);
+                    boolean inBackpressure =
+                            compactionBackpressureThreshold != Integer.MAX_VALUE
+                                    && snapshot.size() >= compactionBackpressureThreshold;
+                    long nowNanos = System.nanoTime();
+                    if (inBackpressure) {
+                        long last = lastBackpressureDeadlockLogNanos.get();
+                        if (last == Long.MIN_VALUE
+                                || nowNanos - last >= STEADY_STATE_LOG_INTERVAL_NANOS) {
+                            if (lastBackpressureDeadlockLogNanos.compareAndSet(last, nowNanos)) {
+                                LOGGER.log(Level.WARNING,
+                                        "vector store {0}: BACKPRESSURE DEADLOCK — {1} segments"
+                                                + " at or above back-pressure threshold {2},"
+                                                + " but compaction selected no candidates this"
+                                                + " cycle (graduated={3} at >= target.bytes={4},"
+                                                + " sub-target={5} totalling {6} bytes; thresholds"
+                                                + " minCount={7}, minBytes={8}, maxCount={9})."
+                                                + " Writes are throttled and compaction cannot"
+                                                + " drain them. OPERATOR ACTION REQUIRED: raise"
+                                                + " vector.index.compaction.target.bytes above"
+                                                + " the largest segment, raise"
+                                                + " vector.index.compaction.backpressure.segments,"
+                                                + " or expand the cluster.",
+                                        new Object[]{indexName, snapshot.size(),
+                                                compactionBackpressureThreshold,
+                                                stats.graduatedCount,
+                                                vectorIndexCompactionTargetBytes,
+                                                stats.subTargetCount, stats.subTargetBytes,
+                                                vectorIndexCompactionMinCount,
+                                                vectorIndexCompactionMinBytes,
+                                                vectorIndexCompactionMaxCount});
+                            }
+                        }
+                    } else {
+                        long last = lastSteadyStateLogNanos.get();
+                        if (last == Long.MIN_VALUE
+                                || nowNanos - last >= STEADY_STATE_LOG_INTERVAL_NANOS) {
+                            if (lastSteadyStateLogNanos.compareAndSet(last, nowNanos)) {
+                                LOGGER.log(Level.INFO,
+                                        "vector store {0}: compaction in steady state — nothing"
+                                                + " to merge. total segments={1}, graduated"
+                                                + " (>= target.bytes {2})={3}, sub-target={4}"
+                                                + " ({5} bytes total); thresholds minCount={6},"
+                                                + " minBytes={7}, maxCount={8}.",
+                                        new Object[]{indexName, snapshot.size(),
+                                                vectorIndexCompactionTargetBytes,
+                                                stats.graduatedCount,
+                                                stats.subTargetCount, stats.subTargetBytes,
+                                                vectorIndexCompactionMinCount,
+                                                vectorIndexCompactionMinBytes,
+                                                vectorIndexCompactionMaxCount});
+                            }
+                        }
+                    }
                 }
                 // Notify even when no candidates were selected (issue #370): apply
                 // threads parked in waitForSegmentCountRelief() must be woken after

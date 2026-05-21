@@ -409,11 +409,97 @@ final class VectorIndexCompactor {
             int maxCount,
             long microSegmentMaxNodes,
             int maxInputs) {
-        if (candidates == null || candidates.size() < minCount) {
+        return chooseSegmentsToMerge(candidates, minCount, minTotalBytes,
+                maxTotalBytes, maxCount, microSegmentMaxNodes, maxInputs,
+                /*targetMaxBytes*/ Long.MAX_VALUE);
+    }
+
+    /**
+     * Full entry point adding the per-segment graduation cap (issue #631).
+     *
+     * <p>Before any of the trigger / smallest-first / micro-segment / input-count
+     * logic runs, {@code candidates} is filtered to retain only those whose
+     * {@link VectorSegment#estimatedSizeBytes} is strictly less than
+     * {@code targetMaxBytes}. Segments at or above the cap are considered
+     * "graduated" and are never picked for further merging. This mirrors the
+     * external optimizer pod's {@code AggressivePolicy} (default 8 GiB
+     * graduation cap via {@code indexoptimizer.merge.target.bytes}) so the
+     * IS-local compaction path converges to the same steady state — both when
+     * the optimizer is disabled and when the IS-local path runs as the
+     * pressure-driven fallback.
+     *
+     * <p><b>Convergence guarantee.</b> Once at most one segment is below the
+     * cap, the byte and count triggers fail on the filtered set and this method
+     * returns an empty list — compaction stops firing for the index. Fresh
+     * sub-target segments produced by subsequent ingest reopen the cycle.
+     *
+     * <p>The cap is applied <em>upstream</em> of the micro-segment fast path:
+     * a segment whose byte size is at or above the cap is treated as graduated
+     * even if its live-node count is below {@code microSegmentMaxNodes}.
+     *
+     * <p>The per-cycle byte cap ({@code maxTotalBytes}), the count cap
+     * ({@code maxCount}), the input cap ({@code maxInputs}), the micro-segment
+     * threshold, the tiered scaling, and the trigger semantics are unchanged
+     * — they all operate on the post-filter candidate set.
+     *
+     * <p>Set {@code targetMaxBytes = Long.MAX_VALUE} to disable the cap and
+     * restore the pre-#631 smallest-first-with-no-graduation behaviour.
+     *
+     * <p>Package-private for unit tests.
+     *
+     * @param targetMaxBytes per-segment graduation cap in bytes. Segments whose
+     *     {@code estimatedSizeBytes} is {@code >= targetMaxBytes} are filtered
+     *     out before any other selection logic runs.
+     *     {@link Long#MAX_VALUE} disables the filter.
+     */
+    static List<VectorSegment> chooseSegmentsToMerge(
+            List<VectorSegment> candidates,
+            int minCount,
+            long minTotalBytes,
+            long maxTotalBytes,
+            int maxCount,
+            long microSegmentMaxNodes,
+            int maxInputs,
+            long targetMaxBytes) {
+        if (candidates == null || candidates.isEmpty()) {
             return new ArrayList<>();
         }
 
-        List<VectorSegment> sorted = new ArrayList<>(candidates);
+        // Issue #631 — per-segment graduation cap. Filter BEFORE every other
+        // selection step so the trigger / smallest-first / micro-segment / input
+        // caps all operate on the same filtered set. Skipped when targetMaxBytes
+        // is Long.MAX_VALUE (the disabled-cap sentinel) to keep the no-filter
+        // path branch-free and preserve legacy semantics.
+        List<VectorSegment> filtered;
+        if (targetMaxBytes == Long.MAX_VALUE) {
+            filtered = candidates;
+        } else {
+            filtered = new ArrayList<>(candidates.size());
+            int graduated = 0;
+            for (VectorSegment seg : candidates) {
+                if (seg.estimatedSizeBytes < targetMaxBytes) {
+                    filtered.add(seg);
+                } else {
+                    graduated++;
+                }
+            }
+            if (graduated > 0) {
+                LOGGER.log(Level.INFO,
+                        "compaction: graduation cap excluded {0} segment(s) at or above"
+                                + " target.bytes={1}; {2} sub-target candidate(s) remain",
+                        new Object[]{graduated, targetMaxBytes, filtered.size()});
+            }
+        }
+
+        if (filtered.size() < minCount) {
+            // Mirror the original minCount short-circuit on the filtered set:
+            // with fewer than minCount sub-target candidates the byte trigger
+            // cannot fire, and in any sensible config (minCount <= maxCount)
+            // the count trigger cannot fire either. Skip sorting.
+            return new ArrayList<>();
+        }
+
+        List<VectorSegment> sorted = new ArrayList<>(filtered);
         sorted.sort(Comparator.comparingLong(s -> s.estimatedSizeBytes));
 
         List<VectorSegment> picked = new ArrayList<>();
@@ -474,6 +560,63 @@ final class VectorIndexCompactor {
             }
         }
         return capInputs(picked, maxInputs);
+    }
+
+    // -------------------------------------------------------------------------
+    // Graduation stats (issue #631)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Compact summary used by {@link PersistentVectorStore#runCompactionCycle}'s
+     * "steady-state convergence" log line to report — in a single INFO entry —
+     * exactly why the cycle found nothing to merge. Carrying the three numbers
+     * here keeps the call site simple and makes the helper unit-testable.
+     */
+    static final class GraduationStats {
+        /** Number of segments at or above {@code targetMaxBytes} (graduated). */
+        final int graduatedCount;
+        /** Number of segments strictly below {@code targetMaxBytes}. */
+        final int subTargetCount;
+        /** Sum of {@link VectorSegment#estimatedSizeBytes} of sub-target segments. */
+        final long subTargetBytes;
+
+        GraduationStats(int graduatedCount, int subTargetCount, long subTargetBytes) {
+            this.graduatedCount = graduatedCount;
+            this.subTargetCount = subTargetCount;
+            this.subTargetBytes = subTargetBytes;
+        }
+    }
+
+    /**
+     * One-pass scan that splits {@code snapshot} into graduated and sub-target
+     * counts (and accumulates the sub-target byte total), against the
+     * graduation cap {@code targetMaxBytes}. Used by the convergence log line
+     * and the matching unit test (issue #631).
+     *
+     * <p>A {@code null} or empty {@code snapshot} returns a zero-filled
+     * {@link GraduationStats}. {@code targetMaxBytes == Long.MAX_VALUE}
+     * treats every segment as sub-target (the cap is disabled), which is the
+     * convention used by the rest of the compactor.
+     *
+     * <p>Package-private for unit tests.
+     */
+    static GraduationStats computeGraduationStats(
+            List<VectorSegment> snapshot, long targetMaxBytes) {
+        if (snapshot == null || snapshot.isEmpty()) {
+            return new GraduationStats(0, 0, 0L);
+        }
+        int graduated = 0;
+        int subTarget = 0;
+        long subTargetBytes = 0L;
+        for (VectorSegment seg : snapshot) {
+            if (seg.estimatedSizeBytes >= targetMaxBytes) {
+                graduated++;
+            } else {
+                subTarget++;
+                subTargetBytes += Math.max(0L, seg.estimatedSizeBytes);
+            }
+        }
+        return new GraduationStats(graduated, subTarget, subTargetBytes);
     }
 
     // -------------------------------------------------------------------------
