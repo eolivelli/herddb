@@ -428,10 +428,15 @@ final class VectorIndexCompactor {
      * the optimizer is disabled and when the IS-local path runs as the
      * pressure-driven fallback.
      *
-     * <p><b>Convergence guarantee.</b> Once at most one segment is below the
-     * cap, the byte and count triggers fail on the filtered set and this method
-     * returns an empty list — compaction stops firing for the index. Fresh
-     * sub-target segments produced by subsequent ingest reopen the cycle.
+     * <p><b>Convergence guarantee.</b> Once fewer than {@code minCount}
+     * segments are below the cap, neither the byte nor the count trigger fires
+     * on the filtered set and this method returns an empty list — compaction
+     * stops running for the index until ingest produces enough fresh sub-target
+     * segments to re-arm the trigger. The exact convergence point therefore
+     * depends on the configured {@code minCount}; the operator-visible
+     * "compaction in steady state" log line in
+     * {@code PersistentVectorStore.runCompactionCycle} reports the post-filter
+     * counts so the convergence reason is unambiguous.
      *
      * <p>The cap is applied <em>upstream</em> of the micro-segment fast path:
      * a segment whose byte size is at or above the cap is treated as graduated
@@ -483,8 +488,15 @@ final class VectorIndexCompactor {
                     graduated++;
                 }
             }
-            if (graduated > 0) {
-                LOGGER.log(Level.INFO,
+            if (graduated > 0 && LOGGER.isLoggable(Level.FINE)) {
+                // FINE rather than INFO: the operator-visible per-cycle log
+                // line lives at the call site (PersistentVectorStore: either
+                // "starting graph-merge compaction" when the cycle fires, or
+                // the steady-state / deadlock convergence line when it does
+                // not). Leaving this at INFO would log the same graduation
+                // count twice per cycle, which is spam at short compaction
+                // intervals.
+                LOGGER.log(Level.FINE,
                         "compaction: graduation cap excluded {0} segment(s) at or above"
                                 + " target.bytes={1}; {2} sub-target candidate(s) remain",
                         new Object[]{graduated, targetMaxBytes, filtered.size()});

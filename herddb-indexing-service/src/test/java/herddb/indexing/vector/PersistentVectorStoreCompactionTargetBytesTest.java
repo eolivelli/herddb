@@ -23,6 +23,8 @@ import static org.junit.Assert.assertEquals;
 import herddb.core.MemoryManager;
 import herddb.file.FileDataStorageManager;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
@@ -102,6 +104,152 @@ public class PersistentVectorStoreCompactionTargetBytesTest {
             // And an explicit Long.MAX_VALUE is preserved (already disabled).
             store.setCompactionTargetBytes(Long.MAX_VALUE);
             assertEquals(Long.MAX_VALUE, store.getCompactionTargetBytes());
+        }
+    }
+
+    // ---- maybeLogConvergence: the two operator-visible log branches ----
+
+    private static VectorSegment seg(int id, long sizeBytes) {
+        VectorSegment s = new VectorSegment(id);
+        s.estimatedSizeBytes = sizeBytes;
+        return s;
+    }
+
+    /**
+     * Below the back-pressure threshold + non-empty snapshot → STEADY_STATE
+     * INFO. Pins the positive convergence signal.
+     */
+    @Test
+    public void maybeLogConvergenceEmitsSteadyStateBelowBackpressure() throws Exception {
+        Path baseDir = tmpFolder.newFolder("data").toPath();
+        Path tmpDir = tmpFolder.newFolder("tmp").toPath();
+        FileDataStorageManager dsm = new FileDataStorageManager(baseDir);
+        dsm.initTablespace(TABLE_SPACE);
+        try (PersistentVectorStore store = createStore(tmpDir, dsm)) {
+            store.setCompactionBackpressureThreshold(100);
+            store.setCompactionTargetBytes(8L * 1024L * 1024L * 1024L);
+
+            List<VectorSegment> snapshot = new ArrayList<>();
+            // 3 graduated segments — far below the bp threshold of 100.
+            for (int i = 1; i <= 3; i++) {
+                snapshot.add(seg(i, 16L * 1024L * 1024L * 1024L));
+            }
+            assertEquals(PersistentVectorStore.ConvergenceLogKind.STEADY_STATE,
+                    store.maybeLogConvergence(snapshot, 1_000L));
+        }
+    }
+
+    /**
+     * At or above the back-pressure threshold + non-empty snapshot →
+     * BACKPRESSURE_DEADLOCK WARNING. This is the operator-action alert the
+     * user explicitly asked for (a stalled cluster: writes blocked, compaction
+     * empty). Also pins that the WARNING fires the very first time it is
+     * reached after start (no missed-first-alert risk).
+     */
+    @Test
+    public void maybeLogConvergenceEmitsBackpressureDeadlockAtOrAboveThreshold()
+            throws Exception {
+        Path baseDir = tmpFolder.newFolder("data").toPath();
+        Path tmpDir = tmpFolder.newFolder("tmp").toPath();
+        FileDataStorageManager dsm = new FileDataStorageManager(baseDir);
+        dsm.initTablespace(TABLE_SPACE);
+        try (PersistentVectorStore store = createStore(tmpDir, dsm)) {
+            store.setCompactionBackpressureThreshold(4);
+            store.setCompactionTargetBytes(8L * 1024L * 1024L * 1024L);
+
+            List<VectorSegment> snapshot = new ArrayList<>();
+            // 4 graduated segments — at the back-pressure threshold (>= 4).
+            for (int i = 1; i <= 4; i++) {
+                snapshot.add(seg(i, 16L * 1024L * 1024L * 1024L));
+            }
+            assertEquals("at the bp threshold the deadlock WARNING must fire",
+                    PersistentVectorStore.ConvergenceLogKind.BACKPRESSURE_DEADLOCK,
+                    store.maybeLogConvergence(snapshot, 1_000L));
+        }
+    }
+
+    /**
+     * Disabling back-pressure (Integer.MAX_VALUE) must suppress the deadlock
+     * WARNING regardless of how many segments accumulate — the steady-state
+     * INFO is still allowed. This pins the sentinel branch the reviewer
+     * flagged.
+     */
+    @Test
+    public void maybeLogConvergenceNeverEmitsDeadlockWhenBackpressureDisabled()
+            throws Exception {
+        Path baseDir = tmpFolder.newFolder("data").toPath();
+        Path tmpDir = tmpFolder.newFolder("tmp").toPath();
+        FileDataStorageManager dsm = new FileDataStorageManager(baseDir);
+        dsm.initTablespace(TABLE_SPACE);
+        try (PersistentVectorStore store = createStore(tmpDir, dsm)) {
+            store.setCompactionBackpressureThreshold(Integer.MAX_VALUE);
+
+            List<VectorSegment> snapshot = new ArrayList<>();
+            for (int i = 1; i <= 1000; i++) {
+                snapshot.add(seg(i, 16L * 1024L * 1024L * 1024L));
+            }
+            // With bp disabled, even a 1000-segment all-graduated index emits
+            // the STEADY_STATE line — never the DEADLOCK line.
+            assertEquals(
+                    PersistentVectorStore.ConvergenceLogKind.STEADY_STATE,
+                    store.maybeLogConvergence(snapshot, 1_000L));
+        }
+    }
+
+    /**
+     * 5-minute throttle: a second call within the window must return NONE,
+     * a call past the window must re-emit. Both the deadlock-WARN and the
+     * steady-state-INFO branches use independent throttles, so this also
+     * pins that they do not stomp on each other.
+     */
+    @Test
+    public void maybeLogConvergenceThrottlesRepeatedCalls() throws Exception {
+        Path baseDir = tmpFolder.newFolder("data").toPath();
+        Path tmpDir = tmpFolder.newFolder("tmp").toPath();
+        FileDataStorageManager dsm = new FileDataStorageManager(baseDir);
+        dsm.initTablespace(TABLE_SPACE);
+        try (PersistentVectorStore store = createStore(tmpDir, dsm)) {
+            store.setCompactionBackpressureThreshold(100);
+
+            List<VectorSegment> steady = new ArrayList<>();
+            for (int i = 1; i <= 3; i++) {
+                steady.add(seg(i, 16L * 1024L * 1024L * 1024L));
+            }
+            // First call: STEADY_STATE.
+            assertEquals(PersistentVectorStore.ConvergenceLogKind.STEADY_STATE,
+                    store.maybeLogConvergence(steady, 0L));
+            // Immediate re-call within the throttle window: NONE.
+            assertEquals(PersistentVectorStore.ConvergenceLogKind.NONE,
+                    store.maybeLogConvergence(steady, 1_000L));
+            // Past the throttle window: re-emits.
+            long pastWindow = PersistentVectorStore.STEADY_STATE_LOG_INTERVAL_NANOS + 1L;
+            assertEquals(PersistentVectorStore.ConvergenceLogKind.STEADY_STATE,
+                    store.maybeLogConvergence(steady, pastWindow));
+
+            // Independent throttle: a DEADLOCK call right after the
+            // STEADY_STATE re-emit must still fire because the deadlock
+            // counter has its own AtomicLong.
+            store.setCompactionBackpressureThreshold(4);
+            List<VectorSegment> overloaded = new ArrayList<>();
+            for (int i = 1; i <= 10; i++) {
+                overloaded.add(seg(i, 16L * 1024L * 1024L * 1024L));
+            }
+            assertEquals("deadlock throttle is independent of steady-state throttle",
+                    PersistentVectorStore.ConvergenceLogKind.BACKPRESSURE_DEADLOCK,
+                    store.maybeLogConvergence(overloaded, pastWindow + 1L));
+        }
+    }
+
+    /** Empty snapshot returns NONE — the helper must not emit any log line. */
+    @Test
+    public void maybeLogConvergenceEmptySnapshotIsNone() throws Exception {
+        Path baseDir = tmpFolder.newFolder("data").toPath();
+        Path tmpDir = tmpFolder.newFolder("tmp").toPath();
+        FileDataStorageManager dsm = new FileDataStorageManager(baseDir);
+        dsm.initTablespace(TABLE_SPACE);
+        try (PersistentVectorStore store = createStore(tmpDir, dsm)) {
+            assertEquals(PersistentVectorStore.ConvergenceLogKind.NONE,
+                    store.maybeLogConvergence(new ArrayList<>(), 0L));
         }
     }
 }

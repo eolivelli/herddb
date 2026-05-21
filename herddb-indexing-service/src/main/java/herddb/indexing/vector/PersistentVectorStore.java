@@ -661,11 +661,17 @@ public class PersistentVectorStore extends AbstractVectorStore {
      * Holds the {@link System#nanoTime()} of the last steady-state log emitted
      * for this store; the log fires again only after
      * {@link #STEADY_STATE_LOG_INTERVAL_NANOS} has elapsed, so a quiescent index
-     * does not spam one log line per compaction tick. Initial value
-     * {@link Long#MIN_VALUE} guarantees the very first steady-state cycle logs.
+     * does not spam one log line per compaction tick.
+     *
+     * <p>The CAS in {@link #maybeLogConvergence} is defensive: while
+     * {@code runCompactionCycle} holds {@code compactionLock} so concurrent
+     * emissions cannot happen, the helper is also reachable from unit tests
+     * that may invoke it directly off-thread. {@link Long#MIN_VALUE} is the
+     * "never logged yet" sentinel — the helper treats it as "force-emit on
+     * first call" without doing the nanos-overflow arithmetic.
      */
-    private final java.util.concurrent.atomic.AtomicLong lastSteadyStateLogNanos =
-            new java.util.concurrent.atomic.AtomicLong(Long.MIN_VALUE);
+    private final AtomicLong lastSteadyStateLogNanos =
+            new AtomicLong(Long.MIN_VALUE);
 
     /**
      * Throttle for the "BACKPRESSURE DEADLOCK" WARNING log line (issue #631).
@@ -675,18 +681,37 @@ public class PersistentVectorStore extends AbstractVectorStore {
      * {@link Long#MIN_VALUE} guarantees the first deadlock cycle warns
      * immediately.
      */
-    private final java.util.concurrent.atomic.AtomicLong lastBackpressureDeadlockLogNanos =
-            new java.util.concurrent.atomic.AtomicLong(Long.MIN_VALUE);
+    private final AtomicLong lastBackpressureDeadlockLogNanos =
+            new AtomicLong(Long.MIN_VALUE);
 
     /**
      * Minimum elapsed time between consecutive emissions of the
      * "compaction in steady state" / "back-pressure deadlock" log lines
-     * (issue #631). 5 minutes matches the default
-     * {@code vector.index.compaction.intervalMs}, so a quiescent index logs
-     * roughly once per cycle rather than every cycle.
+     * (issue #631). Fixed at 5 minutes — independent of
+     * {@code vector.index.compaction.intervalMs} so the cadence stays
+     * predictable for operators even when the compaction interval is tuned
+     * shorter (a 30-second compaction interval would otherwise spam these
+     * lines at twelve times the rate the convergence story is meant to be
+     * observed at). The first emission after process start is always
+     * unthrottled.
      */
     static final long STEADY_STATE_LOG_INTERVAL_NANOS =
-            java.util.concurrent.TimeUnit.MINUTES.toNanos(5);
+            TimeUnit.MINUTES.toNanos(5);
+
+    /**
+     * Result of {@link #maybeLogConvergence} — names the operator-visible log
+     * line that was emitted for this cycle's empty-candidates outcome. Used by
+     * the unit tests to assert which branch fired (and that the throttle
+     * suppresses re-emissions) without intercepting the {@code Logger} stream.
+     */
+    enum ConvergenceLogKind {
+        /** Empty snapshot, throttled, or back-pressure disabled — nothing emitted. */
+        NONE,
+        /** Steady-state INFO line — segments exist but compaction correctly has nothing to merge. */
+        STEADY_STATE,
+        /** Back-pressure WARNING line — segments at or above the BP threshold but compaction picked nothing. */
+        BACKPRESSURE_DEADLOCK
+    }
     /**
      * When {@code true} (the default), the per-cycle byte cap and segment
      * count cap are scaled up by {@link VectorIndexCompactor#tieredMultiplier}
@@ -2523,6 +2548,105 @@ public class PersistentVectorStore extends AbstractVectorStore {
     }
 
     /**
+     * Issue #631 — emits the operator-visible "nothing to merge" log line for
+     * the supplied snapshot, throttled per {@link #STEADY_STATE_LOG_INTERVAL_NANOS}.
+     *
+     * <p>One of three outcomes:
+     * <ul>
+     *   <li>{@link ConvergenceLogKind#BACKPRESSURE_DEADLOCK} (WARNING) when the
+     *       snapshot is at or above {@link #compactionBackpressureThreshold}
+     *       and compaction selected nothing — writes are throttled and
+     *       compaction cannot drain them. Names the operator knobs to raise
+     *       (target.bytes, backpressure.segments, cluster size).</li>
+     *   <li>{@link ConvergenceLogKind#STEADY_STATE} (INFO) when the snapshot
+     *       is non-empty but below the back-pressure threshold — typically
+     *       every segment has graduated and the index is correctly idle.</li>
+     *   <li>{@link ConvergenceLogKind#NONE} when the snapshot is empty, when
+     *       the throttle suppresses the emission, or when back-pressure is
+     *       disabled ({@link Integer#MAX_VALUE}) and the snapshot is below
+     *       that ceiling.</li>
+     * </ul>
+     *
+     * <p>The deadlock-WARN uses {@code >= compactionBackpressureThreshold}
+     * intentionally — the write-blocker at {@code waitForSegmentCountRelief}
+     * uses strict {@code >}, so the WARNING fires one segment earlier than
+     * writes actually block. That gives operators a one-segment heads-up that
+     * the deadlock is imminent rather than racing them to it.
+     *
+     * <p>Package-private and snapshot-parameterised so the unit tests can
+     * drive every branch (including the back-pressure-disabled and
+     * throttle-suppressed cases) without standing up a full compaction loop.
+     *
+     * @param snapshot the per-cycle segment snapshot that produced an empty
+     *     candidate set; must be non-null
+     * @param nowNanos the {@code System.nanoTime()} timestamp for this cycle;
+     *     parameterised so tests can drive the 5-min throttle deterministically
+     */
+    ConvergenceLogKind maybeLogConvergence(List<VectorSegment> snapshot, long nowNanos) {
+        if (snapshot == null || snapshot.isEmpty()) {
+            return ConvergenceLogKind.NONE;
+        }
+        VectorIndexCompactor.GraduationStats stats =
+                VectorIndexCompactor.computeGraduationStats(
+                        snapshot, vectorIndexCompactionTargetBytes);
+        boolean inBackpressure =
+                compactionBackpressureThreshold != Integer.MAX_VALUE
+                        && snapshot.size() >= compactionBackpressureThreshold;
+        if (inBackpressure) {
+            long last = lastBackpressureDeadlockLogNanos.get();
+            if (last != Long.MIN_VALUE
+                    && nowNanos - last < STEADY_STATE_LOG_INTERVAL_NANOS) {
+                return ConvergenceLogKind.NONE;
+            }
+            if (!lastBackpressureDeadlockLogNanos.compareAndSet(last, nowNanos)) {
+                // Lost a race with another thread that just logged; treat as
+                // throttled — no double emission for this cycle.
+                return ConvergenceLogKind.NONE;
+            }
+            LOGGER.log(Level.WARNING,
+                    "vector store {0}: BACKPRESSURE DEADLOCK — {1} segments at or above"
+                            + " back-pressure threshold {2}, but compaction selected no"
+                            + " candidates this cycle (graduated={3} at >= target.bytes={4},"
+                            + " sub-target={5} totalling {6} bytes; thresholds minCount={7},"
+                            + " minBytes={8}, maxCount={9}). Writes are throttled and"
+                            + " compaction cannot drain them. OPERATOR ACTION REQUIRED:"
+                            + " raise vector.index.compaction.target.bytes above the largest"
+                            + " segment, raise vector.index.compaction.backpressure.segments,"
+                            + " or expand the cluster.",
+                    new Object[]{indexName, snapshot.size(),
+                            compactionBackpressureThreshold,
+                            stats.graduatedCount, vectorIndexCompactionTargetBytes,
+                            stats.subTargetCount, stats.subTargetBytes,
+                            vectorIndexCompactionMinCount,
+                            vectorIndexCompactionMinBytes,
+                            vectorIndexCompactionMaxCount});
+            return ConvergenceLogKind.BACKPRESSURE_DEADLOCK;
+        }
+
+        long last = lastSteadyStateLogNanos.get();
+        if (last != Long.MIN_VALUE
+                && nowNanos - last < STEADY_STATE_LOG_INTERVAL_NANOS) {
+            return ConvergenceLogKind.NONE;
+        }
+        if (!lastSteadyStateLogNanos.compareAndSet(last, nowNanos)) {
+            return ConvergenceLogKind.NONE;
+        }
+        LOGGER.log(Level.INFO,
+                "vector store {0}: compaction in steady state — nothing to merge."
+                        + " total segments={1}, graduated (>= target.bytes {2})={3},"
+                        + " sub-target={4} ({5} bytes total); thresholds minCount={6},"
+                        + " minBytes={7}, maxCount={8}.",
+                new Object[]{indexName, snapshot.size(),
+                        vectorIndexCompactionTargetBytes,
+                        stats.graduatedCount,
+                        stats.subTargetCount, stats.subTargetBytes,
+                        vectorIndexCompactionMinCount,
+                        vectorIndexCompactionMinBytes,
+                        vectorIndexCompactionMaxCount});
+        return ConvergenceLogKind.STEADY_STATE;
+    }
+
+    /**
      * Runs at most one compaction cycle. Silently skips when the lock
      * is busy (tests may invoke synchronously) or when the policy says
      * no candidates are large enough / numerous enough.
@@ -2654,76 +2778,11 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 }
                 // Issue #631 — emit a clear, structured "nothing to do" / "operator
                 // action required" log line whenever compaction selects no candidates
-                // on a non-empty index. The two log lines are mutually exclusive:
-                //   - BACKPRESSURE DEADLOCK (WARNING): the segment count is at or
-                //     above the back-pressure threshold AND compaction selected
-                //     nothing. Writes are throttled and compaction will not drain
-                //     them — operator intervention is required.
-                //   - Steady state (INFO): the index has segments but compaction
-                //     correctly has nothing to merge (typically every segment has
-                //     graduated). Both lines carry graduated / sub-target counts so
-                //     the operator can immediately tell which side of the cap is
-                //     dominant. Both are throttled to one emission per
-                //     STEADY_STATE_LOG_INTERVAL_NANOS so a quiescent index does not
-                //     spam one entry per compaction tick.
-                if (!snapshot.isEmpty()) {
-                    VectorIndexCompactor.GraduationStats stats =
-                            VectorIndexCompactor.computeGraduationStats(
-                                    snapshot, vectorIndexCompactionTargetBytes);
-                    boolean inBackpressure =
-                            compactionBackpressureThreshold != Integer.MAX_VALUE
-                                    && snapshot.size() >= compactionBackpressureThreshold;
-                    long nowNanos = System.nanoTime();
-                    if (inBackpressure) {
-                        long last = lastBackpressureDeadlockLogNanos.get();
-                        if (last == Long.MIN_VALUE
-                                || nowNanos - last >= STEADY_STATE_LOG_INTERVAL_NANOS) {
-                            if (lastBackpressureDeadlockLogNanos.compareAndSet(last, nowNanos)) {
-                                LOGGER.log(Level.WARNING,
-                                        "vector store {0}: BACKPRESSURE DEADLOCK — {1} segments"
-                                                + " at or above back-pressure threshold {2},"
-                                                + " but compaction selected no candidates this"
-                                                + " cycle (graduated={3} at >= target.bytes={4},"
-                                                + " sub-target={5} totalling {6} bytes; thresholds"
-                                                + " minCount={7}, minBytes={8}, maxCount={9})."
-                                                + " Writes are throttled and compaction cannot"
-                                                + " drain them. OPERATOR ACTION REQUIRED: raise"
-                                                + " vector.index.compaction.target.bytes above"
-                                                + " the largest segment, raise"
-                                                + " vector.index.compaction.backpressure.segments,"
-                                                + " or expand the cluster.",
-                                        new Object[]{indexName, snapshot.size(),
-                                                compactionBackpressureThreshold,
-                                                stats.graduatedCount,
-                                                vectorIndexCompactionTargetBytes,
-                                                stats.subTargetCount, stats.subTargetBytes,
-                                                vectorIndexCompactionMinCount,
-                                                vectorIndexCompactionMinBytes,
-                                                vectorIndexCompactionMaxCount});
-                            }
-                        }
-                    } else {
-                        long last = lastSteadyStateLogNanos.get();
-                        if (last == Long.MIN_VALUE
-                                || nowNanos - last >= STEADY_STATE_LOG_INTERVAL_NANOS) {
-                            if (lastSteadyStateLogNanos.compareAndSet(last, nowNanos)) {
-                                LOGGER.log(Level.INFO,
-                                        "vector store {0}: compaction in steady state — nothing"
-                                                + " to merge. total segments={1}, graduated"
-                                                + " (>= target.bytes {2})={3}, sub-target={4}"
-                                                + " ({5} bytes total); thresholds minCount={6},"
-                                                + " minBytes={7}, maxCount={8}.",
-                                        new Object[]{indexName, snapshot.size(),
-                                                vectorIndexCompactionTargetBytes,
-                                                stats.graduatedCount,
-                                                stats.subTargetCount, stats.subTargetBytes,
-                                                vectorIndexCompactionMinCount,
-                                                vectorIndexCompactionMinBytes,
-                                                vectorIndexCompactionMaxCount});
-                            }
-                        }
-                    }
-                }
+                // on a non-empty index. The helper routes between the steady-state
+                // INFO and the BACKPRESSURE DEADLOCK WARNING, applies the per-line
+                // throttle, and returns which (if any) line was emitted so unit
+                // tests can pin the behaviour without intercepting the Logger.
+                maybeLogConvergence(snapshot, System.nanoTime());
                 // Notify even when no candidates were selected (issue #370): apply
                 // threads parked in waitForSegmentCountRelief() must be woken after
                 // every cycle so they can re-check the segment count and, if the
@@ -2732,9 +2791,20 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 return;
             }
 
+            // Issue #631 — include the post-filter graduation breakdown so a
+            // single log line per cycle tells operators both how many segments
+            // are about to merge AND how many were skipped because they crossed
+            // the target.bytes cap.
+            VectorIndexCompactor.GraduationStats firingStats =
+                    VectorIndexCompactor.computeGraduationStats(
+                            snapshot, vectorIndexCompactionTargetBytes);
             LOGGER.log(Level.INFO,
-                    "vector store {0}: starting graph-merge compaction ({1} candidate segments)",
-                    new Object[]{indexName, candidates.size()});
+                    "vector store {0}: starting graph-merge compaction ({1} candidate segments;"
+                            + " {2} graduated at >= target.bytes={3}, {4} sub-target totalling"
+                            + " {5} bytes in snapshot)",
+                    new Object[]{indexName, candidates.size(),
+                            firingStats.graduatedCount, vectorIndexCompactionTargetBytes,
+                            firingStats.subTargetCount, firingStats.subTargetBytes});
 
             compactionActive.set(1);
 
