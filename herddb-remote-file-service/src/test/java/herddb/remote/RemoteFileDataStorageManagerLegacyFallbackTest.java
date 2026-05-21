@@ -23,16 +23,21 @@ package herddb.remote;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
 import herddb.remote.storage.LocalObjectStorage;
+import herddb.remote.storage.ReadResult;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Rule;
@@ -234,37 +239,102 @@ public class RemoteFileDataStorageManagerLegacyFallbackTest {
     }
 
     /**
-     * The probe-cache is populated lazily on first probe. A legacy file
-     * must NOT have its absence cached after the very first call — that
-     * would cause a never-rewritten legacy file to permanently look
-     * "absent" if it later gains a bulk variant. The implementation
-     * deliberately caches the negative result for the JVM's lifetime
-     * because we expect the layout to be stable per logical path, but the
-     * assertion here guards a subtler property: the cache MUST be
-     * populated (true or false) after the first probe, so we don't issue
-     * a HEAD round-trip on every random-access read.
+     * The probe-cache is populated lazily on first positive probe. This test
+     * verifies the concrete cache-hit property: once a bulk file is present and
+     * the first {@code multipartIndexFileExists} has probed it, subsequent calls
+     * must NOT issue additional {@code existsObject} round-trips — the positive
+     * result is cached in-memory for the JVM lifetime.
+     *
+     * <p>A {@link CountingLocalObjectStorage} wraps the backing storage and
+     * counts every {@code existsObject} call, giving direct visibility into
+     * cache hits vs. misses.
+     *
+     * <p>Note: only positive results are cached (since isBulkLayout v2 — see
+     * the fix in issue #638 review). Legacy per-block paths that have no bulk
+     * object always re-probe on each call; the other tests in this class cover
+     * that path end-to-end.
      */
     @Test
     public void probeCacheIsPopulatedAfterFirstProbe() throws Exception {
-        byte[] original = randomBytes(BLOCK_SIZE * 2, 9L);
-        writeBlocksDirectly("ts", "probe-cache", "map", original);
+        // Use a fresh DSM wired to a counting storage so we can count HEAD probes.
+        CountingLocalObjectStorage countingStorage = new CountingLocalObjectStorage(
+                tmpFolder.newFolder("counting-storage").toPath(), metadataExecutor);
+        Map<String, Object> fastFailConfig = new HashMap<>();
+        fastFailConfig.put(RemoteFileServiceClient.CONFIG_CLIENT_TIMEOUT, 1L);
+        fastFailConfig.put(RemoteFileServiceClient.CONFIG_CLIENT_RETRIES, 0);
+        RemoteFileServiceClient freshClient = new RemoteFileServiceClient(
+                Collections.emptyList(), fastFailConfig);
+        Path metaDir = tmpFolder.newFolder("probe-meta").toPath();
+        Path tmpDir = tmpFolder.newFolder("probe-tmp").toPath();
+        RemoteFileDataStorageManager freshDsm = new RemoteFileDataStorageManager(
+                metaDir, tmpDir, Integer.MAX_VALUE, freshClient);
+        freshDsm.setDirectObjectStorage(countingStorage);
+        try {
+            // Materialise a bulk file directly in the counting storage so
+            // isBulkLayout's HEAD probe returns true and caches it.
+            String tableSpace = "ts";
+            String uuid = "probe-cache";
+            String fileType = "map";
+            String bulkKey = tableSpace + "/" + uuid + "/multipart/" + fileType + ".bulk";
+            byte[] payload = randomBytes(256, 9L);
+            countingStorage.write(bulkKey, payload).get();
 
-        // First probe — triggers a HEAD against the LocalObjectStorage. We
-        // do not have direct access to the cache map, but verify behaviour:
-        // a second download succeeds without any probe-throughput
-        // explosion. (Indirect: a real test of cache population would need
-        // a counting ObjectStorage, but the legacy-only file
-        // downloadMultipartIndexFile assertion above already exercises the
-        // probe-then-fallback path end-to-end.)
-        Path dest1 = tmpFolder.newFile("probe-cache-1.bin").toPath();
-        dsm.downloadMultipartIndexFile("ts", "probe-cache", "map", original.length, dest1);
-        Path dest2 = tmpFolder.newFile("probe-cache-2.bin").toPath();
-        dsm.downloadMultipartIndexFile("ts", "probe-cache", "map", original.length, dest2);
-        assertArrayEquals(original, Files.readAllBytes(dest1));
-        assertArrayEquals(original, Files.readAllBytes(dest2));
-        // Sanity check: the file bytes match across both invocations — the
-        // second invocation must not have served a stale cached copy.
-        assertEquals(original.length, Files.size(dest1));
-        assertEquals(original.length, Files.size(dest2));
+            // First probe: isBulkLayout issues one existsObject call, gets true, caches it.
+            int probesBefore = countingStorage.existsCount.get();
+            assertTrue("first probe must find the bulk file",
+                    freshDsm.multipartIndexFileExists(tableSpace, uuid, fileType));
+            assertEquals("first probe must issue exactly one existsObject call",
+                    probesBefore + 1, countingStorage.existsCount.get());
+
+            // Second probe: positive result is cached — no additional HEAD must fire.
+            int probesAfterFirst = countingStorage.existsCount.get();
+            assertTrue("second probe must also return true via cache",
+                    freshDsm.multipartIndexFileExists(tableSpace, uuid, fileType));
+            assertEquals("second probe must be a cache hit — no new existsObject call",
+                    probesAfterFirst, countingStorage.existsCount.get());
+
+            // Third probe — still cached.
+            assertTrue(freshDsm.multipartIndexFileExists(tableSpace, uuid, fileType));
+            assertEquals("third probe must also be a cache hit",
+                    probesAfterFirst, countingStorage.existsCount.get());
+        } finally {
+            freshDsm.close();
+            freshClient.close();
+        }
+    }
+
+    // ====================================================================
+    // CountingLocalObjectStorage — LocalObjectStorage subclass that counts
+    // existsObject calls so the probeCacheIsPopulatedAfterFirstProbe test can
+    // assert cache hits without direct access to the cache map.
+    // ====================================================================
+
+    static final class CountingLocalObjectStorage extends LocalObjectStorage {
+        final AtomicInteger existsCount = new AtomicInteger();
+
+        CountingLocalObjectStorage(Path baseDir, ExecutorService executor) throws IOException {
+            super(baseDir, executor);
+        }
+
+        @Override
+        public CompletableFuture<Boolean> existsObject(String path) {
+            existsCount.incrementAndGet();
+            // Delegate to the default ObjectStorage.existsObject which calls read().
+            return read(path).thenApply(result -> {
+                boolean found = result.status() == ReadResult.Status.FOUND;
+                result.release();
+                return found;
+            }).exceptionally(t -> Boolean.FALSE);
+        }
+
+        @Override
+        public CompletableFuture<Boolean> deleteLogical(String path) {
+            return delete(path);
+        }
+
+        @Override
+        public CompletableFuture<List<String>> listLogical(String prefix) {
+            return list(prefix);
+        }
     }
 }

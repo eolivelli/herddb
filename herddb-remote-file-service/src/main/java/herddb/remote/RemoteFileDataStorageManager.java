@@ -45,7 +45,10 @@ import herddb.utils.ByteBufDataOutput;
 import herddb.utils.XXHash64Utils;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.PooledByteBufAllocator;
+import java.io.FilterInputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -56,10 +59,13 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.LongConsumer;
@@ -137,7 +143,7 @@ public class RemoteFileDataStorageManager extends DataStorageManager
      * operators tune the direct cap independently via
      * {@code indexing.remote.file.client.max.inflight.direct.write.bytes}.
      */
-    private volatile java.util.concurrent.Semaphore directInflightUploadBytes;
+    private volatile Semaphore directInflightUploadBytes;
 
     /**
      * Issue #638: total capacity of {@link #directInflightUploadBytes},
@@ -226,7 +232,7 @@ public class RemoteFileDataStorageManager extends DataStorageManager
         }
         // Cap to Integer.MAX_VALUE because Semaphore counts permits as int.
         int permits = (int) Math.min(maxInflightBytes, Integer.MAX_VALUE);
-        this.directInflightUploadBytes = new java.util.concurrent.Semaphore(permits);
+        this.directInflightUploadBytes = new Semaphore(permits);
         this.maxDirectInflightUploadBytes = maxInflightBytes;
         this.directUploadPermits = permits;
         this.directUploadEnabled = true;
@@ -258,7 +264,7 @@ public class RemoteFileDataStorageManager extends DataStorageManager
      * disabled. Used by tests and as a future gauge source.
      */
     public long availableDirectInflightUploadBytes() {
-        java.util.concurrent.Semaphore s = this.directInflightUploadBytes;
+        Semaphore s = this.directInflightUploadBytes;
         return s == null ? 0L : s.availablePermits();
     }
 
@@ -610,7 +616,7 @@ public class RemoteFileDataStorageManager extends DataStorageManager
         // file from a previous run is gone before the JVM exits.
         for (Path localCache : bulkLocalCache.values()) {
             try {
-                java.nio.file.Files.deleteIfExists(localCache);
+                Files.deleteIfExists(localCache);
             } catch (IOException ioe) {
                 LOGGER.log(Level.FINE,
                         "could not delete local bulk cache file {0} during close: {1}",
@@ -1159,8 +1165,8 @@ public class RemoteFileDataStorageManager extends DataStorageManager
         }
         int blockSize = Math.max(client.getBlockSize(), MULTIPART_BLOCK_SIZE);
         long totalBytes;
-        try (java.io.InputStream raw = java.nio.file.Files.newInputStream(tempFile);
-             java.io.InputStream in = progress != null
+        try (InputStream raw = Files.newInputStream(tempFile);
+             InputStream in = progress != null
                      ? new CountingInputStream(raw, progress)
                      : raw) {
             totalBytes = client.writeMultipartFile(logicalPath, in, blockSize);
@@ -1172,10 +1178,11 @@ public class RemoteFileDataStorageManager extends DataStorageManager
     }
 
     /**
-     * Issue #638: direct-S3 upload path. Reserves
+     * Issue #638: direct-S3 upload path. Reserves up to
      * {@code min(fileSize, directUploadPermits)} permits from the in-flight
-     * upload semaphore (chunked acquire to allow smaller concurrent uploads
-     * to interleave), invokes
+     * upload semaphore — a file larger than the cap holds the full cap for
+     * the duration of the upload, which serialises large uploads behind one
+     * another. Invokes
      * {@link ObjectStorage#uploadFile(String, Path, LongConsumer)} against
      * the single bulk-layout key {@code logicalPath + ".bulk"}, and releases
      * all permits when the future completes regardless of outcome.
@@ -1203,7 +1210,7 @@ public class RemoteFileDataStorageManager extends DataStorageManager
                     "Direct S3 not configured on this RemoteFileDataStorageManager");
         }
         final String bulkPath = logicalPath + BULK_LAYOUT_SUFFIX;
-        final long fileSize = java.nio.file.Files.size(tempFile);
+        final long fileSize = Files.size(tempFile);
         // Reserve permits before launching the upload. A zero-byte file
         // skips the reservation entirely (no inflight bytes to bound).
         final Runnable release = fileSize > 0L
@@ -1217,7 +1224,7 @@ public class RemoteFileDataStorageManager extends DataStorageManager
             LOGGER.log(Level.INFO,
                     "writeMultipartIndexFile(direct): {0} uploaded {1} bytes (bulk layout) in {2} ms",
                     new Object[]{bulkPath, uploaded,
-                            java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(
+                            TimeUnit.NANOSECONDS.toMillis(
                                     System.nanoTime() - startNanos)});
             // Mark the bulk layout as present so subsequent probes (existence
             // check, reader supplier, download path) take the bulk branch
@@ -1257,7 +1264,7 @@ public class RemoteFileDataStorageManager extends DataStorageManager
      */
     private static void bestEffortDeleteBulkOrphan(ObjectStorage storage, String bulkPath) {
         try {
-            storage.delete(bulkPath).get(10L, java.util.concurrent.TimeUnit.SECONDS);
+            storage.delete(bulkPath).get(10L, TimeUnit.SECONDS);
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
             LOGGER.log(Level.WARNING,
@@ -1286,7 +1293,7 @@ public class RemoteFileDataStorageManager extends DataStorageManager
      * cap (smaller concurrent uploads can interleave between chunks).
      */
     private Runnable reserveDirectInflightUploadBytes(long bytes) throws IOException {
-        java.util.concurrent.Semaphore s = this.directInflightUploadBytes;
+        Semaphore s = this.directInflightUploadBytes;
         if (s == null) {
             // disableDirectUpload() raced with the upload — return a no-op
             // releaser; callers are still responsible for handling the
@@ -1313,7 +1320,7 @@ public class RemoteFileDataStorageManager extends DataStorageManager
             // 10 min is generous enough for any realistic multipart upload.
             try {
                 boolean acquired = s.tryAcquire(toAcquire, 10L,
-                        java.util.concurrent.TimeUnit.MINUTES);
+                        TimeUnit.MINUTES);
                 if (!acquired) {
                     throw new IOException(
                             "direct-upload inflight semaphore timed out after 10 minutes "
@@ -1328,7 +1335,7 @@ public class RemoteFileDataStorageManager extends DataStorageManager
                 throw new IOException(
                         "Interrupted while waiting for direct-upload inflight semaphore", ie);
             }
-            long elapsedMs = java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(
+            long elapsedMs = TimeUnit.NANOSECONDS.toMillis(
                     System.nanoTime() - startNanos);
             if (elapsedMs >= 50L) {
                 LOGGER.log(Level.WARNING,
@@ -1337,8 +1344,8 @@ public class RemoteFileDataStorageManager extends DataStorageManager
                         new Object[]{elapsedMs, toAcquire});
             }
         }
-        java.util.concurrent.atomic.AtomicBoolean released =
-                new java.util.concurrent.atomic.AtomicBoolean(false);
+        AtomicBoolean released =
+                new AtomicBoolean(false);
         final int finalAcquired = toAcquire;
         return () -> {
             if (released.compareAndSet(false, true)) {
@@ -1352,10 +1359,10 @@ public class RemoteFileDataStorageManager extends DataStorageManager
      * report via a {@link LongConsumer}. Used by Phase-B multipart uploads so
      * that the PersistentVectorStore can expose mid-flight upload progress.
      */
-    private static final class CountingInputStream extends java.io.FilterInputStream {
+    private static final class CountingInputStream extends FilterInputStream {
         private final LongConsumer progress;
 
-        CountingInputStream(java.io.InputStream in, LongConsumer progress) {
+        CountingInputStream(InputStream in, LongConsumer progress) {
             super(in);
             this.progress = progress;
         }
@@ -1426,7 +1433,7 @@ public class RemoteFileDataStorageManager extends DataStorageManager
         try {
             present = Boolean.TRUE.equals(
                     storage.existsObject(logicalPath + BULK_LAYOUT_SUFFIX).get(
-                            15L, java.util.concurrent.TimeUnit.SECONDS));
+                            15L, TimeUnit.SECONDS));
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
             return false;
@@ -1480,8 +1487,9 @@ public class RemoteFileDataStorageManager extends DataStorageManager
      */
     private Path ensureBulkLocalCacheFile(String logicalPath, long expectedSize)
             throws IOException {
+        // Fast path: already cached.
         Path cached = bulkLocalCache.get(logicalPath);
-        if (cached != null && java.nio.file.Files.isReadable(cached)) {
+        if (cached != null) {
             return cached;
         }
         ObjectStorage storage = this.directObjectStorage;
@@ -1491,22 +1499,26 @@ public class RemoteFileDataStorageManager extends DataStorageManager
         }
         // Place the cache file under the manager's tmp directory so it
         // travels with the rest of the IS local state on restart cleanup.
-        // The file name encodes the logical path so we can recognise stale
-        // entries left over from a previous JVM run.
         Path cacheDir = tmpDir.resolve("bulk-cache");
-        java.nio.file.Files.createDirectories(cacheDir);
+        Files.createDirectories(cacheDir);
         String safeName = logicalPath.replace('/', '_').replace('\\', '_');
-        Path destFile = cacheDir.resolve(safeName + BULK_LAYOUT_SUFFIX);
+        // Download to a UNIQUE temp file per call to prevent concurrent callers
+        // for the same logical path from writing to the same destination path
+        // simultaneously (which would interleave bytes and corrupt the output).
+        // putIfAbsent below elects exactly one caller's download as the canonical
+        // cache entry; all losers delete their copies.
+        Path tmpFile = cacheDir.resolve(
+                safeName + "." + UUID.randomUUID() + BULK_LAYOUT_SUFFIX);
         try {
-            storage.downloadFileBulk(logicalPath + BULK_LAYOUT_SUFFIX, destFile).get();
+            storage.downloadFileBulk(logicalPath + BULK_LAYOUT_SUFFIX, tmpFile).get();
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
-            // Clean up any partial file so a retry starts from scratch.
-            java.nio.file.Files.deleteIfExists(destFile);
+            // Clean up partial file so a retry starts from scratch.
+            Files.deleteIfExists(tmpFile);
             throw new IOException(
                     "interrupted while materialising bulk file " + logicalPath, ie);
         } catch (java.util.concurrent.ExecutionException ee) {
-            java.nio.file.Files.deleteIfExists(destFile);
+            Files.deleteIfExists(tmpFile);
             Throwable cause = ee.getCause();
             if (cause instanceof IOException) {
                 throw (IOException) cause;
@@ -1514,19 +1526,25 @@ public class RemoteFileDataStorageManager extends DataStorageManager
             throw new IOException(
                     "failed to materialise bulk file " + logicalPath, cause);
         }
-        LOGGER.log(Level.INFO,
-                "materialised bulk multipart file {0} (expectedSize={1}) to local cache {2}",
-                new Object[]{logicalPath, expectedSize, destFile});
-        // Race: another thread may have downloaded the same file concurrently.
-        // putIfAbsent returns the previously-stored value; if non-null we
-        // delete ours and use the existing cache entry to avoid duplicate
-        // local copies. Both copies have identical content so either is fine.
-        Path existing = bulkLocalCache.putIfAbsent(logicalPath, destFile);
+        // Race: another caller may have finished downloading for the same
+        // logical path concurrently. putIfAbsent atomically elects the winner.
+        // The loser deletes its temp file (identical content, just redundant).
+        Path existing = bulkLocalCache.putIfAbsent(logicalPath, tmpFile);
         if (existing != null) {
-            java.nio.file.Files.deleteIfExists(destFile);
+            // We lost the race — delete our temp download and use the winner's.
+            try {
+                Files.deleteIfExists(tmpFile);
+            } catch (IOException cleanupErr) {
+                LOGGER.log(Level.FINE,
+                        "could not clean up duplicate bulk cache download {0}: {1}",
+                        new Object[]{tmpFile, cleanupErr.getMessage()});
+            }
             return existing;
         }
-        return destFile;
+        LOGGER.log(Level.INFO,
+                "materialised bulk multipart file {0} (expectedSize={1}) to local cache {2}",
+                new Object[]{logicalPath, expectedSize, tmpFile});
+        return tmpFile;
     }
 
     /**
@@ -1596,7 +1614,7 @@ public class RemoteFileDataStorageManager extends DataStorageManager
         if (storage != null) {
             try {
                 storage.delete(logicalPath + BULK_LAYOUT_SUFFIX)
-                        .get(15L, java.util.concurrent.TimeUnit.SECONDS);
+                        .get(15L, TimeUnit.SECONDS);
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
                 LOGGER.log(Level.WARNING,
@@ -1622,7 +1640,7 @@ public class RemoteFileDataStorageManager extends DataStorageManager
         Path localCache = bulkLocalCache.remove(logicalPath);
         if (localCache != null) {
             try {
-                java.nio.file.Files.deleteIfExists(localCache);
+                Files.deleteIfExists(localCache);
             } catch (IOException ioe) {
                 LOGGER.log(Level.FINE,
                         "could not delete local bulk cache file {0}: {1}",
@@ -2056,7 +2074,7 @@ public class RemoteFileDataStorageManager extends DataStorageManager
             } catch (RuntimeException ex) {
                 long batchElapsedMicros = (System.nanoTime() - batchStartNanos) / 1_000L;
                 cleanupBatchLatency.registerFailedEvent(batchElapsedMicros,
-                        java.util.concurrent.TimeUnit.MICROSECONDS);
+                        TimeUnit.MICROSECONDS);
                 LOGGER.log(Level.WARNING,
                         "cleanupAfterTableBoot[" + tableSpace + "/" + uuid + "]: batch "
                                 + batchIdx + "/" + totalBatches + " of size " + batch.size()
@@ -2071,7 +2089,7 @@ public class RemoteFileDataStorageManager extends DataStorageManager
             cleanupBatchesCounter.inc();
             cleanupDeletionsCounter.addCount(deleted);
             cleanupBatchLatency.registerSuccessfulEvent(batchElapsedNanos / 1_000L,
-                    java.util.concurrent.TimeUnit.MICROSECONDS);
+                    TimeUnit.MICROSECONDS);
             totalDeleted += deleted;
             // Rate-limit per-batch progress lines: always log the first batch, the
             // final batch, every 100 batches, and at most once every 30 seconds.

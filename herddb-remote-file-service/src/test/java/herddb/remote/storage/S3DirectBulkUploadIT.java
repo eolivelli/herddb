@@ -23,7 +23,6 @@ package herddb.remote.storage;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 import java.net.URI;
 import java.nio.file.Files;
@@ -278,9 +277,9 @@ public class S3DirectBulkUploadIT {
             Files.write(src, payload);
             String key = "plain-" + UUID.randomUUID() + ".bulk";
             long uploaded = plain.uploadFile(key, src, null).get();
-            assertEquals(payload.length, uploaded);
-            assertTrue(plain.existsObject(key).get());
-            assertNotNull("plain storage upload returned non-null receipt", uploaded);
+            assertEquals("plain upload must report the full file size", payload.length, uploaded);
+            assertTrue("uploaded key must be discoverable via existsObject",
+                    plain.existsObject(key).get());
         } finally {
             plain.close();
         }
