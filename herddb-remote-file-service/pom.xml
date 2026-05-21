@@ -84,6 +84,17 @@
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>aws-crt-client</artifactId>
         </dependency>
+        <!--
+          S3 Transfer Manager (issue #638): canonical AWS SDK v2 high-throughput
+          bulk-transfer API. Wraps the CRT S3 client to drive real S3 Multipart
+          Upload / Multipart Download with parallel parts pipelined by CRT, used
+          by the indexing service to upload Phase B / compaction graph + map
+          files directly to S3/MinIO and bypass the gRPC file-server hop.
+        -->
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>s3-transfer-manager</artifactId>
+        </dependency>
         <dependency>
             <groupId>org.apache.bookkeeper.stats</groupId>
             <artifactId>bookkeeper-stats-api</artifactId>

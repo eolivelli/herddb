@@ -341,6 +341,22 @@ public abstract class DataStorageManager implements AutoCloseable {
     }
 
     /**
+     * Issue #638: symmetric to {@link #supportsDirectMultipartDownload}.
+     * Returns {@code true} when this storage manager supports bypassing the
+     * gRPC file-server for bulk segment-file <em>uploads</em> during Phase B
+     * checkpoint / compaction. When {@code true}, {@link #writeMultipartIndexFile}
+     * uploads the file directly to object storage (using the S3 Multipart
+     * Upload API on S3 backends) instead of fanning out per-block
+     * {@code writeFileBlock} RPCs through the gRPC file-server.
+     *
+     * <p>Default: {@code false}. Subclasses that wire a direct
+     * {@code ObjectStorage} client override this to return {@code true}.
+     */
+    public boolean supportsDirectMultipartUpload() {
+        return false;
+    }
+
+    /**
      * Downloads a multipart index file directly to a local file, bypassing the
      * gRPC file server. Only valid when {@link #supportsDirectMultipartDownload()}
      * returns {@code true}; subclasses that do not support this path throw

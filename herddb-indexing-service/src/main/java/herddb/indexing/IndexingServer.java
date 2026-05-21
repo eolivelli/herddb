@@ -293,6 +293,26 @@ public class IndexingServer implements AutoCloseable {
                                 ((RemoteFileDataStorageManager) dsm).setDirectObjectStorage(directStorage);
                                 LOGGER.log(Level.INFO,
                                         "Direct S3 download enabled for segment map files (issue #381)");
+                                // Issue #638: symmetrically enable direct-S3 uploads so Phase B
+                                // checkpoint / compaction writes bypass the gRPC file-server hop
+                                // via the S3 Multipart Upload API. Gated on its own sub-flag so
+                                // operators can roll out reads first and writes later.
+                                boolean directWriteEnabled = config.getBoolean(
+                                        IndexingServerConfiguration.PROPERTY_S3_DIRECT_WRITE_ENABLED,
+                                        IndexingServerConfiguration.PROPERTY_S3_DIRECT_WRITE_ENABLED_DEFAULT);
+                                if (directWriteEnabled) {
+                                    long maxInflight = config.getLong(
+                                            IndexingServerConfiguration
+                                                    .PROPERTY_REMOTE_FILE_CLIENT_MAX_INFLIGHT_DIRECT_WRITE_BYTES,
+                                            IndexingServerConfiguration
+                                                    .PROPERTY_REMOTE_FILE_CLIENT_MAX_INFLIGHT_DIRECT_WRITE_BYTES_DEFAULT);
+                                    ((RemoteFileDataStorageManager) dsm).enableDirectUpload(maxInflight);
+                                    LOGGER.log(Level.INFO,
+                                            "Direct S3 upload via Transfer Manager enabled for"
+                                                    + " multipart index files (issue #638):"
+                                                    + " maxInflight={0} bytes",
+                                            new Object[]{maxInflight});
+                                }
                             } catch (IOException ioe) {
                                 throw new RuntimeException(
                                         "Failed to build direct S3 client for indexing service", ioe);
@@ -540,10 +560,16 @@ public class IndexingServer implements AutoCloseable {
         LOGGER.log(Level.INFO,
                 "Direct S3 client built for segment map downloads: bucket={0}, region={1}, prefix={2}",
                 new Object[]{bucket, region, s3Prefix});
+        // Issue #638: wire an S3TransferManager on top of the same CRT client
+        // so direct uploads/downloads go through the SDK's high-throughput
+        // multipart API instead of single-shot PutObject/GetObject. Closing
+        // the storage closes the TM first and then the client.
+        software.amazon.awssdk.transfer.s3.S3TransferManager tm =
+                herddb.remote.storage.S3TransferManagerFactory.build(s3Client);
         // No StatsLogger here: this object is used only for cold-start reads and
         // the metrics provider is not yet initialised at the point buildDirectS3ObjectStorage
         // is called (it is set up later in start()).
-        return new S3ObjectStorage(s3Client, bucket, s3Prefix);
+        return new S3ObjectStorage(s3Client, bucket, s3Prefix, null, tm);
     }
 
     /**

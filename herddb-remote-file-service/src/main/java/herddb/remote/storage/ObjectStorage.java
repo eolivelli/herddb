@@ -144,6 +144,87 @@ public interface ObjectStorage extends AutoCloseable {
         });
     }
 
+    /**
+     * Issue #638: uploads {@code source} as a <em>single</em> object stored at
+     * {@code path}, returning the number of bytes written. Backends that
+     * support the S3 Multipart Upload API (e.g. {@link S3ObjectStorage} via
+     * {@code S3TransferManager.uploadFile(...)}) override this to pipeline
+     * parts in parallel and stream the file zero-copy from disk.
+     *
+     * <p>Unlike {@link #writeBlock(String, long, byte[])}, the resulting
+     * storage object lives at {@code path} itself — there is no
+     * {@code .multipart/{N}} suffix. {@link RemoteFileDataStorageManager}
+     * pairs this with the {@code .bulk} key convention so that bulk-uploaded
+     * files coexist with legacy per-block files in the same bucket without
+     * ambiguity.
+     *
+     * <p>The default implementation reads the whole file into a heap byte
+     * array and calls {@link #write(String, byte[])} — fine for unit tests
+     * and small files, but a real backend should override.
+     *
+     * @param path     logical object path (this is the final key, no suffix is added)
+     * @param source   local file to upload; must exist and be readable for the
+     *                 entire duration of the upload
+     * @param progress invoked with the number of bytes uploaded since the
+     *                 last invocation (a delta, not a running total). May be
+     *                 {@code null}.
+     * @return a future that completes with the total bytes uploaded
+     */
+    default CompletableFuture<Long> uploadFile(String path, Path source,
+                                               java.util.function.LongConsumer progress) {
+        try {
+            byte[] content = java.nio.file.Files.readAllBytes(source);
+            return write(path, content).thenApply(v -> {
+                if (progress != null && content.length > 0) {
+                    progress.accept(content.length);
+                }
+                return (long) content.length;
+            });
+        } catch (IOException e) {
+            CompletableFuture<Long> failed = new CompletableFuture<>();
+            failed.completeExceptionally(e);
+            return failed;
+        }
+    }
+
+    /**
+     * Issue #638: best-effort single-key existence probe used by
+     * {@link RemoteFileDataStorageManager} to discover whether a logical
+     * multipart file is stored in the bulk layout
+     * ({@code {logicalPath}.bulk}, a single object) or the legacy per-block
+     * layout ({@code {logicalPath}.multipart/{i}}).
+     *
+     * <p>Backends with a cheap presence probe (S3 {@code HEAD}, local file
+     * {@code exists()}) should override; the default falls back to
+     * {@link #read(String)} which materialises the whole object — correct,
+     * but inefficient.
+     *
+     * @return a future that completes with {@code true} if {@code path} is
+     *         present, {@code false} otherwise. Must never complete
+     *         exceptionally for a simple "object missing" answer.
+     */
+    default CompletableFuture<Boolean> existsObject(String path) {
+        return read(path).thenApply(result -> {
+            boolean found = result.status() == ReadResult.Status.FOUND;
+            result.release();
+            return found;
+        }).exceptionally(t -> Boolean.FALSE);
+    }
+
+    /**
+     * Issue #638: downloads a single-object bulk file at {@code path}
+     * directly to {@code dest}, replacing any existing file. Symmetric to
+     * {@link #uploadFile(String, Path, java.util.function.LongConsumer)}.
+     *
+     * <p>The default implementation delegates to
+     * {@link #downloadToFile(String, Path, boolean)} with {@code append=false};
+     * S3 overrides with {@code S3TransferManager.downloadFile(...)} so large
+     * objects stream zero-copy via CRT.
+     */
+    default CompletableFuture<Void> downloadFileBulk(String path, Path dest) {
+        return downloadToFile(path, dest, false);
+    }
+
     @Override
     void close() throws Exception;
 }

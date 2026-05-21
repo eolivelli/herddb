@@ -1299,6 +1299,28 @@ public final class IndexOptimizerMain {
         LOGGER.log(Level.INFO,
                 "Direct S3 download enabled for streaming compaction input segments"
                         + " (issue #609)");
+        // Issue #638: symmetrically enable the direct-S3 upload path for
+        // segments that the optimizer's streaming compactor writes back.
+        // Gated on a dedicated sub-flag so operators can roll out reads
+        // first and writes later; the inflight-bytes cap is independent of
+        // the gRPC client's so the two write paths cannot starve each
+        // other.
+        boolean directWriteEnabled = configuration.getBoolean(
+                OptimizerConfiguration.PROPERTY_S3_DIRECT_WRITE_ENABLED,
+                OptimizerConfiguration.PROPERTY_S3_DIRECT_WRITE_ENABLED_DEFAULT);
+        if (directWriteEnabled) {
+            long maxInflight = configuration.getLong(
+                    OptimizerConfiguration
+                            .PROPERTY_REMOTE_FILE_CLIENT_MAX_INFLIGHT_DIRECT_WRITE_BYTES,
+                    OptimizerConfiguration
+                            .PROPERTY_REMOTE_FILE_CLIENT_MAX_INFLIGHT_DIRECT_WRITE_BYTES_DEFAULT);
+            ((RemoteFileDataStorageManager) dsm).enableDirectUpload(maxInflight);
+            LOGGER.log(Level.INFO,
+                    "optimizer: Direct S3 upload via Transfer Manager enabled for"
+                            + " streaming compaction output segments (issue #638):"
+                            + " maxInflight={0} bytes",
+                    new Object[]{maxInflight});
+        }
     }
 
     /**
@@ -1376,9 +1398,14 @@ public final class IndexOptimizerMain {
                 "Direct S3 client built for streaming compaction segment downloads:"
                         + " bucket={0}, region={1}, prefix={2}",
                 new Object[]{bucket, region, s3Prefix});
+        // Issue #638: wire an S3TransferManager on the same CRT client so
+        // the optimizer's direct uploads/downloads use the high-throughput
+        // S3 Multipart APIs (parts pipelined by the CRT HTTP client).
+        software.amazon.awssdk.transfer.s3.S3TransferManager tm =
+                herddb.remote.storage.S3TransferManagerFactory.build(s3Client);
         // No StatsLogger here: the optimizer's stats provider may not be ready
         // when this is invoked during startup.
-        return new S3ObjectStorage(s3Client, bucket, s3Prefix);
+        return new S3ObjectStorage(s3Client, bucket, s3Prefix, null, tm);
     }
 
     private Path resolveTmpDirectory() throws IOException {

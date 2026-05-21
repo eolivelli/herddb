@@ -113,6 +113,73 @@ public class RemoteFileDataStorageManager extends DataStorageManager
     private volatile ObjectStorage directObjectStorage;
 
     /**
+     * Issue #638: when {@code true}, {@link #writeMultipartIndexFile} uploads
+     * segment files <em>directly</em> to object storage as a single S3 object
+     * via the S3 Multipart Upload API (driven by {@code S3TransferManager}),
+     * bypassing the gRPC file-server hop. Symmetric to the
+     * {@link #directObjectStorage} read-side flag.
+     */
+    private volatile boolean directUploadEnabled;
+
+    /**
+     * Issue #638: semaphore that bounds the total bytes currently being
+     * uploaded via the direct-S3 path, independent of the gRPC client's
+     * {@code inflightWriteBytes} budget. Permits are acquired before the
+     * Transfer Manager upload starts and released when its completion
+     * future fires (success or failure). When direct upload is disabled
+     * the semaphore is {@code null} and the cap field is {@code 0}.
+     *
+     * <p>The dedicated budget keeps direct compaction writes from
+     * starving (or being starved by) the gRPC write plane, and lets
+     * operators tune the direct cap independently via
+     * {@code indexing.remote.file.client.max.inflight.direct.write.bytes}.
+     */
+    private volatile java.util.concurrent.Semaphore directInflightUploadBytes;
+
+    /**
+     * Issue #638: total capacity of {@link #directInflightUploadBytes},
+     * recorded so warning logs and the {@code availableDirectInflightUploadBytes()}
+     * gauge can report the configured limit.
+     */
+    private volatile long maxDirectInflightUploadBytes;
+
+    /**
+     * Issue #638: per-permit cap for {@link #directInflightUploadBytes}.
+     * Mirrors the deadlock-prevention pattern in
+     * {@code RemoteFileServiceClient.acquireInflightWriteBytes} — a single
+     * upload that exceeds the semaphore's total capacity must not block
+     * forever; instead we acquire up to {@code directUploadPermits}.
+     */
+    private volatile int directUploadPermits;
+
+    /**
+     * Issue #638: probe-result cache for the {@code .bulk} layout presence
+     * check. Avoids issuing an S3 {@code HEAD} for every random-access
+     * read on the same logical multipart file. Populated on first probe;
+     * invalidated whenever the logical file is written or deleted.
+     */
+    private final ConcurrentHashMap<String, Boolean> bulkLayoutCache = new ConcurrentHashMap<>();
+
+    /**
+     * Issue #638: local cache of bulk multipart files that have been
+     * downloaded for {@link #multipartIndexReaderSupplier} access. Bulk
+     * files are stored as a single S3 object (no per-block layout) so we
+     * materialise them to local disk once and reuse a memory-mapped
+     * reader for subsequent supplier invocations. Keyed by logical path.
+     * Cleared on {@link #deleteMultipartIndexFile} and {@link #close()}.
+     */
+    private final ConcurrentHashMap<String, Path> bulkLocalCache = new ConcurrentHashMap<>();
+
+    /**
+     * Issue #638: suffix appended to the multipart logical path when the
+     * file is stored in the bulk layout (single S3 object). Chosen to be
+     * unambiguously distinct from the legacy per-block suffix
+     * {@code .multipart/{N}} so that both layouts can coexist for the same
+     * logical file (legacy + new writes) without collision in the bucket.
+     */
+    static final String BULK_LAYOUT_SUFFIX = ".bulk";
+
+    /**
      * Configures a direct object-storage client for segment map-file downloads
      * during recovery. When set, {@link #supportsDirectMultipartDownload()} returns
      * {@code true} and {@link #downloadMultipartIndexFile} reads block objects directly
@@ -125,6 +192,72 @@ public class RemoteFileDataStorageManager extends DataStorageManager
      */
     public void setDirectObjectStorage(ObjectStorage storage) {
         this.directObjectStorage = storage;
+    }
+
+    /**
+     * Issue #638: turns on the direct-S3 upload path for
+     * {@link #writeMultipartIndexFile}. Must be called <em>after</em>
+     * {@link #setDirectObjectStorage} — uploads dispatch through the same
+     * {@link ObjectStorage} instance used for direct reads.
+     *
+     * <p>{@code maxInflightBytes} sets the cap on the per-DSM in-flight
+     * direct-upload semaphore. The cap is independent of the gRPC client's
+     * {@code remote.file.client.max.inflight.write.bytes}: tune them
+     * separately via {@code indexing.remote.file.client.max.inflight.direct.write.bytes}.
+     *
+     * <p>Idempotent: calling repeatedly with the same value is a no-op; calling
+     * with a different value resizes the semaphore by drain-and-replace (only
+     * safe during startup, before any direct upload has been dispatched).
+     */
+    public void enableDirectUpload(long maxInflightBytes) {
+        if (maxInflightBytes <= 0L) {
+            throw new IllegalArgumentException(
+                    "maxInflightBytes must be > 0, got " + maxInflightBytes);
+        }
+        // Cap to Integer.MAX_VALUE because Semaphore counts permits as int.
+        int permits = (int) Math.min(maxInflightBytes, Integer.MAX_VALUE);
+        this.directInflightUploadBytes = new java.util.concurrent.Semaphore(permits);
+        this.maxDirectInflightUploadBytes = maxInflightBytes;
+        this.directUploadPermits = permits;
+        this.directUploadEnabled = true;
+        LOGGER.log(Level.INFO,
+                "direct multipart upload enabled (issue #638): maxInflightBytes={0}",
+                new Object[]{maxInflightBytes});
+    }
+
+    /**
+     * Issue #638: turns off the direct-S3 upload path. Used by tests and by
+     * the promotable wrapper when demoting to a read-only role. Outstanding
+     * direct uploads must be drained before calling this.
+     */
+    public void disableDirectUpload() {
+        this.directUploadEnabled = false;
+        this.directInflightUploadBytes = null;
+        this.maxDirectInflightUploadBytes = 0L;
+        this.directUploadPermits = 0;
+    }
+
+    @Override
+    public boolean supportsDirectMultipartUpload() {
+        return directUploadEnabled && directObjectStorage != null;
+    }
+
+    /**
+     * Issue #638: returns the number of bytes still available in the
+     * direct-upload inflight semaphore, or 0 when direct upload is
+     * disabled. Used by tests and as a future gauge source.
+     */
+    public long availableDirectInflightUploadBytes() {
+        java.util.concurrent.Semaphore s = this.directInflightUploadBytes;
+        return s == null ? 0L : s.availablePermits();
+    }
+
+    /**
+     * Issue #638: returns the configured maximum in-flight bytes for direct
+     * uploads, or 0 when direct upload is disabled.
+     */
+    public long maxDirectInflightUploadBytes() {
+        return maxDirectInflightUploadBytes;
     }
 
     /**
@@ -461,6 +594,21 @@ public class RemoteFileDataStorageManager extends DataStorageManager
         // cache is a no-op.
         lazyValueCache.close();
         localMetadataManager.close();
+        // Issue #638: best-effort cleanup of local bulk cache files. These
+        // live under tmpDir/bulk-cache/ but we delete each one explicitly so
+        // tests that snapshot tmpDir get a clean state and any leftover bulk
+        // file from a previous run is gone before the JVM exits.
+        for (Path localCache : bulkLocalCache.values()) {
+            try {
+                java.nio.file.Files.deleteIfExists(localCache);
+            } catch (IOException ioe) {
+                LOGGER.log(Level.FINE,
+                        "could not delete local bulk cache file {0} during close: {1}",
+                        new Object[]{localCache, ioe.getMessage()});
+            }
+        }
+        bulkLocalCache.clear();
+        bulkLayoutCache.clear();
         // Close the direct-S3 client if one was wired in (issue #381).
         // S3AsyncClient + CRT HTTP-client threads are native resources; closing
         // here prevents leaks on pod shutdown and in tests that restart the IS.
@@ -988,6 +1136,17 @@ public class RemoteFileDataStorageManager extends DataStorageManager
                                           Path tempFile, LongConsumer progress)
             throws IOException, DataStorageManagerException {
         String logicalPath = remoteMultipartPath(tableSpace, uuid, fileType);
+        // Any previously-cached probe state for this logical file is stale the
+        // moment we begin a write; invalidate proactively so a concurrent
+        // probe observes the fresh layout once the upload completes.
+        bulkLayoutCache.remove(logicalPath);
+        // Issue #638: when the direct-S3 upload path is wired, dispatch the
+        // upload as a single S3 object via S3TransferManager.uploadFile()
+        // (real S3 Multipart Upload, parts pipelined by the CRT HTTP client).
+        // Falls back to the gRPC per-block path when direct upload is off.
+        if (supportsDirectMultipartUpload()) {
+            return writeMultipartIndexFileDirect(logicalPath, tempFile, progress);
+        }
         int blockSize = Math.max(client.getBlockSize(), MULTIPART_BLOCK_SIZE);
         long totalBytes;
         try (java.io.InputStream raw = java.nio.file.Files.newInputStream(tempFile);
@@ -1000,6 +1159,163 @@ public class RemoteFileDataStorageManager extends DataStorageManager
                 "writeMultipartIndexFile: {0} written {1} bytes in blocks of {2}",
                 new Object[]{logicalPath, totalBytes, blockSize});
         return logicalPath;
+    }
+
+    /**
+     * Issue #638: direct-S3 upload path. Reserves
+     * {@code min(fileSize, directUploadPermits)} permits from the in-flight
+     * upload semaphore (chunked acquire to allow smaller concurrent uploads
+     * to interleave), invokes
+     * {@link ObjectStorage#uploadFile(String, Path, LongConsumer)} against
+     * the single bulk-layout key {@code logicalPath + ".bulk"}, and releases
+     * all permits when the future completes regardless of outcome.
+     *
+     * <p>On any failure the partial S3 object is deleted best-effort so we
+     * never leave an orphaned half-written {@code .bulk} key behind. The
+     * permit-release-on-failure pattern mirrors issue #575 from the gRPC
+     * path: a single idempotent releaser is registered with
+     * {@link CompletableFuture#whenComplete} so a thrown exception does not
+     * stall the semaphore for the network timeout.
+     *
+     * @return the same logical path the gRPC variant returns — opaque to
+     *         callers
+     */
+    private String writeMultipartIndexFileDirect(String logicalPath, Path tempFile,
+                                                 LongConsumer progress) throws IOException {
+        final ObjectStorage storage = this.directObjectStorage;
+        if (storage == null) {
+            // supportsDirectMultipartUpload() guarantees storage != null at the
+            // call site, but a concurrent disableDirectUpload() could race
+            // between the check and here; surface a clean fallback to gRPC by
+            // throwing an UnsupportedOperationException, which the test layer
+            // can also assert on.
+            throw new UnsupportedOperationException(
+                    "Direct S3 not configured on this RemoteFileDataStorageManager");
+        }
+        final String bulkPath = logicalPath + BULK_LAYOUT_SUFFIX;
+        final long fileSize = java.nio.file.Files.size(tempFile);
+        // Reserve permits before launching the upload. A zero-byte file
+        // skips the reservation entirely (no inflight bytes to bound).
+        final Runnable release = fileSize > 0L
+                ? reserveDirectInflightUploadBytes(fileSize)
+                : () -> { };
+        final long startNanos = System.nanoTime();
+        try {
+            long uploaded = storage.uploadFile(bulkPath, tempFile, progress)
+                    .whenComplete((bytes, err) -> release.run())
+                    .get();
+            LOGGER.log(Level.INFO,
+                    "writeMultipartIndexFile(direct): {0} uploaded {1} bytes (bulk layout) in {2} ms",
+                    new Object[]{bulkPath, uploaded,
+                            java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(
+                                    System.nanoTime() - startNanos)});
+            // Mark the bulk layout as present so subsequent probes (existence
+            // check, reader supplier, download path) take the bulk branch
+            // without re-issuing a HEAD round-trip.
+            bulkLayoutCache.put(logicalPath, Boolean.TRUE);
+            return logicalPath;
+        } catch (InterruptedException e) {
+            // Permit already released by whenComplete; we still need to
+            // attempt the orphan cleanup since the storage future may have
+            // partially completed on the wire.
+            Thread.currentThread().interrupt();
+            bestEffortDeleteBulkOrphan(storage, bulkPath);
+            throw new IOException(
+                    "Interrupted while uploading multipart " + bulkPath, e);
+        } catch (java.util.concurrent.ExecutionException e) {
+            // Permit already released by whenComplete (idempotent). Clean up
+            // any partial object so retries are not blocked by an orphan.
+            bestEffortDeleteBulkOrphan(storage, bulkPath);
+            Throwable cause = e.getCause();
+            if (cause instanceof IOException) {
+                throw (IOException) cause;
+            }
+            throw new IOException("direct multipart upload failed for " + bulkPath, cause);
+        }
+    }
+
+    /**
+     * Issue #638: best-effort cleanup of a partial {@code .bulk} S3 object
+     * after a failed direct upload. Errors during the cleanup itself are
+     * logged at {@code WARNING} but never propagated — the caller has
+     * already decided to fail the write and a stuck orphan only widens the
+     * blast radius into the next retry. The S3 Multipart Upload itself is
+     * aborted internally by the CRT client on upload failure (no orphan
+     * parts), so this delete only targets the rare case where the upload
+     * completed enough to materialise the final object before some other
+     * step (e.g. cancellation) failed.
+     */
+    private static void bestEffortDeleteBulkOrphan(ObjectStorage storage, String bulkPath) {
+        try {
+            storage.delete(bulkPath).get(10L, java.util.concurrent.TimeUnit.SECONDS);
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            LOGGER.log(Level.WARNING,
+                    "interrupted during best-effort cleanup of orphan bulk object {0}",
+                    new Object[]{bulkPath});
+        } catch (java.util.concurrent.ExecutionException
+                | java.util.concurrent.TimeoutException
+                | RuntimeException cleanupErr) {
+            // RuntimeException catch is required because some S3 backends surface
+            // delete errors as unchecked AWS SDK exceptions (e.g. SdkServiceException
+            // subclasses). This is best-effort cleanup; swallowing here is correct
+            // because the storage-level orphan is no worse than the original write
+            // failure that triggered it.
+            LOGGER.log(Level.WARNING,
+                    "best-effort cleanup of orphan bulk object {0} failed: {1}",
+                    new Object[]{bulkPath, cleanupErr.toString()});
+        }
+    }
+
+    /**
+     * Issue #638: acquires permits from {@link #directInflightUploadBytes}
+     * for a direct upload of {@code bytes}. Returns an idempotent releaser
+     * runnable. Mirrors the deadlock-prevention pattern from
+     * {@code RemoteFileServiceClient.acquireInflightWriteBytes}: when the
+     * payload exceeds the semaphore's total capacity we acquire up to the
+     * cap (smaller concurrent uploads can interleave between chunks).
+     */
+    private Runnable reserveDirectInflightUploadBytes(long bytes) {
+        java.util.concurrent.Semaphore s = this.directInflightUploadBytes;
+        if (s == null) {
+            // disableDirectUpload() raced with the upload — return a no-op
+            // releaser; callers are still responsible for handling the
+            // upcoming UnsupportedOperationException from uploadFile.
+            return () -> { };
+        }
+        int toAcquire = (int) Math.min(bytes, this.directUploadPermits);
+        if (bytes > this.directUploadPermits) {
+            LOGGER.log(Level.WARNING,
+                    "direct-upload payload ({0} bytes) exceeds inflight cap ({1} bytes);"
+                            + " will hold up to {1} permits at a time during this upload"
+                            + " — consider raising the configured limit",
+                    new Object[]{bytes, (long) this.directUploadPermits});
+        }
+        if (!s.tryAcquire(toAcquire)) {
+            LOGGER.log(Level.WARNING,
+                    "direct-upload inflight reservation blocked "
+                            + "(requested={0} bytes, available={1}/{2}); waiting",
+                    new Object[]{toAcquire, s.availablePermits(),
+                            this.maxDirectInflightUploadBytes});
+            long startNanos = System.nanoTime();
+            s.acquireUninterruptibly(toAcquire);
+            long elapsedMs = java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(
+                    System.nanoTime() - startNanos);
+            if (elapsedMs >= 50L) {
+                LOGGER.log(Level.WARNING,
+                        "direct-upload inflight reservation unblocked after {0} ms"
+                                + " (requested={1} bytes)",
+                        new Object[]{elapsedMs, toAcquire});
+            }
+        }
+        java.util.concurrent.atomic.AtomicBoolean released =
+                new java.util.concurrent.atomic.AtomicBoolean(false);
+        final int finalAcquired = toAcquire;
+        return () -> {
+            if (released.compareAndSet(false, true)) {
+                s.release(finalAcquired);
+            }
+        };
     }
 
     /**
@@ -1039,10 +1355,135 @@ public class RemoteFileDataStorageManager extends DataStorageManager
             String tableSpace, String uuid, String fileType, long fileSize)
             throws DataStorageManagerException {
         String logicalPath = remoteMultipartPath(tableSpace, uuid, fileType);
+        // Issue #638: bulk-layout files are stored as a single S3 object at
+        // {logicalPath}.bulk. Random-access reads against the bulk object
+        // happen via a memory-mapped reader over a local cache file that we
+        // materialise on first call; subsequent suppliers reuse the same
+        // cache file. Per-block files (legacy layout) keep the existing
+        // remote-random-access path.
+        if (isBulkLayout(logicalPath)) {
+            try {
+                Path localFile = ensureBulkLocalCacheFile(logicalPath, fileSize);
+                return new io.github.jbellis.jvector.disk.MappedChunkReader.Supplier(localFile);
+            } catch (IOException ioe) {
+                throw new DataStorageManagerException(
+                        "Failed to materialise bulk multipart file " + logicalPath, ioe);
+            }
+        }
         int writeBlockSize = Math.max(client.getBlockSize(), MULTIPART_BLOCK_SIZE);
         return new RemoteRandomAccessReader.Supplier(
                 client, logicalPath, fileSize, writeBlockSize, READ_BUFFER_SIZE,
                 readerStatsLogger, segmentBlockCache);
+    }
+
+    /**
+     * Issue #638: best-effort probe — returns {@code true} when the logical
+     * multipart file is stored in the bulk layout (single S3 object at
+     * {@code {logicalPath}.bulk}). Honours the in-memory probe cache so
+     * repeated calls for the same logical path issue at most one S3
+     * {@code HEAD}. Returns {@code false} for legacy per-block files and
+     * when the direct-S3 client is not wired.
+     */
+    private boolean isBulkLayout(String logicalPath) {
+        ObjectStorage storage = this.directObjectStorage;
+        if (storage == null) {
+            return false;
+        }
+        Boolean cached = bulkLayoutCache.get(logicalPath);
+        if (cached != null) {
+            return cached;
+        }
+        boolean present;
+        try {
+            present = Boolean.TRUE.equals(
+                    storage.existsObject(logicalPath + BULK_LAYOUT_SUFFIX).get(
+                            60L, java.util.concurrent.TimeUnit.SECONDS));
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            return false;
+        } catch (java.util.concurrent.ExecutionException
+                | java.util.concurrent.TimeoutException
+                | RuntimeException probeErr) {
+            // existsObject is contractually best-effort and must not throw on
+            // missing keys, but defensive: treat any failure as "not bulk"
+            // and fall back to the legacy per-block code path. The
+            // RuntimeException catch is needed because some S3-compatible
+            // backends wrap non-existence in unchecked SDK exceptions; we
+            // intentionally do not cache the negative result here so a
+            // transient probe failure does not pin the logical file to the
+            // wrong layout for the rest of the JVM lifetime.
+            LOGGER.log(Level.FINE,
+                    "bulk-layout probe failed for {0}: {1}",
+                    new Object[]{logicalPath, probeErr.toString()});
+            return false;
+        }
+        bulkLayoutCache.put(logicalPath, present);
+        return present;
+    }
+
+    /**
+     * Issue #638: returns a local file path containing the full byte content
+     * of the bulk-layout multipart file at {@code logicalPath}. The file is
+     * downloaded once (the first time this method is called for a given
+     * logical path) into the manager's tmp directory; subsequent callers
+     * reuse the same path so the same {@code MappedChunkReader.Supplier} can
+     * memory-map it. The cache entry is removed by
+     * {@link #deleteMultipartIndexFile} and the local file is deleted on
+     * {@link #close()}.
+     *
+     * <p>{@code expectedSize} is informational — used in log lines but not
+     * for validation. The actual file size is whatever {@code S3TransferManager.downloadFile}
+     * materialised.
+     */
+    private Path ensureBulkLocalCacheFile(String logicalPath, long expectedSize)
+            throws IOException {
+        Path cached = bulkLocalCache.get(logicalPath);
+        if (cached != null && java.nio.file.Files.isReadable(cached)) {
+            return cached;
+        }
+        ObjectStorage storage = this.directObjectStorage;
+        if (storage == null) {
+            throw new IOException(
+                    "Direct S3 not configured — cannot materialise bulk file " + logicalPath);
+        }
+        // Place the cache file under the manager's tmp directory so it
+        // travels with the rest of the IS local state on restart cleanup.
+        // The file name encodes the logical path so we can recognise stale
+        // entries left over from a previous JVM run.
+        Path cacheDir = tmpDir.resolve("bulk-cache");
+        java.nio.file.Files.createDirectories(cacheDir);
+        String safeName = logicalPath.replace('/', '_').replace('\\', '_');
+        Path destFile = cacheDir.resolve(safeName + BULK_LAYOUT_SUFFIX);
+        try {
+            storage.downloadFileBulk(logicalPath + BULK_LAYOUT_SUFFIX, destFile).get();
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            // Clean up any partial file so a retry starts from scratch.
+            java.nio.file.Files.deleteIfExists(destFile);
+            throw new IOException(
+                    "interrupted while materialising bulk file " + logicalPath, ie);
+        } catch (java.util.concurrent.ExecutionException ee) {
+            java.nio.file.Files.deleteIfExists(destFile);
+            Throwable cause = ee.getCause();
+            if (cause instanceof IOException) {
+                throw (IOException) cause;
+            }
+            throw new IOException(
+                    "failed to materialise bulk file " + logicalPath, cause);
+        }
+        LOGGER.log(Level.INFO,
+                "materialised bulk multipart file {0} (expectedSize={1}) to local cache {2}",
+                new Object[]{logicalPath, expectedSize, destFile});
+        // Race: another thread may have downloaded the same file concurrently.
+        // putIfAbsent returns the previously-stored value; if non-null we
+        // delete ours and use the existing cache entry to avoid duplicate
+        // local copies. Both copies have identical content so either is fine.
+        Path existing = bulkLocalCache.putIfAbsent(logicalPath, destFile);
+        if (existing != null) {
+            java.nio.file.Files.deleteIfExists(destFile);
+            return existing;
+        }
+        return destFile;
     }
 
     /**
@@ -1066,6 +1507,13 @@ public class RemoteFileDataStorageManager extends DataStorageManager
     @Override
     public boolean multipartIndexFileExists(String tableSpace, String uuid, String fileType) {
         String logicalPath = remoteMultipartPath(tableSpace, uuid, fileType);
+        // Issue #638: probe the bulk layout first via S3 HEAD (with in-memory
+        // cache). A bulk file's existence is authoritative — we wrote it
+        // ourselves via the direct upload path. If absent, fall through to
+        // the legacy per-block existence probe.
+        if (isBulkLayout(logicalPath)) {
+            return true;
+        }
         int blockSize = Math.max(client.getBlockSize(), MULTIPART_BLOCK_SIZE);
         try {
             byte[] head = client.readFileRange(logicalPath, 0L, 4, blockSize);
@@ -1089,12 +1537,54 @@ public class RemoteFileDataStorageManager extends DataStorageManager
     public void deleteMultipartIndexFile(String tableSpace, String uuid, String fileType)
             throws DataStorageManagerException {
         String logicalPath = remoteMultipartPath(tableSpace, uuid, fileType);
+        // Issue #638: delete both the legacy per-block layout AND the bulk
+        // layout (single .bulk object). Either may be present — for files
+        // written via the direct path only .bulk exists; for files written
+        // via gRPC only per-block exists; both deletes are idempotent so a
+        // missing layout silently succeeds.
         try {
             client.deleteFile(logicalPath);
         } catch (RuntimeException e) {
             LOGGER.log(Level.WARNING,
                     "deleteMultipartIndexFile: non-fatal error deleting {0}: {1}",
                     new Object[]{logicalPath, e.getMessage()});
+        }
+        ObjectStorage storage = this.directObjectStorage;
+        if (storage != null) {
+            try {
+                storage.delete(logicalPath + BULK_LAYOUT_SUFFIX)
+                        .get(60L, java.util.concurrent.TimeUnit.SECONDS);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                LOGGER.log(Level.WARNING,
+                        "deleteMultipartIndexFile: interrupted while deleting bulk variant of {0}",
+                        new Object[]{logicalPath});
+            } catch (java.util.concurrent.ExecutionException
+                    | java.util.concurrent.TimeoutException
+                    | RuntimeException bulkErr) {
+                // RuntimeException covers SDK-wrapped 404s and other transient
+                // failures. Bulk delete is best-effort: if it fails the next
+                // optimizer sweep will catch the orphan, exactly like the
+                // legacy per-block path. Swallow with a log.
+                LOGGER.log(Level.WARNING,
+                        "deleteMultipartIndexFile: non-fatal error deleting bulk variant"
+                                + " {0}{1}: {2}",
+                        new Object[]{logicalPath, BULK_LAYOUT_SUFFIX, bulkErr.toString()});
+            }
+        }
+        // Drop probe-cache + local-cache state so a future segment rewritten
+        // under the same logical path does not observe stale layout info or
+        // serve stale bytes from a leftover local cache file.
+        bulkLayoutCache.remove(logicalPath);
+        Path localCache = bulkLocalCache.remove(logicalPath);
+        if (localCache != null) {
+            try {
+                java.nio.file.Files.deleteIfExists(localCache);
+            } catch (IOException ioe) {
+                LOGGER.log(Level.FINE,
+                        "could not delete local bulk cache file {0}: {1}",
+                        new Object[]{localCache, ioe.getMessage()});
+            }
         }
         // Drop any cached blocks for this path so a future segment rewritten
         // under the same logical path does not serve stale bytes.
@@ -1135,6 +1625,31 @@ public class RemoteFileDataStorageManager extends DataStorageManager
                     "Direct S3 not configured on this RemoteFileDataStorageManager");
         }
         String logicalPath = remoteMultipartPath(tableSpace, uuid, fileType);
+        // Issue #638: bulk layout fast path — a single .bulk object is
+        // downloaded in one shot via S3TransferManager.downloadFile (real S3
+        // Multipart Download, parallel parts pipelined by CRT). Falls back to
+        // the legacy per-block sequential download when the bulk variant is
+        // absent.
+        if (isBulkLayout(logicalPath)) {
+            try {
+                storage.downloadFileBulk(logicalPath + BULK_LAYOUT_SUFFIX, destFile).get();
+                LOGGER.log(Level.FINE,
+                        "downloadMultipartIndexFile(bulk): {0} -> {1} fileSize={2}",
+                        new Object[]{logicalPath, destFile, fileSize});
+                return;
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                throw new IOException(
+                        "interrupted while downloading bulk multipart " + logicalPath, ie);
+            } catch (java.util.concurrent.ExecutionException ee) {
+                Throwable cause = ee.getCause();
+                if (cause instanceof IOException) {
+                    throw (IOException) cause;
+                }
+                throw new IOException(
+                        "bulk multipart download failed for " + logicalPath, cause);
+            }
+        }
         // Block size must match what was used at write time.
         int writeBlockSize = Math.max(client.getBlockSize(), MULTIPART_BLOCK_SIZE);
         int numBlocks = (int) Math.ceil((double) fileSize / writeBlockSize);

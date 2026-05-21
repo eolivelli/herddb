@@ -543,6 +543,39 @@ public final class IndexingServerConfiguration {
     public static final String PROPERTY_S3_DIRECT_ENABLED = "indexing.s3.direct.enabled";
     public static final boolean PROPERTY_S3_DIRECT_ENABLED_DEFAULT = false;
 
+    /**
+     * Issue #638: when {@code true} (the default), and direct S3 is enabled
+     * via {@link #PROPERTY_S3_DIRECT_ENABLED}, Phase B checkpoint /
+     * compaction segment uploads go <em>directly</em> to S3/MinIO via the
+     * S3 Multipart Upload API (driven by {@code S3TransferManager}) instead
+     * of being routed through the gRPC file-server. Symmetric to the
+     * already-existing direct-read path (issue #381).
+     *
+     * <p>Setting this to {@code false} keeps direct reads on but reverts
+     * writes to the gRPC file-server — useful as a rollout safety valve.
+     */
+    public static final String PROPERTY_S3_DIRECT_WRITE_ENABLED =
+            "indexing.s3.direct.write.enabled";
+    public static final boolean PROPERTY_S3_DIRECT_WRITE_ENABLED_DEFAULT = true;
+
+    /**
+     * Issue #638: maximum number of bytes that may be in flight across
+     * concurrent direct-S3 multipart uploads. Independent of
+     * {@link #PROPERTY_REMOTE_FILE_CLIENT_MAX_INFLIGHT_WRITE_BYTES} (which
+     * still bounds the gRPC write plane for non-direct uploads): direct
+     * uploads have their own dedicated budget so the two paths cannot
+     * starve one another.
+     *
+     * <p>Default 512 MiB matches the workaround value applied in
+     * {@code values.yaml} during the issue investigation; on memory-
+     * constrained IS pods, lower this in tandem with the CRT native
+     * memory budget.
+     */
+    public static final String PROPERTY_REMOTE_FILE_CLIENT_MAX_INFLIGHT_DIRECT_WRITE_BYTES =
+            "indexing.remote.file.client.max.inflight.direct.write.bytes";
+    public static final long PROPERTY_REMOTE_FILE_CLIENT_MAX_INFLIGHT_DIRECT_WRITE_BYTES_DEFAULT =
+            512L * 1024 * 1024;
+
     /** S3 endpoint URL override. Leave empty for native AWS S3; set for GCS or MinIO. */
     public static final String PROPERTY_S3_ENDPOINT = "indexing.s3.endpoint";
     public static final String PROPERTY_S3_ENDPOINT_DEFAULT = "";

@@ -240,6 +240,32 @@ public final class OptimizerConfiguration {
     public static final String PROPERTY_S3_GCS_COMPATIBILITY = "indexoptimizer.s3.gcs.compatibility";
     public static final boolean PROPERTY_S3_GCS_COMPATIBILITY_DEFAULT = false;
 
+    /**
+     * Issue #638: when {@code true} (the default), and direct S3 is enabled
+     * via {@link #PROPERTY_S3_DIRECT_ENABLED}, segment uploads produced by
+     * the optimizer's streaming compactor go <em>directly</em> to S3/MinIO
+     * via the S3 Multipart Upload API (driven by {@code S3TransferManager})
+     * instead of being routed through the gRPC file-server.
+     *
+     * <p>Setting this to {@code false} keeps direct reads on but reverts
+     * writes to the gRPC file-server. Mirrors the IS-server flag
+     * {@code indexing.s3.direct.write.enabled}.
+     */
+    public static final String PROPERTY_S3_DIRECT_WRITE_ENABLED =
+            "indexoptimizer.s3.direct.write.enabled";
+    public static final boolean PROPERTY_S3_DIRECT_WRITE_ENABLED_DEFAULT = true;
+
+    /**
+     * Issue #638: maximum number of bytes that may be in flight across
+     * concurrent direct-S3 multipart uploads issued by the optimizer.
+     * Independent of any gRPC write-plane budget so the two paths cannot
+     * starve one another. Default 512 MiB.
+     */
+    public static final String PROPERTY_REMOTE_FILE_CLIENT_MAX_INFLIGHT_DIRECT_WRITE_BYTES =
+            "indexoptimizer.remote.file.client.max.inflight.direct.write.bytes";
+    public static final long PROPERTY_REMOTE_FILE_CLIENT_MAX_INFLIGHT_DIRECT_WRITE_BYTES_DEFAULT =
+            512L * 1024 * 1024;
+
     // -------------------------------------------------------------------------
     // K-way single-pass merge (issue #524)
     // -------------------------------------------------------------------------
