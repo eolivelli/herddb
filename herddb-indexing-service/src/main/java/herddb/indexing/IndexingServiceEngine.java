@@ -803,6 +803,10 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             final long vectorCompactionMaxInputBytes = config.getLong(
                     IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_MAX_INPUT_BYTES,
                     IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_MAX_INPUT_BYTES_DEFAULT);
+            // Per-segment graduation cap for the IS-local picker (issue #631).
+            final long vectorCompactionTargetBytes = config.getLong(
+                    IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_TARGET_BYTES,
+                    IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_TARGET_BYTES_DEFAULT);
             final boolean vectorCompactionTieredEnabled = config.getBoolean(
                     IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_TIERED_ENABLED,
                     IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_TIERED_ENABLED_DEFAULT);
@@ -829,14 +833,15 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                             + "backpressureMaxWaitMs={2}, localKickFraction={3},"
                             + " localEnabledWithOptimizer={4},"
                             + " microSegmentMaxNodes={5}, maxInputs={6},"
-                            + " maxInputBytes={7}",
+                            + " maxInputBytes={7}, targetBytes={8}",
                     new Object[]{vectorCompactionTieredEnabled, vectorCompactionBackpressureSegments,
                             vectorCompactionBackpressureMaxWaitMs,
                             vectorCompactionLocalKickFraction,
                             vectorCompactionLocalEnabledWithOptimizer,
                             vectorCompactionMicroSegmentMaxNodes,
                             vectorCompactionMaxInputs,
-                            vectorCompactionMaxInputBytes});
+                            vectorCompactionMaxInputBytes,
+                            vectorCompactionTargetBytes});
             // Async IO pipeline for FusedPQ search (issue #547).
             // Config key takes precedence over the system property.
             final boolean vectorSearchAsyncPipelineEnabled = config.getBoolean(
@@ -952,6 +957,11 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                 store.setCompactionMaxInputs(vectorCompactionMaxInputs);
                 // Issue #602: per-cycle download budget cap.
                 store.setCompactionMaxInputBytes(vectorCompactionMaxInputBytes);
+                // Issue #631: per-segment graduation cap. Mirrors the optimizer
+                // pod's AggressivePolicy graduation cap so the IS-local
+                // compaction path converges to the same steady-state segment
+                // size whether or not the external optimizer is enabled.
+                store.setCompactionTargetBytes(vectorCompactionTargetBytes);
                 store.setCompactionBackpressureThreshold(vectorCompactionBackpressureSegments);
                 store.setCompactionBackpressureMaxWaitMs(vectorCompactionBackpressureMaxWaitMs);
                 store.setLocalCompactionKickFraction(vectorCompactionLocalKickFraction);

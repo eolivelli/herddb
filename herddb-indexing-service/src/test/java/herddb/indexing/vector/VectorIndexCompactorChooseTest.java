@@ -315,4 +315,187 @@ public class VectorIndexCompactorChooseTest {
         assertEquals(2, VectorIndexCompactor.clampMaxInputs(2));
         assertEquals(16, VectorIndexCompactor.clampMaxInputs(16));
     }
+
+    // ---- Tests for the per-segment graduation cap (issue #631) ----
+
+    private static final long TARGET_8_GIB = 8L * 1024L * 1024L * 1024L;
+
+    /**
+     * A single sub-target candidate with the rest graduated returns an empty
+     * pick: the byte trigger fails on the 1-element filtered set
+     * ({@code minCount=4} unmet) and the count trigger fails too.
+     */
+    @Test
+    public void graduationCapAllButOneAboveTargetYieldsEmpty() {
+        List<VectorSegment> cand = new ArrayList<>();
+        cand.add(seg(1, 100L)); // single sub-target candidate
+        for (int i = 2; i <= 6; i++) {
+            cand.add(seg(i, TARGET_8_GIB + i)); // graduated
+        }
+        List<VectorSegment> picked = VectorIndexCompactor.chooseSegmentsToMerge(
+                cand, /*minCount*/ 4, /*minBytes*/ 1L, /*maxBytes*/ Long.MAX_VALUE,
+                /*maxCount*/ 100, /*microSegmentMaxNodes*/ 0L, /*maxInputs*/ 0,
+                /*targetMaxBytes*/ TARGET_8_GIB);
+        assertTrue("graduated segments must be skipped, leaving < minCount sub-target",
+                picked.isEmpty());
+    }
+
+    /**
+     * Every candidate at or above the cap → empty pick regardless of count.
+     * Proves convergence: a fully-graduated index stops triggering compaction.
+     */
+    @Test
+    public void graduationCapAllAboveTargetYieldsEmpty() {
+        List<VectorSegment> cand = new ArrayList<>();
+        for (int i = 1; i <= 50; i++) {
+            cand.add(seg(i, TARGET_8_GIB + i));
+        }
+        List<VectorSegment> picked = VectorIndexCompactor.chooseSegmentsToMerge(
+                cand, /*minCount*/ 2, /*minBytes*/ 1L, /*maxBytes*/ Long.MAX_VALUE,
+                /*maxCount*/ 10, /*microSegmentMaxNodes*/ 0L, /*maxInputs*/ 0,
+                /*targetMaxBytes*/ TARGET_8_GIB);
+        assertTrue("a fully-graduated index must compact nothing — fixed point",
+                picked.isEmpty());
+    }
+
+    /**
+     * Mixed set (3 sub-target + 2 graduated): the picker selects from the
+     * 3 sub-target only, smallest-first; the 2 above target are dropped
+     * before sorting.
+     */
+    @Test
+    public void graduationCapMixedSetPicksOnlySubTarget() {
+        List<VectorSegment> cand = new ArrayList<>();
+        cand.add(seg(10, 30L)); // sub-target
+        cand.add(seg(20, 10L)); // sub-target, smallest
+        cand.add(seg(30, 20L)); // sub-target
+        cand.add(seg(40, TARGET_8_GIB));        // graduated (== target)
+        cand.add(seg(50, TARGET_8_GIB + 100L)); // graduated
+        List<VectorSegment> picked = VectorIndexCompactor.chooseSegmentsToMerge(
+                cand, /*minCount*/ 2, /*minBytes*/ 1L, /*maxBytes*/ Long.MAX_VALUE,
+                /*maxCount*/ Integer.MAX_VALUE, /*microSegmentMaxNodes*/ 0L,
+                /*maxInputs*/ 0, /*targetMaxBytes*/ TARGET_8_GIB);
+        assertEquals("only the 3 sub-target segments should be picked",
+                3, picked.size());
+        assertEquals("smallest-first: 20", 20, picked.get(0).segmentId);
+        assertEquals("then 30", 30, picked.get(1).segmentId);
+        assertEquals("then 10", 10, picked.get(2).segmentId);
+        for (VectorSegment s : picked) {
+            assertTrue("no graduated segment may appear in the result",
+                    s.estimatedSizeBytes < TARGET_8_GIB);
+        }
+    }
+
+    /**
+     * {@code targetMaxBytes == Long.MAX_VALUE} disables the cap entirely — the
+     * picker reproduces the pre-#631 selection on the full candidate set, even
+     * when several candidates are larger than typical real-world graduation
+     * caps.
+     */
+    @Test
+    public void graduationCapDisabledMatchesLegacyBehaviour() {
+        List<VectorSegment> cand = new ArrayList<>();
+        for (int i = 1; i <= 5; i++) {
+            cand.add(seg(i, TARGET_8_GIB + i));
+        }
+        List<VectorSegment> withCap = VectorIndexCompactor.chooseSegmentsToMerge(
+                cand, /*minCount*/ 2, /*minBytes*/ 1L, /*maxBytes*/ Long.MAX_VALUE,
+                /*maxCount*/ Integer.MAX_VALUE, /*microSegmentMaxNodes*/ 0L,
+                /*maxInputs*/ 0, /*targetMaxBytes*/ TARGET_8_GIB);
+        List<VectorSegment> withoutCap = VectorIndexCompactor.chooseSegmentsToMerge(
+                cand, /*minCount*/ 2, /*minBytes*/ 1L, /*maxBytes*/ Long.MAX_VALUE,
+                /*maxCount*/ Integer.MAX_VALUE, /*microSegmentMaxNodes*/ 0L,
+                /*maxInputs*/ 0, /*targetMaxBytes*/ Long.MAX_VALUE);
+        assertTrue("with the cap on all are graduated → empty",
+                withCap.isEmpty());
+        assertEquals("with the cap disabled all 5 are picked",
+                5, withoutCap.size());
+    }
+
+    /**
+     * The 6-arg / 7-arg overloads (no {@code targetMaxBytes}) must keep their
+     * pre-#631 behaviour: equivalent to passing {@code Long.MAX_VALUE}. This
+     * pins the contract every existing call site depends on.
+     */
+    @Test
+    public void graduationCapLegacyOverloadsDoNotFilter() {
+        List<VectorSegment> cand = new ArrayList<>();
+        for (int i = 1; i <= 5; i++) {
+            cand.add(seg(i, TARGET_8_GIB + i));
+        }
+        // 5-arg.
+        List<VectorSegment> a = VectorIndexCompactor.chooseSegmentsToMerge(
+                cand, 2, 1L, Long.MAX_VALUE, Integer.MAX_VALUE);
+        // 6-arg.
+        List<VectorSegment> b = VectorIndexCompactor.chooseSegmentsToMerge(
+                cand, 2, 1L, Long.MAX_VALUE, Integer.MAX_VALUE,
+                /*microSegmentMaxNodes*/ 0L);
+        // 7-arg.
+        List<VectorSegment> c = VectorIndexCompactor.chooseSegmentsToMerge(
+                cand, 2, 1L, Long.MAX_VALUE, Integer.MAX_VALUE,
+                /*microSegmentMaxNodes*/ 0L, /*maxInputs*/ 0);
+        assertEquals(5, a.size());
+        assertEquals(5, b.size());
+        assertEquals(5, c.size());
+    }
+
+    /**
+     * The graduation cap is upstream of the micro-segment fast path: a
+     * graduated segment is excluded from the micro scan too, even if it has a
+     * low live-node count (e.g. a heavily-tombstoned huge segment).
+     */
+    @Test
+    public void graduationCapAppliesUpstreamOfMicroSegmentPath() {
+        List<VectorSegment> cand = new ArrayList<>();
+        // 3 micro-segments (low live count, small bytes).
+        for (int i = 1; i <= 3; i++) {
+            cand.add(seg(i, 100L, /*liveNodes*/ 10));
+        }
+        // 1 huge mostly-tombstoned segment: low live count but graduated by bytes.
+        cand.add(seg(99, TARGET_8_GIB + 1L, /*liveNodes*/ 10));
+        List<VectorSegment> picked = VectorIndexCompactor.chooseSegmentsToMerge(
+                cand, /*minCount*/ 2, /*minBytes*/ 1L, /*maxBytes*/ Long.MAX_VALUE,
+                /*maxCount*/ 100, /*microSegmentMaxNodes*/ 1000L, /*maxInputs*/ 0,
+                /*targetMaxBytes*/ TARGET_8_GIB);
+        assertEquals("micro path must skip the graduated segment", 3, picked.size());
+        for (VectorSegment s : picked) {
+            assertTrue("graduated bytes must not bypass the cap via the micro path",
+                    s.estimatedSizeBytes < TARGET_8_GIB);
+        }
+    }
+
+    /**
+     * Sanity check for {@link VectorIndexCompactor#computeGraduationStats} —
+     * the helper that the {@code runCompactionCycle} steady-state /
+     * back-pressure-deadlock log lines consume. The counts and byte total must
+     * match the picker's filter decisions on the same fixture.
+     */
+    @Test
+    public void computeGraduationStatsMatchesFilterDecisions() {
+        List<VectorSegment> snapshot = new ArrayList<>();
+        snapshot.add(seg(1, 10L));    // sub-target
+        snapshot.add(seg(2, 20L));    // sub-target
+        snapshot.add(seg(3, 30L));    // sub-target
+        snapshot.add(seg(4, TARGET_8_GIB)); // graduated (== target)
+        snapshot.add(seg(5, TARGET_8_GIB + 1_000_000L)); // graduated
+
+        VectorIndexCompactor.GraduationStats stats =
+                VectorIndexCompactor.computeGraduationStats(snapshot, TARGET_8_GIB);
+        assertEquals(2, stats.graduatedCount);
+        assertEquals(3, stats.subTargetCount);
+        assertEquals(60L, stats.subTargetBytes);
+
+        // Disabled cap (Long.MAX_VALUE) treats every segment as sub-target.
+        VectorIndexCompactor.GraduationStats disabled =
+                VectorIndexCompactor.computeGraduationStats(snapshot, Long.MAX_VALUE);
+        assertEquals(0, disabled.graduatedCount);
+        assertEquals(5, disabled.subTargetCount);
+
+        // Null / empty snapshot tolerated.
+        VectorIndexCompactor.GraduationStats none =
+                VectorIndexCompactor.computeGraduationStats(null, TARGET_8_GIB);
+        assertEquals(0, none.graduatedCount);
+        assertEquals(0, none.subTargetCount);
+        assertEquals(0L, none.subTargetBytes);
+    }
 }

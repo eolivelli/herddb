@@ -327,6 +327,37 @@ public final class IndexingServerConfiguration {
             100L * 1024 * 1024 * 1024; // 100 GiB
 
     /**
+     * Per-segment graduation cap for the IS-local compaction picker (issue #631).
+     *
+     * <p>Segments whose {@code estimatedSizeBytes} is at or above this value are
+     * considered "graduated" and are filtered out by
+     * {@link herddb.indexing.vector.VectorIndexCompactor#chooseSegmentsToMerge}
+     * before any selection step runs — the trigger, smallest-first ordering,
+     * micro-segment fast path, and input-count cap all operate on the
+     * post-filter set. Graduated segments are never re-merged on the IS-local
+     * path.
+     *
+     * <p>This is the exact parity of the optimizer pod's
+     * {@code indexoptimizer.merge.target.bytes} (same 8 GiB default), so an
+     * IS-local-only deployment converges to the same steady-state segment size
+     * as a deployment driven by the external optimizer.
+     *
+     * <p><b>Convergence guarantee.</b> Once at most one segment is below the
+     * cap, the trigger checks fail on the filtered set and compaction stops
+     * firing for that index. Ingest produces fresh sub-target segments that
+     * reopen the cycle; merges drive each one across the threshold and the
+     * index returns to the steady state.
+     *
+     * <p>Set to {@link Long#MAX_VALUE} (or {@code <= 0}, which is clamped to
+     * {@code Long.MAX_VALUE} by the store) to disable the cap and restore the
+     * pre-#631 smallest-first-with-no-graduation behaviour.
+     */
+    public static final String PROPERTY_VECTOR_INDEX_COMPACTION_TARGET_BYTES =
+            "vector.index.compaction.target.bytes";
+    public static final long PROPERTY_VECTOR_INDEX_COMPACTION_TARGET_BYTES_DEFAULT =
+            8L * 1024L * 1024L * 1024L; // 8 GiB — matches indexoptimizer.merge.target.bytes
+
+    /**
      * How long old segment files remain on-disk after a compaction swap
      * before the reaper may physically delete them. Also gated by
      * {@code shadowAckedGeneration}: reclaim waits for the later of the
