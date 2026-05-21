@@ -92,6 +92,14 @@ public class Config {
     boolean skipIngest = false;
     boolean skipIndex = false;
     boolean skipVerify = false;
+    /**
+     * Skip the post-ingest query / recall phase. Honored only by
+     * {@code GrpcBench} ({@code --protocol grpc}); the JDBC path has its own
+     * skip semantics keyed on {@code skipIngest} / {@code skipVerify}. When
+     * {@code true}, gRPC mode exits right after count verification and emits
+     * the bench summary without any {@code Search} RPCs or recall metric.
+     */
+    boolean skipQuery = false;
     boolean dropTable = false;
     boolean checkpoint = false;
     int clientTimeoutSeconds = 7200 * 4; // 8 hours
@@ -179,6 +187,9 @@ public class Config {
         opts.addOption(null, "skip-ingest", false, "Skip ingestion phase");
         opts.addOption(null, "skip-index", false, "Skip index creation");
         opts.addOption(null, "skip-verify", false, "Skip row count verification after ingestion");
+        opts.addOption(null, "skip-query", false,
+                "Skip the post-ingest query / recall phase (--protocol grpc only). "
+                        + "Use for pure ingestion benchmarks where recall is computed separately.");
         opts.addOption(null, "drop-table", false, "Drop table before starting");
         opts.addOption(null, "checkpoint", false, "Force checkpoint after ingestion and after index creation");
         opts.addOption(null, "similarity", true, "Similarity function: euclidean, cosine, dot_product (default: from dataset)");
@@ -317,6 +328,9 @@ public class Config {
         }
         if (cmd.hasOption("skip-verify")) {
             cfg.skipVerify = true;
+        }
+        if (cmd.hasOption("skip-query")) {
+            cfg.skipQuery = true;
         }
         if (cmd.hasOption("drop-table")) {
             cfg.dropTable = true;
@@ -481,6 +495,9 @@ public class Config {
         }
         if (props.containsKey("skip-verify")) {
             skipVerify = Boolean.parseBoolean(props.getProperty("skip-verify"));
+        }
+        if (props.containsKey("skip-query")) {
+            skipQuery = Boolean.parseBoolean(props.getProperty("skip-query"));
         }
         if (props.containsKey("drop-table")) {
             dropTable = Boolean.parseBoolean(props.getProperty("drop-table"));
@@ -700,6 +717,7 @@ public class Config {
                 + ", skipIngest=" + skipIngest
                 + ", skipIndex=" + skipIndex
                 + ", skipVerify=" + skipVerify
+                + ", skipQuery=" + skipQuery
                 + ", dropTable=" + dropTable
                 + ", checkpoint=" + checkpoint
                 + ", checkpointTimeoutSeconds=" + checkpointTimeoutSeconds

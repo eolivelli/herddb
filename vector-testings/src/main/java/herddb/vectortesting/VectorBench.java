@@ -189,7 +189,7 @@ public class VectorBench {
         // gRPC push mode: ingestion straight into a single indexing service,
         // with no HerdDB server. Entirely separate from the JDBC path below.
         if (config.protocol == Config.Protocol.GRPC) {
-            GrpcBench.run(config, out, benchmarkStartNs);
+            GrpcBench.run(config, out, benchmarkStartNs, runtime);
             return;
         }
 

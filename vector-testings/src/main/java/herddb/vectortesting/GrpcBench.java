@@ -19,10 +19,13 @@
  */
 package herddb.vectortesting;
 
+import com.google.common.util.concurrent.RateLimiter;
 import herddb.codec.RecordSerializer;
 import herddb.index.vector.VectorIndexManager;
 import herddb.indexing.IndexingPushClient;
 import herddb.indexing.proto.PushEntriesResponse;
+import herddb.indexing.proto.SearchResponse;
+import herddb.indexing.proto.SearchResult;
 import herddb.log.LogEntry;
 import herddb.log.LogEntryFactory;
 import herddb.log.LogEntryType;
@@ -32,13 +35,28 @@ import herddb.model.Index;
 import herddb.model.Record;
 import herddb.model.Table;
 import herddb.model.TableSpace;
+import herddb.utils.Bytes;
 import io.netty.buffer.ByteBuf;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorCompletionService;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Function;
+import java.util.function.LongSupplier;
+import java.util.function.Supplier;
 
 /**
  * The {@code --protocol grpc} ingestion path of VectorBench.
@@ -50,26 +68,53 @@ import java.util.function.Function;
  * them over the {@code PushEntries} gRPC RPC. No HerdDB server, BookKeeper or
  * commit log is involved.
  *
- * <p>It is ingestion-only: a transaction wraps each batch of inserts, the
- * entries are serialized into pooled direct {@link ByteBuf}s to keep the
- * client's memory footprint low, and a single thread issues every push so the
- * indexing service sees a strictly increasing LSN stream. Verification polls
- * the index status over gRPC and checks the indexed vector count.
+ * <p>It is ingestion + optional recall: a transaction wraps each batch of
+ * inserts, the entries are serialized into pooled direct {@link ByteBuf}s to
+ * keep the client's memory footprint low, and a single thread issues every
+ * push so the indexing service sees a strictly increasing LSN stream.
+ * Verification polls the index status over gRPC and checks the indexed
+ * vector count; the query phase (when enabled) drives {@code Search} RPCs
+ * against the same service and computes recall@K against the dataset's
+ * ground truth.
  */
 public final class GrpcBench {
 
     /** Name of the vector index this mode creates, populates and verifies. */
     private static final String INDEX_NAME = "vidx";
 
+    /**
+     * Maximum time to wait for the indexing service's tailer to apply every
+     * pushed entry once {@link #ingest} has finished pushing.
+     *
+     * <p>The {@code PushEntries} RPC only guarantees that entries have been
+     * <em>accepted into the bounded push buffer</em> by the time it returns —
+     * the IS tailer thread applies them asynchronously. In push mode the IS
+     * does not lag a real commit log, so once the last buffered entry has been
+     * accepted the apply loop typically finishes within milliseconds. A short
+     * fixed cap is enough to absorb that lag without pretending we need an
+     * open-ended wait.
+     *
+     * <p>Deliberately not driven by {@code --wait-for-indexes-timeout}: that
+     * flag is a JDBC-only concept (server-side {@code WAITFORINDEXES}) and is
+     * meaningless for push mode, where there is no external tailer to wait
+     * for. Promoting this to a CLI flag is intentionally avoided so the
+     * "always up-to-date" contract of push mode stays visible.
+     */
+    private static final long VERIFY_CATCHUP_TIMEOUT_MS = 30_000L;
+
+    /** Poll interval used while waiting for the tailer to apply the last buffered entries. */
+    private static final long VERIFY_POLL_INTERVAL_MS = 200L;
+
     private GrpcBench() {
     }
 
     /**
      * Entry point for {@code --protocol grpc}. Loads the dataset, opens the
-     * gRPC client and drives ingestion, then exits the JVM (mirroring the JDBC
+     * gRPC client and drives ingestion, optionally followed by verification
+     * and a query / recall phase, then exits the JVM (mirroring the JDBC
      * path's terminal {@code System.exit(0)}).
      */
-    static void run(Config config, BenchOutput out, long benchmarkStartNs) throws Exception {
+    static void run(Config config, BenchOutput out, long benchmarkStartNs, BenchRuntime runtime) throws Exception {
         out.header("=== gRPC PUSH MODE (indexing service " + config.grpcEndpoint + ") ===");
         if (config.resumeFromAuto) {
             out.info("WARNING: --resume-from auto is not supported with --protocol grpc; "
@@ -80,17 +125,50 @@ public final class GrpcBench {
         loader.ensureDataset();
 
         long toIngest = Math.max(0L, config.numRows - config.resumeFrom);
+        long pushed;
+        double recall = -1.0;
+        long recallQueries = 0;
+        long queriesRun = 0;
+        double queryWallSecs = -1.0;
         try (IndexingPushClient client = new IndexingPushClient(config.grpcEndpoint);
                 DatasetLoader.VectorStream stream = loader.streamBaseVectors(config.resumeFrom, toIngest)) {
-            long pushed = ingest(client, config, out, stream.iterator(), config.resumeFrom, toIngest);
-            double totalSecs = (System.nanoTime() - benchmarkStartNs) / 1e9;
-            LinkedHashMap<String, Object> summary = new LinkedHashMap<>();
-            summary.put("protocol", "grpc");
-            summary.put("endpoint", config.grpcEndpoint);
-            summary.put("dataset", config.dataset.name());
-            summary.put("rows", pushed);
-            summary.put("total_wall_time_s", Math.round(totalSecs * 10.0) / 10.0);
-            out.summary(summary);
+            pushed = ingest(client, config, out, stream.iterator(), config.resumeFrom, toIngest, runtime);
+
+            if (!config.skipQuery) {
+                QueryPhaseResult q = runQueryPhase(client, config, out, loader, runtime, pushed);
+                if (q != null) {
+                    recall = q.recall;
+                    recallQueries = q.recallQueries;
+                    queriesRun = q.queries;
+                    queryWallSecs = q.wallSecs;
+                }
+            } else {
+                out.info("Skipping query/recall phase (--skip-query).");
+            }
+        }
+        double totalSecs = (System.nanoTime() - benchmarkStartNs) / 1e9;
+        LinkedHashMap<String, Object> summary = new LinkedHashMap<>();
+        summary.put("protocol", "grpc");
+        summary.put("endpoint", config.grpcEndpoint);
+        summary.put("dataset", config.dataset.name());
+        summary.put("rows", pushed);
+        if (queriesRun > 0) {
+            summary.put("queries", queriesRun);
+            summary.put("query_wall_s", Math.round(queryWallSecs * 10.0) / 10.0);
+            summary.put("qps", queryWallSecs > 0
+                    ? Math.round((queriesRun / queryWallSecs) * 10.0) / 10.0 : 0.0);
+        }
+        if (recall >= 0.0) {
+            summary.put("recall_at_k", Math.round(recall * 10000.0) / 10000.0);
+            summary.put("recall_queries", recallQueries);
+            summary.put("top_k", config.topK);
+        }
+        summary.put("total_wall_time_s", Math.round(totalSecs * 10.0) / 10.0);
+        out.summary(summary);
+        // Final status: indicate we are done so the admin API stops reporting
+        // an in-progress phase after run() has returned.
+        if (runtime != null) {
+            runtime.setStatusSupplier(() -> Collections.singletonMap("phase", "done"));
         }
         out.done();
         System.exit(0);
@@ -103,12 +181,26 @@ public final class GrpcBench {
      * count over gRPC.
      *
      * <p>Package-private and free of {@code System.exit} so integration tests
-     * can drive it directly with a synthetic vector source.
+     * can drive it directly with a synthetic vector source. The {@code runtime}
+     * argument is optional ({@code null} permitted): when present, per-phase
+     * status fields are published to the admin HTTP API as the bench moves
+     * through {@code schema} → {@code ingest} → {@code verification}.
      *
      * @return the number of vector rows pushed
      */
     static long ingest(IndexingPushClient client, Config config, BenchOutput out,
                        Iterator<float[]> vectors, long firstRowId, long totalRows) throws Exception {
+        return ingest(client, config, out, vectors, firstRowId, totalRows, null);
+    }
+
+    /**
+     * Same as {@link #ingest(IndexingPushClient, Config, BenchOutput, Iterator, long, long)}
+     * but accepts a {@link BenchRuntime} so the admin HTTP API can observe
+     * each phase transition (issue #632).
+     */
+    static long ingest(IndexingPushClient client, Config config, BenchOutput out,
+                       Iterator<float[]> vectors, long firstRowId, long totalRows,
+                       BenchRuntime runtime) throws Exception {
         Table table = buildTable(config);
         Index index = buildIndex(config);
 
@@ -119,6 +211,7 @@ public final class GrpcBench {
         long[] offset = {1L};
 
         out.phaseStart("schema");
+        setSimpleStatus(runtime, "schema");
         out.info("Pushing CREATE TABLE " + config.tableName + " + CREATE VECTOR INDEX " + INDEX_NAME);
         PushEntriesResponse schemaResp = pushBatch(client, ledgerId, offset, Arrays.asList(
                 LogEntryFactory.createTable(table, null),
@@ -135,6 +228,29 @@ public final class GrpcBench {
         out.header("=== INGESTION PHASE (gRPC push) ===");
         out.phaseStart("ingest");
         long ingestStart = System.nanoTime();
+        // AtomicLongs so the status supplier (read concurrently from Jetty
+        // threads in BenchRuntime) sees a coherent snapshot rather than a
+        // half-updated long.
+        AtomicLong pushedRows = new AtomicLong(0);
+        AtomicLong pushCallsCounter = new AtomicLong(0);
+        if (runtime != null) {
+            final long ingestStartNs = ingestStart;
+            runtime.setStatusSupplier(() -> {
+                Runtime rt = Runtime.getRuntime();
+                long rows = pushedRows.get();
+                double elapsed = (System.nanoTime() - ingestStartNs) / 1e9;
+                double opsPerSec = elapsed > 0 ? rows / elapsed : 0.0;
+                LinkedHashMap<String, Object> m = new LinkedHashMap<>();
+                m.put("phase", "ingest");
+                m.put("rows", rows);
+                m.put("total", totalRows);
+                m.put("ops_per_sec", opsPerSec);
+                m.put("push_calls", pushCallsCounter.get());
+                m.put("heap_used_mb", (rt.totalMemory() - rt.freeMemory()) / (1024 * 1024));
+                m.put("heap_max_mb", rt.maxMemory() / (1024 * 1024));
+                return m;
+            });
+        }
         long rowId = firstRowId;
         long pushed = 0;
         long pushCalls = 0;
@@ -160,6 +276,8 @@ public final class GrpcBench {
             PushEntriesResponse resp = pushBatch(client, ledgerId, offset, batch);
             pushed += n;
             pushCalls++;
+            pushedRows.set(pushed);
+            pushCallsCounter.set(pushCalls);
             if (resp.getAcceptedCount() != batch.size()) {
                 throw new IllegalStateException("indexing service accepted "
                         + resp.getAcceptedCount() + " of " + batch.size() + " pushed entries");
@@ -189,41 +307,424 @@ public final class GrpcBench {
         if (config.skipVerify) {
             out.info("Skipping vector-count verification (--skip-verify).");
         } else {
-            verifyVectorCount(client, config, out, baseline + pushed);
+            verifyVectorCount(client, config, out, baseline + pushed, runtime);
         }
         return pushed;
     }
 
     /**
      * Polls {@code GetIndexStatus} until the indexed vector count reaches
-     * {@code expected}. The indexing service applies pushed entries
-     * asynchronously and may pause for a checkpoint/compaction, so this waits
-     * with a generous deadline rather than asserting immediately.
+     * {@code expected}. {@code PushEntries} only guarantees buffer-accept,
+     * not apply, so a tiny lag is possible right after the last batch
+     * returns — but in push mode the IS is "always up to date" and the
+     * tailer drains in milliseconds, so we bound the wait at
+     * {@link #VERIFY_CATCHUP_TIMEOUT_MS} (deliberately short, and explicitly
+     * <em>not</em> driven by {@code --wait-for-indexes-timeout}, which is a
+     * JDBC concept).
      */
     private static void verifyVectorCount(IndexingPushClient client, Config config,
-                                          BenchOutput out, long expected) throws InterruptedException {
+                                          BenchOutput out, long expected,
+                                          BenchRuntime runtime) throws InterruptedException {
+        LongSupplier counter = () -> client.getIndexStatus(TableSpace.DEFAULT, config.tableName, INDEX_NAME)
+                .getVectorCount();
+        verifyVectorCount(counter, out, expected, runtime, VERIFY_CATCHUP_TIMEOUT_MS, VERIFY_POLL_INTERVAL_MS);
+    }
+
+    /**
+     * Polling-loop core, factored out so unit tests can drive it with a
+     * synthetic counter (no live gRPC server) and pin the timing contract:
+     * the deadline is the {@code timeoutMs} value passed in, NOT
+     * {@code config.waitForIndexesTimeoutSeconds}.
+     *
+     * <p>Package-private for {@link GrpcBenchTest}.
+     */
+    static void verifyVectorCount(LongSupplier currentCount, BenchOutput out, long expected,
+                                  BenchRuntime runtime, long timeoutMs, long pollIntervalMs)
+            throws InterruptedException {
         out.phaseStart("verification");
         long verifyStart = System.nanoTime();
-        long deadlineMs = System.currentTimeMillis() + 3_600_000L;
+        AtomicLong lastObserved = new AtomicLong(-1);
+        if (runtime != null) {
+            final long expectedFinal = expected;
+            runtime.setStatusSupplier(() -> {
+                LinkedHashMap<String, Object> m = new LinkedHashMap<>();
+                m.put("phase", "verification");
+                m.put("vector_count", lastObserved.get());
+                m.put("expected", expectedFinal);
+                return m;
+            });
+        }
+        long deadlineMs = System.currentTimeMillis() + timeoutMs;
         long last = -1;
-        while (System.currentTimeMillis() < deadlineMs) {
-            last = client.getIndexStatus(TableSpace.DEFAULT, config.tableName, INDEX_NAME)
-                    .getVectorCount();
+        boolean firstAttempt = true;
+        while (true) {
+            last = currentCount.getAsLong();
+            lastObserved.set(last);
             if (last >= expected) {
                 out.phaseDone("verification", (System.nanoTime() - verifyStart) / 1e9);
                 out.info("Verification OK: index '" + INDEX_NAME + "' reports " + last + " vectors");
                 return;
             }
-            double elapsed = (System.nanoTime() - verifyStart) / 1e9;
-            LinkedHashMap<String, Object> fields = new LinkedHashMap<>();
-            fields.put("vector_count", last);
-            fields.put("expected", expected);
-            out.progress("verification", elapsed,
-                    "indexed " + last + "/" + expected + " vectors", fields);
-            Thread.sleep(1000);
+            if (firstAttempt) {
+                // Only log a verification "progress" line when we actually had
+                // to wait — the steady-state push-mode case is a single
+                // sub-millisecond status call.
+                double elapsed = (System.nanoTime() - verifyStart) / 1e9;
+                LinkedHashMap<String, Object> fields = new LinkedHashMap<>();
+                fields.put("vector_count", last);
+                fields.put("expected", expected);
+                out.progress("verification", elapsed,
+                        "indexed " + last + "/" + expected + " vectors — waiting for tailer to apply last batch",
+                        fields);
+                firstAttempt = false;
+            }
+            if (System.currentTimeMillis() >= deadlineMs) {
+                break;
+            }
+            Thread.sleep(pollIntervalMs);
         }
         throw new IllegalStateException("index vector count reached only " + last
-                + " of the expected " + expected + " within the verification timeout");
+                + " of the expected " + expected + " within " + timeoutMs
+                + " ms — the indexing-service tailer has not applied every pushed entry."
+                + " In push mode this is expected to take milliseconds; a longer lag indicates"
+                + " a stalled tailer (a long-running checkpoint/compaction or a bug)");
+    }
+
+    /**
+     * Result of {@link #runQueryPhase}: aggregate counts and the computed recall.
+     * Returned by the query phase so the bench summary can include the same
+     * fields the JDBC path reports.
+     */
+    static final class QueryPhaseResult {
+        final long queries;
+        final double wallSecs;
+        final double recall;
+        final long recallQueries;
+
+        QueryPhaseResult(long queries, double wallSecs, double recall, long recallQueries) {
+            this.queries = queries;
+            this.wallSecs = wallSecs;
+            this.recall = recall;
+            this.recallQueries = recallQueries;
+        }
+    }
+
+    /**
+     * Runs the query / recall phase over gRPC. Loads {@code config.queryCount}
+     * query vectors and ground-truth records from {@code loader}, drives
+     * {@code Search} RPCs in parallel across {@code config.queryThreads}
+     * threads at {@code config.queryMaxOpsPerSecond} aggregate rate, then
+     * computes recall@K against the dataset's ground truth. Returns
+     * {@code null} if no query vectors are available (e.g. a CUSTOM dataset
+     * with no query file), and the caller treats that as "phase skipped".
+     *
+     * <p>Both file loads (query vectors and ground truth) are best-effort:
+     * a missing query file skips the entire phase, a missing ground-truth
+     * file runs the queries for QPS/latency but skips recall.
+     */
+    static QueryPhaseResult runQueryPhase(IndexingPushClient client, Config config, BenchOutput out,
+                                          DatasetLoader loader, BenchRuntime runtime,
+                                          long ingestedRows) throws Exception {
+        List<float[]> queryVectors = tryLoadQueryVectors(
+                () -> loader.loadQueryVectors(config.queryCount), out);
+        if (queryVectors == null) {
+            return null;
+        }
+        out.info("Loaded " + queryVectors.size() + " query vectors for the query phase");
+
+        // Recall is only meaningful when ground truth matches the baseline.
+        // Use the actual row count (resumeFrom + ingestedRows) so CUSTOM
+        // datasets with prefix checkpoints pick the right file.
+        final long baseRowCount = config.resumeFrom + ingestedRows;
+        final int querySize = queryVectors.size();
+        List<int[]> groundTruth = tryLoadGroundTruth(
+                () -> loader.loadGroundTruth(querySize, baseRowCount), out);
+        if (groundTruth != null) {
+            out.info("Loaded " + groundTruth.size() + " ground-truth entries (top-K up to "
+                    + (groundTruth.isEmpty() ? 0 : groundTruth.get(0).length) + ")");
+        }
+        return runQueryPhase(client, config, out, queryVectors, groundTruth, runtime);
+    }
+
+    /**
+     * Best-effort loader for query vectors. Catches {@link IOException} (e.g.
+     * dataset directory missing the query file, or a CUSTOM descriptor
+     * without {@code queryFile}) and returns {@code null} so the caller
+     * skips the phase with a clear log line instead of aborting the run
+     * after a successful ingest. Package-private so tests can inject a
+     * throwing supplier.
+     */
+    static List<float[]> tryLoadQueryVectors(IOThrowingSupplier<List<float[]>> loader, BenchOutput out) {
+        try {
+            List<float[]> v = loader.get();
+            if (v == null || v.isEmpty()) {
+                out.info("No query vectors available — skipping query/recall phase.");
+                return null;
+            }
+            return v;
+        } catch (IOException e) {
+            out.info("No query vectors available: " + e.getMessage()
+                    + " — skipping query/recall phase.");
+            return null;
+        }
+    }
+
+    /**
+     * Best-effort loader for ground truth. {@code null} means "no recall",
+     * not "no query phase" — see {@link #tryLoadQueryVectors}.
+     */
+    static List<int[]> tryLoadGroundTruth(IOThrowingSupplier<List<int[]>> loader, BenchOutput out) {
+        try {
+            return loader.get();
+        } catch (IOException e) {
+            out.info("Ground truth unavailable: " + e.getMessage()
+                    + " — running queries without recall.");
+            return null;
+        }
+    }
+
+    /**
+     * Narrow functional interface for {@link DatasetLoader} calls that throw
+     * {@link IOException}. Used by {@link #tryLoadQueryVectors} and
+     * {@link #tryLoadGroundTruth} so unit tests can inject lambdas that
+     * throw deterministically without depending on a real {@link DatasetLoader}
+     * (which is {@code final} and reads from the filesystem).
+     */
+    @FunctionalInterface
+    interface IOThrowingSupplier<T> {
+        T get() throws IOException;
+    }
+
+    /**
+     * Runs the query / recall phase given already-loaded inputs. Pure compute
+     * + gRPC — no filesystem access. Package-private so tests can drive it
+     * directly with synthetic inputs (covers {@code queryThreads > queryCount}
+     * and deterministic-recall scenarios that would otherwise require a real
+     * dataset).
+     */
+    static QueryPhaseResult runQueryPhase(IndexingPushClient client, Config config, BenchOutput out,
+                                          List<float[]> queryVectors, List<int[]> groundTruth,
+                                          BenchRuntime runtime) throws Exception {
+        out.header("=== QUERY PHASE (gRPC search) ===");
+        out.phaseStart("query");
+        Table table = buildTable(config);
+        int total = queryVectors.size();
+        List<List<Integer>> results = new ArrayList<>(Collections.nCopies(total, null));
+        MetricsCollector queryMetrics = new MetricsCollector();
+        long queryStart = System.nanoTime();
+        // Per-iteration re-read so an admin-issued query-rate change takes
+        // effect on the next query, matching the JDBC QueryWorker behaviour.
+        Supplier<RateLimiter> rateLimiterSupplier = runtime != null
+                ? runtime::queryRateLimiter
+                : () -> RateLimiter.create(config.queryMaxOpsPerSecond > 0
+                        ? config.queryMaxOpsPerSecond : BenchRuntime.UNLIMITED_RATE);
+
+        if (runtime != null) {
+            final long queryStartNs = queryStart;
+            runtime.setStatusSupplier(() -> {
+                LinkedHashMap<String, Object> m = new LinkedHashMap<>();
+                double elapsed = (System.nanoTime() - queryStartNs) / 1e9;
+                long done = queryMetrics.getCount();
+                double qps = elapsed > 0 ? done / elapsed : 0.0;
+                m.put("phase", "query");
+                m.put("queries_done", done);
+                m.put("total", (long) total);
+                m.put("qps", qps);
+                m.put("top_k", config.topK);
+                MetricsCollector.Stats s = queryMetrics.computeStats();
+                LinkedHashMap<String, Object> latency = new LinkedHashMap<>();
+                latency.put("mean_ms", s.meanNanos() / 1e6);
+                latency.put("p50_ms", s.p50Nanos() / 1e6);
+                latency.put("p95_ms", s.p95Nanos() / 1e6);
+                latency.put("p99_ms", s.p99Nanos() / 1e6);
+                latency.put("max_ms", s.maxNanos() / 1e6);
+                m.put("latency", latency);
+                return m;
+            });
+        }
+
+        // Clamp to the actual query count: a pool with more threads than
+        // queries would otherwise leave `chunk == 0` slices for every thread
+        // except the last, which would then process every query serially
+        // (issue #632 review item 2).
+        int requestedThreads = Math.max(1, config.queryThreads);
+        int effectiveThreads = Math.min(requestedThreads, Math.max(1, total));
+        ExecutorService pool = Executors.newFixedThreadPool(effectiveThreads);
+        try {
+            ExecutorCompletionService<Void> ecs = new ExecutorCompletionService<>(pool);
+            List<Future<Void>> futures = new ArrayList<>(effectiveThreads);
+            int chunk = total / effectiveThreads;
+            int remainder = total % effectiveThreads;
+            int cursor = 0;
+            for (int t = 0; t < effectiveThreads; t++) {
+                // Distribute the remainder over the first `remainder` threads
+                // (one extra each) so partitions stay balanced even when
+                // queryCount is not divisible by effectiveThreads.
+                int size = chunk + (t < remainder ? 1 : 0);
+                final int startIdx = cursor;
+                final int endIdx = cursor + size;
+                cursor = endIdx;
+                futures.add(ecs.submit(() -> {
+                    searchRange(client, config, table, queryVectors, startIdx, endIdx,
+                            rateLimiterSupplier, queryMetrics, results);
+                    return null;
+                }));
+            }
+            pool.shutdown();
+            int completed = 0;
+            while (completed < futures.size()) {
+                Future<Void> next = ecs.poll(500, TimeUnit.MILLISECONDS);
+                if (next != null) {
+                    try {
+                        next.get();
+                    } catch (ExecutionException ee) {
+                        // Cancel peer workers immediately so the failure
+                        // surfaces in <1 s rather than after every peer has
+                        // drained its slice (issue #632 review item 6).
+                        for (Future<Void> f : futures) {
+                            f.cancel(true);
+                        }
+                        pool.shutdownNow();
+                        Throwable cause = ee.getCause();
+                        if (cause instanceof RuntimeException re) {
+                            throw re;
+                        }
+                        if (cause instanceof Error err) {
+                            throw err;
+                        }
+                        throw new IllegalStateException("query worker failed", cause);
+                    }
+                    completed++;
+                    continue;
+                }
+                // No worker has finished in the last 500 ms — emit a progress line.
+                double elapsed = (System.nanoTime() - queryStart) / 1e9;
+                long done = queryMetrics.getCount();
+                double qps = elapsed > 0 ? done / elapsed : 0.0;
+                LinkedHashMap<String, Object> fields = new LinkedHashMap<>();
+                fields.put("queries_done", done);
+                fields.put("total", (long) total);
+                fields.put("qps", qps);
+                MetricsCollector.Stats stats = queryMetrics.computeStats();
+                fields.put("latency_mean_ms", stats.meanNanos() / 1e6);
+                fields.put("latency_p99_ms", stats.p99Nanos() / 1e6);
+                out.progress("query", elapsed, String.format(
+                        "queried %d/%d | %.0f qps | mean %.2f ms | p99 %.2f ms",
+                        done, total, qps,
+                        stats.meanNanos() / 1e6, stats.p99Nanos() / 1e6), fields);
+            }
+        } finally {
+            if (!pool.isTerminated()) {
+                pool.shutdownNow();
+            }
+        }
+        double querySecs = (System.nanoTime() - queryStart) / 1e9;
+        out.phaseDone("query", querySecs);
+
+        long queriesRun = queryMetrics.getCount();
+        double qps = querySecs > 0 ? queriesRun / querySecs : 0.0;
+        out.info(String.format("Ran %d searches in %.1fs (%.0f qps), top-K=%d",
+                queriesRun, querySecs, qps, config.topK));
+
+        double recall = -1.0;
+        long recallQueries = 0;
+        if (groundTruth != null && !groundTruth.isEmpty()) {
+            // Match the JDBC path's recall semantics: compare only the prefix
+            // of result rows that have ground truth.
+            List<List<Integer>> recallResults = results.subList(0, Math.min(results.size(), groundTruth.size()));
+            recall = computeRecall(recallResults, groundTruth, config.topK);
+            recallQueries = recallResults.size();
+            out.info(String.format("Recall@%d: %.4f (computed on %d queries)",
+                    config.topK, recall, recallQueries));
+        } else {
+            out.info("Recall@" + config.topK + ": not computed (no ground truth available)");
+        }
+        return new QueryPhaseResult(queriesRun, querySecs, recall, recallQueries);
+    }
+
+    /**
+     * Runs the {@code Search} RPC for {@code queryVectors[startIdx..endIdx)},
+     * deserializing each result's serialized primary key into the row's
+     * integer id (single-column LONG PK — fits in int while the bench's row
+     * count stays below 2^31). Populates {@code results[i]} with the list of
+     * matched ids in rank order so the caller can compute recall.
+     */
+    private static void searchRange(IndexingPushClient client, Config config, Table table,
+                                    List<float[]> queryVectors, int startIdx, int endIdx,
+                                    Supplier<RateLimiter> rateLimiterSupplier,
+                                    MetricsCollector metrics, List<List<Integer>> results) {
+        for (int i = startIdx; i < endIdx; i++) {
+            int k = config.topK;
+            RateLimiter rl = rateLimiterSupplier.get();
+            if (rl != null) {
+                rl.acquire(1);
+            }
+            long start = System.nanoTime();
+            SearchResponse response = client.search(TableSpace.DEFAULT, config.tableName,
+                    INDEX_NAME, queryVectors.get(i), k);
+            long elapsed = System.nanoTime() - start;
+            metrics.record(elapsed);
+
+            List<Integer> ids = new ArrayList<>(response.getResultsCount());
+            for (SearchResult r : response.getResultsList()) {
+                Bytes pk = Bytes.from_array(r.getPrimaryKey().toByteArray());
+                Object idValue = RecordSerializer.deserializePrimaryKey(pk, table);
+                // Single-column LONG PK: idValue is a Long. Recall arithmetic
+                // works on int ids (ground truth files are int[]); a bench with
+                // more than 2^31 rows would need int64 recall comparisons too
+                // — far beyond what fits in a single IS today. Fail loudly if
+                // a future regression overflows the int cast, rather than
+                // wrapping to a negative id that silently corrupts recall.
+                long id = ((Number) idValue).longValue();
+                if (id < 0 || id > Integer.MAX_VALUE) {
+                    throw new IllegalStateException("returned primary key id=" + id
+                            + " does not fit in the int recall arithmetic; "
+                            + "the gRPC recall path is bounded to 2^31 rows");
+                }
+                ids.add((int) id);
+            }
+            results.set(i, ids);
+        }
+    }
+
+    /**
+     * Recall@K: fraction of ground-truth-top-K ids that appear in the result
+     * top-K. Identical semantics to {@code VectorBench.computeRecall} so the
+     * gRPC and JDBC paths report the same metric.
+     */
+    private static double computeRecall(List<List<Integer>> results, List<int[]> groundTruth, int k) {
+        int totalRelevant = 0;
+        int totalFound = 0;
+        int count = Math.min(results.size(), groundTruth.size());
+        for (int i = 0; i < count; i++) {
+            List<Integer> result = results.get(i);
+            if (result == null) {
+                continue;
+            }
+            int[] truth = groundTruth.get(i);
+            Set<Integer> truthSet = new HashSet<>();
+            for (int j = 0; j < Math.min(k, truth.length); j++) {
+                truthSet.add(truth[j]);
+            }
+            totalRelevant += truthSet.size();
+            for (int id : result) {
+                if (truthSet.contains(id)) {
+                    totalFound++;
+                }
+            }
+        }
+        return totalRelevant == 0 ? 0.0 : (double) totalFound / totalRelevant;
+    }
+
+    private static void setSimpleStatus(BenchRuntime runtime, String phase) {
+        if (runtime == null) {
+            return;
+        }
+        runtime.setStatusSupplier(() -> {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("phase", phase);
+            return m;
+        });
     }
 
     /**

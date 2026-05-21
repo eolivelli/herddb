@@ -27,6 +27,8 @@ import herddb.indexing.proto.IndexingServiceGrpc;
 import herddb.indexing.proto.PushEntriesRequest;
 import herddb.indexing.proto.PushEntriesResponse;
 import herddb.indexing.proto.PushedLogEntry;
+import herddb.indexing.proto.SearchRequest;
+import herddb.indexing.proto.SearchResponse;
 import herddb.log.LogSequenceNumber;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
@@ -111,6 +113,34 @@ public final class IndexingPushClient implements AutoCloseable {
                 .setTable(table)
                 .setIndex(index)
                 .build());
+    }
+
+    /**
+     * Runs an ANN search via the {@code Search} RPC. Used by the
+     * {@code VectorBench} {@code --protocol grpc} query/recall phase to issue
+     * vector searches against the same indexing service the bench has just
+     * populated. The response carries each match's raw serialized
+     * {@code primary_key} bytes (no score, since {@code returnScore=false}); the
+     * caller deserializes them with {@code RecordSerializer} according to the
+     * configured table schema.
+     *
+     * @param tablespace HerdDB tablespace name
+     * @param table      table containing the vector column
+     * @param index      name of the vector index to query
+     * @param vector     query vector (dimension must match the index)
+     * @param limit      top-K — maximum number of results to return
+     */
+    public SearchResponse search(String tablespace, String table, String index, float[] vector, int limit) {
+        SearchRequest.Builder request = SearchRequest.newBuilder()
+                .setTablespace(tablespace)
+                .setTable(table)
+                .setIndex(index)
+                .setLimit(limit)
+                .setReturnScore(false);
+        for (float v : vector) {
+            request.addVector(v);
+        }
+        return stub.search(request.build());
     }
 
     @Override
