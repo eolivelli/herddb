@@ -27,13 +27,19 @@ import java.lang.reflect.Proxy;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
+import org.reactivestreams.Subscriber;
 import org.reactivestreams.Subscription;
 import software.amazon.awssdk.core.async.AsyncResponseTransformer;
+import software.amazon.awssdk.core.async.SdkPublisher;
 import software.amazon.awssdk.services.s3.S3AsyncClient;
 import software.amazon.awssdk.services.s3.model.GetObjectRequest;
 import software.amazon.awssdk.services.s3.model.GetObjectResponse;
@@ -154,6 +160,112 @@ public class S3ObjectStorageDownloadToFileTest {
         assertTrue("destination file must still exist after S3 error", Files.exists(dest));
     }
 
+    /**
+     * Issue #636 — deterministic regression test for the
+     * {@link #singleBufferPublisher} idempotency contract that the other tests
+     * in this file rely on. Drives a hand-rolled {@link Subscriber} that
+     * synchronously calls {@code request(1)} three times inside its
+     * {@code onSubscribe}, then asserts the payload is delivered exactly once.
+     *
+     * <p>Prior to the fix, {@code onNext} was called three times — which is
+     * what the SDK's {@code AsyncResponseTransformer.toFile()} occasionally
+     * triggered during {@link #downloadToFileAppendsSubsequentBlocks} (one
+     * extra request → one extra block written → file length 15 instead of 10).
+     */
+    @Test
+    public void requestIsIdempotentUnderMultipleRequestCalls() {
+        byte[] payload = {1, 2, 3, 4, 5};
+        AtomicInteger onNextCalls = new AtomicInteger();
+        AtomicInteger onCompleteCalls = new AtomicInteger();
+        AtomicInteger onErrorCalls = new AtomicInteger();
+        List<byte[]> received = new ArrayList<>();
+
+        Subscriber<ByteBuffer> subscriber = new Subscriber<ByteBuffer>() {
+            @Override
+            public void onSubscribe(Subscription s) {
+                // Three back-to-back request(n) calls — the helper must
+                // deliver the payload at most once. This is what the SDK's
+                // file transformer can do internally; we model that worst
+                // case explicitly here so the regression cannot recur.
+                s.request(1);
+                s.request(1);
+                s.request(Long.MAX_VALUE);
+            }
+
+            @Override
+            public void onNext(ByteBuffer b) {
+                onNextCalls.incrementAndGet();
+                byte[] copy = new byte[b.remaining()];
+                b.get(copy);
+                received.add(copy);
+            }
+
+            @Override
+            public void onError(Throwable t) {
+                onErrorCalls.incrementAndGet();
+            }
+
+            @Override
+            public void onComplete() {
+                onCompleteCalls.incrementAndGet();
+            }
+        };
+
+        singleBufferPublisher(payload).subscribe(subscriber);
+
+        assertEquals("onNext must fire exactly once regardless of request count",
+                1, onNextCalls.get());
+        assertEquals("onComplete must fire exactly once", 1, onCompleteCalls.get());
+        assertEquals("onError must not fire on the happy path",
+                0, onErrorCalls.get());
+        assertEquals("exactly one buffer must have been delivered",
+                1, received.size());
+        assertArrayEquals("delivered bytes must match the payload",
+                payload, received.get(0));
+    }
+
+    /**
+     * Issue #636 — cancel must also flip the terminal flag, so a
+     * {@code request(n)} that arrives after {@code cancel()} is a no-op.
+     * Pins the post-cancel-state path of the Reactive Streams contract.
+     */
+    @Test
+    public void requestAfterCancelIsNoOp() {
+        byte[] payload = {1, 2, 3};
+        AtomicInteger onNextCalls = new AtomicInteger();
+        AtomicInteger onCompleteCalls = new AtomicInteger();
+
+        Subscriber<ByteBuffer> subscriber = new Subscriber<ByteBuffer>() {
+            @Override
+            public void onSubscribe(Subscription s) {
+                s.cancel();
+                s.request(1);
+                s.request(Long.MAX_VALUE);
+            }
+
+            @Override
+            public void onNext(ByteBuffer b) {
+                onNextCalls.incrementAndGet();
+            }
+
+            @Override
+            public void onError(Throwable t) {
+                // No-op for this test.
+            }
+
+            @Override
+            public void onComplete() {
+                onCompleteCalls.incrementAndGet();
+            }
+        };
+
+        singleBufferPublisher(payload).subscribe(subscriber);
+
+        assertEquals("onNext must not fire after cancel", 0, onNextCalls.get());
+        assertEquals("onComplete must not fire after cancel",
+                0, onCompleteCalls.get());
+    }
+
     // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------
@@ -178,19 +290,7 @@ public class S3ObjectStorageDownloadToFileTest {
                         CompletableFuture<Object> future =
                                 (CompletableFuture<Object>) transformer.prepare();
                         transformer.onResponse(GetObjectResponse.builder().build());
-                        transformer.onStream(subscriber -> {
-                            subscriber.onSubscribe(new Subscription() {
-                                @Override
-                                public void request(long n) {
-                                    subscriber.onNext(ByteBuffer.wrap(payload));
-                                    subscriber.onComplete();
-                                }
-
-                                @Override
-                                public void cancel() {
-                                }
-                            });
-                        });
+                        transformer.onStream(singleBufferPublisher(payload));
                         return future;
                     }
                     if ("close".equals(method.getName())) {
@@ -199,6 +299,51 @@ public class S3ObjectStorageDownloadToFileTest {
                     throw new UnsupportedOperationException(
                             "fake S3 client does not implement " + method.getName());
                 });
+    }
+
+    /**
+     * Returns an {@link SdkPublisher} that delivers {@code payload} as a single
+     * {@link ByteBuffer} element and then completes — once and only once,
+     * regardless of how many times the subscriber calls
+     * {@link Subscription#request(long)}.
+     *
+     * <p>This is the issue #636 fix: previously the inline {@code Subscription}
+     * inside {@link #proxyClient} re-delivered the payload on every
+     * {@code request(n)} call. The SDK's {@code AsyncResponseTransformer.toFile()}
+     * is free to issue {@code request} more than once per subscription (especially
+     * in the append-mode {@code FileTransformerConfiguration.defaultCreateOrAppend()}
+     * path), so any second request silently doubled the bytes written to disk
+     * and produced the {@code expected:&lt;10&gt; but was:&lt;15&gt;} flake in
+     * {@link #downloadToFileAppendsSubsequentBlocks}.
+     *
+     * <p>The Reactive Streams contract requires a publisher to be a state
+     * machine: after {@code onComplete} / {@code onError} / {@code cancel},
+     * further {@code request} calls must be no-ops. The
+     * {@link AtomicBoolean#compareAndSet} below pins exactly that contract.
+     * Kept as a single-buffer-only helper — any future test that needs
+     * multi-chunk delivery should introduce its own helper rather than reuse
+     * this flag.
+     */
+    static SdkPublisher<ByteBuffer> singleBufferPublisher(byte[] payload) {
+        return subscriber -> {
+            AtomicBoolean delivered = new AtomicBoolean(false);
+            subscriber.onSubscribe(new Subscription() {
+                @Override
+                public void request(long n) {
+                    if (delivered.compareAndSet(false, true)) {
+                        subscriber.onNext(ByteBuffer.wrap(payload));
+                        subscriber.onComplete();
+                    }
+                }
+
+                @Override
+                public void cancel() {
+                    // Idempotent terminal — flip the flag so any post-cancel
+                    // request(n) is also a no-op, matching the spec.
+                    delivered.set(true);
+                }
+            });
+        };
     }
 
     /**
