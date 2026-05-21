@@ -37,6 +37,7 @@ import herddb.model.Table;
 import herddb.model.TableSpace;
 import herddb.utils.Bytes;
 import io.netty.buffer.ByteBuf;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -46,6 +47,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -414,34 +417,94 @@ public final class GrpcBench {
      * computes recall@K against the dataset's ground truth. Returns
      * {@code null} if no query vectors are available (e.g. a CUSTOM dataset
      * with no query file), and the caller treats that as "phase skipped".
+     *
+     * <p>Both file loads (query vectors and ground truth) are best-effort:
+     * a missing query file skips the entire phase, a missing ground-truth
+     * file runs the queries for QPS/latency but skips recall.
      */
     static QueryPhaseResult runQueryPhase(IndexingPushClient client, Config config, BenchOutput out,
                                           DatasetLoader loader, BenchRuntime runtime,
                                           long ingestedRows) throws Exception {
-        List<float[]> queryVectors = loader.loadQueryVectors(config.queryCount);
-        if (queryVectors == null || queryVectors.isEmpty()) {
-            out.info("No query vectors available — skipping query/recall phase.");
+        List<float[]> queryVectors = tryLoadQueryVectors(
+                () -> loader.loadQueryVectors(config.queryCount), out);
+        if (queryVectors == null) {
             return null;
         }
         out.info("Loaded " + queryVectors.size() + " query vectors for the query phase");
 
-        List<int[]> groundTruth;
-        try {
-            // Recall is only meaningful when ground truth matches the
-            // baseline. Use the actual row count (resumeFrom + ingestedRows)
-            // so CUSTOM datasets with prefix checkpoints pick the right file.
-            long baseRowCount = config.resumeFrom + ingestedRows;
-            groundTruth = loader.loadGroundTruth(queryVectors.size(), baseRowCount);
+        // Recall is only meaningful when ground truth matches the baseline.
+        // Use the actual row count (resumeFrom + ingestedRows) so CUSTOM
+        // datasets with prefix checkpoints pick the right file.
+        final long baseRowCount = config.resumeFrom + ingestedRows;
+        final int querySize = queryVectors.size();
+        List<int[]> groundTruth = tryLoadGroundTruth(
+                () -> loader.loadGroundTruth(querySize, baseRowCount), out);
+        if (groundTruth != null) {
             out.info("Loaded " + groundTruth.size() + " ground-truth entries (top-K up to "
                     + (groundTruth.isEmpty() ? 0 : groundTruth.get(0).length) + ")");
-        } catch (java.io.IOException e) {
-            // Ground truth is optional — if the dataset has no file matching
-            // the row count we still run the query phase (for QPS / latency)
-            // but skip recall.
-            out.info("Ground truth unavailable: " + e.getMessage() + " — running queries without recall.");
-            groundTruth = null;
         }
+        return runQueryPhase(client, config, out, queryVectors, groundTruth, runtime);
+    }
 
+    /**
+     * Best-effort loader for query vectors. Catches {@link IOException} (e.g.
+     * dataset directory missing the query file, or a CUSTOM descriptor
+     * without {@code queryFile}) and returns {@code null} so the caller
+     * skips the phase with a clear log line instead of aborting the run
+     * after a successful ingest. Package-private so tests can inject a
+     * throwing supplier.
+     */
+    static List<float[]> tryLoadQueryVectors(IOThrowingSupplier<List<float[]>> loader, BenchOutput out) {
+        try {
+            List<float[]> v = loader.get();
+            if (v == null || v.isEmpty()) {
+                out.info("No query vectors available — skipping query/recall phase.");
+                return null;
+            }
+            return v;
+        } catch (IOException e) {
+            out.info("No query vectors available: " + e.getMessage()
+                    + " — skipping query/recall phase.");
+            return null;
+        }
+    }
+
+    /**
+     * Best-effort loader for ground truth. {@code null} means "no recall",
+     * not "no query phase" — see {@link #tryLoadQueryVectors}.
+     */
+    static List<int[]> tryLoadGroundTruth(IOThrowingSupplier<List<int[]>> loader, BenchOutput out) {
+        try {
+            return loader.get();
+        } catch (IOException e) {
+            out.info("Ground truth unavailable: " + e.getMessage()
+                    + " — running queries without recall.");
+            return null;
+        }
+    }
+
+    /**
+     * Narrow functional interface for {@link DatasetLoader} calls that throw
+     * {@link IOException}. Used by {@link #tryLoadQueryVectors} and
+     * {@link #tryLoadGroundTruth} so unit tests can inject lambdas that
+     * throw deterministically without depending on a real {@link DatasetLoader}
+     * (which is {@code final} and reads from the filesystem).
+     */
+    @FunctionalInterface
+    interface IOThrowingSupplier<T> {
+        T get() throws IOException;
+    }
+
+    /**
+     * Runs the query / recall phase given already-loaded inputs. Pure compute
+     * + gRPC — no filesystem access. Package-private so tests can drive it
+     * directly with synthetic inputs (covers {@code queryThreads > queryCount}
+     * and deterministic-recall scenarios that would otherwise require a real
+     * dataset).
+     */
+    static QueryPhaseResult runQueryPhase(IndexingPushClient client, Config config, BenchOutput out,
+                                          List<float[]> queryVectors, List<int[]> groundTruth,
+                                          BenchRuntime runtime) throws Exception {
         out.header("=== QUERY PHASE (gRPC search) ===");
         out.phaseStart("query");
         Table table = buildTable(config);
@@ -480,22 +543,61 @@ public final class GrpcBench {
             });
         }
 
-        int threads = Math.max(1, config.queryThreads);
-        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        // Clamp to the actual query count: a pool with more threads than
+        // queries would otherwise leave `chunk == 0` slices for every thread
+        // except the last, which would then process every query serially
+        // (issue #632 review item 2).
+        int requestedThreads = Math.max(1, config.queryThreads);
+        int effectiveThreads = Math.min(requestedThreads, Math.max(1, total));
+        ExecutorService pool = Executors.newFixedThreadPool(effectiveThreads);
         try {
-            List<Future<?>> futures = new ArrayList<>(threads);
-            int chunk = total / threads;
-            for (int t = 0; t < threads; t++) {
-                final int startIdx = t * chunk;
-                final int endIdx = (t == threads - 1) ? total : startIdx + chunk;
-                futures.add(pool.submit(() ->
-                        searchRange(client, config, table, queryVectors, startIdx, endIdx,
-                                rateLimiterSupplier, queryMetrics, results)));
+            ExecutorCompletionService<Void> ecs = new ExecutorCompletionService<>(pool);
+            List<Future<Void>> futures = new ArrayList<>(effectiveThreads);
+            int chunk = total / effectiveThreads;
+            int remainder = total % effectiveThreads;
+            int cursor = 0;
+            for (int t = 0; t < effectiveThreads; t++) {
+                // Distribute the remainder over the first `remainder` threads
+                // (one extra each) so partitions stay balanced even when
+                // queryCount is not divisible by effectiveThreads.
+                int size = chunk + (t < remainder ? 1 : 0);
+                final int startIdx = cursor;
+                final int endIdx = cursor + size;
+                cursor = endIdx;
+                futures.add(ecs.submit(() -> {
+                    searchRange(client, config, table, queryVectors, startIdx, endIdx,
+                            rateLimiterSupplier, queryMetrics, results);
+                    return null;
+                }));
             }
             pool.shutdown();
-            // Progress loop — same shape as VectorBench's JDBC query progress
-            // line, just emitted from this thread since there is no JDBC pool.
-            while (!pool.awaitTermination(500, TimeUnit.MILLISECONDS)) {
+            int completed = 0;
+            while (completed < futures.size()) {
+                Future<Void> next = ecs.poll(500, TimeUnit.MILLISECONDS);
+                if (next != null) {
+                    try {
+                        next.get();
+                    } catch (ExecutionException ee) {
+                        // Cancel peer workers immediately so the failure
+                        // surfaces in <1 s rather than after every peer has
+                        // drained its slice (issue #632 review item 6).
+                        for (Future<Void> f : futures) {
+                            f.cancel(true);
+                        }
+                        pool.shutdownNow();
+                        Throwable cause = ee.getCause();
+                        if (cause instanceof RuntimeException re) {
+                            throw re;
+                        }
+                        if (cause instanceof Error err) {
+                            throw err;
+                        }
+                        throw new IllegalStateException("query worker failed", cause);
+                    }
+                    completed++;
+                    continue;
+                }
+                // No worker has finished in the last 500 ms — emit a progress line.
                 double elapsed = (System.nanoTime() - queryStart) / 1e9;
                 long done = queryMetrics.getCount();
                 double qps = elapsed > 0 ? done / elapsed : 0.0;
@@ -510,10 +612,6 @@ public final class GrpcBench {
                         "queried %d/%d | %.0f qps | mean %.2f ms | p99 %.2f ms",
                         done, total, qps,
                         stats.meanNanos() / 1e6, stats.p99Nanos() / 1e6), fields);
-            }
-            for (Future<?> f : futures) {
-                // Surface any worker exception (search RPC failure, deserialization bug).
-                f.get();
             }
         } finally {
             if (!pool.isTerminated()) {
@@ -572,10 +670,17 @@ public final class GrpcBench {
                 Bytes pk = Bytes.from_array(r.getPrimaryKey().toByteArray());
                 Object idValue = RecordSerializer.deserializePrimaryKey(pk, table);
                 // Single-column LONG PK: idValue is a Long. Recall arithmetic
-                // works on int ids (ground truth is int[]); a bench with more
-                // than 2^31 rows would need int64 recall comparisons too — far
-                // beyond what fits in a single IS today.
+                // works on int ids (ground truth files are int[]); a bench with
+                // more than 2^31 rows would need int64 recall comparisons too
+                // — far beyond what fits in a single IS today. Fail loudly if
+                // a future regression overflows the int cast, rather than
+                // wrapping to a negative id that silently corrupts recall.
                 long id = ((Number) idValue).longValue();
+                if (id < 0 || id > Integer.MAX_VALUE) {
+                    throw new IllegalStateException("returned primary key id=" + id
+                            + " does not fit in the int recall arithmetic; "
+                            + "the gRPC recall path is bounded to 2^31 rows");
+                }
                 ids.add((int) id);
             }
             results.set(i, ids);

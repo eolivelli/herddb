@@ -28,8 +28,10 @@ import herddb.indexing.IndexingServerConfiguration;
 import herddb.model.TableSpace;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Properties;
@@ -243,54 +245,93 @@ class GrpcBenchIntegrationTest {
     }
 
     /**
-     * Issue #632 (3): the new query / recall phase runs gRPC {@code Search}
-     * calls against the same IS the bench has just populated. With a tiny
-     * deterministic dataset (200 dim-8 vectors built from a coordinate ramp)
-     * the query for the exact vector at row K must rank K first — so
-     * recall@1 = 1.0 across every probe. This pins both the
-     * {@link IndexingPushClient#search} round-trip and the primary-key
-     * deserialization in {@code GrpcBench.searchRange}.
+     * Issue #632 (3): the new query / recall phase end-to-end. Ingest a
+     * deterministic dataset (300 dim-8 ramp vectors), then drive the
+     * package-private {@link GrpcBench#runQueryPhase(IndexingPushClient,
+     * Config, BenchOutput, List, List, BenchRuntime)} with hand-built
+     * query vectors and ground truth. Asserts on the returned
+     * {@code QueryPhaseResult} — exercising the parallel search pool,
+     * primary-key deserialization, recall computation, and the
+     * {@code phase=query} status supplier all at once.
      */
     @Test
     @Timeout(120)
-    void grpcQueryPhaseProducesPerfectRecallOnDeterministicData() throws Exception {
+    void grpcQueryPhaseEndToEndProducesPerfectRecall() throws Exception {
         EmbeddedIndexingService service = startPushService();
         try (IndexingPushClient client = new IndexingPushClient(service.getAddress())) {
             Config config = grpcConfig("grpc_recall");
-            int rows = 200;
+            config.topK = 1;
+            int rows = 300;
+            int dim = 8;
+            BenchRuntime runtime = new BenchRuntime(config);
+            long pushed = GrpcBench.ingest(client, config, BenchOutput.create(config),
+                    rampVectors(rows, dim), 0L, rows, runtime);
+            assertEquals(rows, pushed);
+
+            // Build query vectors that are exact replicas of 10 known rows,
+            // so the nearest-neighbour at top-1 is always the matching id.
+            int probes = 10;
+            List<float[]> queryVectors = new ArrayList<>(probes);
+            List<int[]> groundTruth = new ArrayList<>(probes);
+            for (int k = 0; k < probes; k++) {
+                int probeId = k * (rows / probes);
+                queryVectors.add(rampVector(probeId, dim));
+                groundTruth.add(new int[]{probeId});
+            }
+
+            GrpcBench.QueryPhaseResult result = GrpcBench.runQueryPhase(
+                    client, config, BenchOutput.create(config),
+                    queryVectors, groundTruth, runtime);
+
+            assertNotNull(result);
+            assertEquals(probes, result.queries, "every probe must have been searched");
+            assertEquals(probes, result.recallQueries);
+            assertTrue(result.recall >= 0.9,
+                    "deterministic ramp dataset must produce near-perfect recall@1, got " + result.recall);
+            // Phase supplier should have been left on `query` (final transition
+            // back to `done` happens in GrpcBench.run, not runQueryPhase).
+            Map<String, Object> status = runtime.getStatusSupplier().get();
+            assertEquals("query", status.get("phase"));
+            assertEquals((long) probes, status.get("total"));
+        } finally {
+            service.close();
+        }
+    }
+
+    /**
+     * Issue #632 review item 2: when {@code queryThreads > queryCount} the
+     * old work-partitioning collapsed every query onto the last thread.
+     * After the fix every query must still be executed exactly once and the
+     * returned {@code QueryPhaseResult.queries} must equal the input size.
+     */
+    @Test
+    @Timeout(60)
+    void grpcQueryPhaseHandlesMoreThreadsThanQueries() throws Exception {
+        EmbeddedIndexingService service = startPushService();
+        try (IndexingPushClient client = new IndexingPushClient(service.getAddress())) {
+            Config config = grpcConfig("grpc_threads_over_queries");
+            config.topK = 1;
+            config.queryThreads = 8;
+            int rows = 64;
             int dim = 8;
             long pushed = GrpcBench.ingest(client, config, BenchOutput.create(config),
                     rampVectors(rows, dim), 0L, rows);
             assertEquals(rows, pushed);
 
-            // Issue Search RPCs for the exact vectors at K=10 known positions.
-            // Each must rank its own id first (recall@1 = 1).
-            int hits = 0;
-            int probes = 10;
-            for (int k = 0; k < probes; k++) {
-                int probeId = k * (rows / probes);
-                float[] query = rampVector(probeId, dim);
-                var resp = client.search(TableSpace.DEFAULT, "grpc_recall", "vidx", query, 5);
-                assertNotNull(resp);
-                assertTrue(resp.getResultsCount() > 0,
-                        "search must return at least one hit for id=" + probeId);
-                // Decode the top result's primary key (single-column LONG id).
-                herddb.utils.Bytes pk = herddb.utils.Bytes.from_array(
-                        resp.getResults(0).getPrimaryKey().toByteArray());
-                herddb.model.Table table = herddb.model.Table.builder()
-                        .name("grpc_recall")
-                        .tablespace(TableSpace.DEFAULT)
-                        .column("id", herddb.model.ColumnTypes.LONG)
-                        .column("vec", herddb.model.ColumnTypes.FLOATARRAY)
-                        .primaryKey("id")
-                        .build();
-                long topId = ((Number) herddb.codec.RecordSerializer.deserializePrimaryKey(pk, table)).longValue();
-                if (topId == probeId) {
-                    hits++;
-                }
-            }
-            assertTrue(hits >= probes - 1,
-                    "expected at least " + (probes - 1) + " exact-match top hits, got " + hits);
+            // Two queries, eight pool threads — every query must still be
+            // executed.
+            List<float[]> queryVectors = new ArrayList<>();
+            queryVectors.add(rampVector(0, dim));
+            queryVectors.add(rampVector(1, dim));
+
+            GrpcBench.QueryPhaseResult result = GrpcBench.runQueryPhase(
+                    client, config, BenchOutput.create(config),
+                    queryVectors, null, null);
+
+            assertNotNull(result);
+            assertEquals(2L, result.queries,
+                    "every query must be executed even when queryThreads > queryCount");
+            assertEquals(-1.0, result.recall, "recall is -1 when no ground truth was passed");
         } finally {
             service.close();
         }

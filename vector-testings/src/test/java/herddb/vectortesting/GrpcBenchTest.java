@@ -21,14 +21,17 @@ package herddb.vectortesting;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import herddb.log.LogEntry;
 import herddb.log.LogEntryFactory;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.PooledByteBufAllocator;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Function;
@@ -147,6 +150,48 @@ class GrpcBenchTest {
      * {@code expected} fields — so the supervision loop can observe the
      * phase even while waiting for the tailer to apply the last batch.
      */
+    /**
+     * Issue #632 review item 1: when {@code DatasetLoader.loadQueryVectors}
+     * throws {@link IOException} (e.g. dataset directory is missing the
+     * query file), the query phase must be skipped cleanly — the bench
+     * must not crash <em>after</em> a successful ingest. We exercise the
+     * dedicated seam {@link GrpcBench#tryLoadQueryVectors} so the test does
+     * not need a live filesystem.
+     */
+    @Test
+    void tryLoadQueryVectorsReturnsNullOnIOException() {
+        Config config = new Config();
+        BenchOutput out = BenchOutput.create(config);
+        List<float[]> queries = GrpcBench.tryLoadQueryVectors(
+                () -> {
+                    throw new IOException("dataset has no query file");
+                },
+                out);
+        assertNull(queries, "IOException must be converted to a null skip, not propagated");
+    }
+
+    @Test
+    void tryLoadQueryVectorsReturnsNullOnEmpty() {
+        Config config = new Config();
+        BenchOutput out = BenchOutput.create(config);
+        List<float[]> queries = GrpcBench.tryLoadQueryVectors(
+                () -> Collections.emptyList(),
+                out);
+        assertNull(queries, "empty result must be treated the same as no query file");
+    }
+
+    @Test
+    void tryLoadGroundTruthReturnsNullOnIOException() {
+        Config config = new Config();
+        BenchOutput out = BenchOutput.create(config);
+        List<int[]> gt = GrpcBench.tryLoadGroundTruth(
+                () -> {
+                    throw new IOException("no ground truth checkpoint matches baseVectorCount");
+                },
+                out);
+        assertNull(gt, "missing ground truth must surface as null (recall skipped)");
+    }
+
     @Test
     void verifyVectorCountPublishesPhaseToBenchRuntime() throws Exception {
         Config config = new Config();
