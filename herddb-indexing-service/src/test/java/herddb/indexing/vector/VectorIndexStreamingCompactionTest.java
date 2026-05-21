@@ -77,20 +77,16 @@ public class VectorIndexStreamingCompactionTest {
     @Rule
     public TemporaryFolder tmpFolder = new TemporaryFolder();
 
-    private boolean savedStreamingFlag;
-
     @Before
     public void disableCheckpointDeferral() {
         // Override the global deferral gate so tiny per-checkpoint shards
         // don't get deferred while the test is building segments.
         PersistentVectorStore.minLiveVectorsForCheckpoint = 0;
-        savedStreamingFlag = VectorIndexCompactor.streamingCompactionEnabled;
     }
 
     @After
     public void restoreCheckpointDeferral() {
         PersistentVectorStore.minLiveVectorsForCheckpoint = 50_000;
-        VectorIndexCompactor.streamingCompactionEnabled = savedStreamingFlag;
     }
 
     private PersistentVectorStore createStore(Path tmpDir, MemoryDataStorageManager dsm) {
@@ -185,7 +181,6 @@ public class VectorIndexStreamingCompactionTest {
 
     @Test
     public void streamingDeletionEquivalenceAndDenseOrdinals() throws Exception {
-        VectorIndexCompactor.streamingCompactionEnabled = true;
         Path tmpDir = tmpFolder.newFolder().toPath();
         MemoryDataStorageManager dsm = new MemoryDataStorageManager();
         try (PersistentVectorStore store = createStore(tmpDir, dsm)) {
@@ -276,35 +271,6 @@ public class VectorIndexStreamingCompactionTest {
         }
     }
 
-    @Test
-    public void legacyPathStillWorksWhenFlagIsOff() throws Exception {
-        VectorIndexCompactor.streamingCompactionEnabled = false;
-        Path tmpDir = tmpFolder.newFolder().toPath();
-        MemoryDataStorageManager dsm = new MemoryDataStorageManager();
-        try (PersistentVectorStore store = createStore(tmpDir, dsm)) {
-            store.start();
-            List<Bytes> allPks = new ArrayList<>();
-            int segmentsBefore = writeSegments(store, 16, 300, 5, allPks, 7);
-            assertTrue(segmentsBefore >= 4);
-
-            // Snapshot ground truth before compaction.
-            Set<Bytes> expectedSurvivors =
-                    authoritativePks(store.getOnDiskSegmentsSnapshotForTest());
-
-            store.runCompactionCycle();
-            assertEquals(1, store.getCompactionSuccessesTotal());
-
-            // Locate merged segment by generation.
-            VectorSegment merged = store.getOnDiskSegmentsSnapshotForTest().stream()
-                    .max(java.util.Comparator.comparingLong(s -> s.generation))
-                    .orElseThrow(() -> new AssertionError("no merged segment"));
-
-            // Same surviving PK set as the ground truth: this is the
-            // observable equivalence between the legacy and streaming paths.
-            assertEquals(expectedSurvivors, mergedSegmentPkSet(merged));
-        }
-    }
-
     /**
      * Issue #485 review item B.3#1: the {@code < 2 candidates} fallback to
      * the legacy in-memory rebuild must trigger when the policy hands a
@@ -316,7 +282,6 @@ public class VectorIndexStreamingCompactionTest {
      */
     @Test
     public void streamingFallsBackToLegacyForSingleCandidate() throws Exception {
-        VectorIndexCompactor.streamingCompactionEnabled = true;
         long fallbackBefore = VectorIndexCompactor.getStreamingFallbackToLegacyTotal();
         AtomicReference<PersistentVectorStore.LiveGraphShard> observed =
                 new AtomicReference<>();
@@ -467,7 +432,6 @@ public class VectorIndexStreamingCompactionTest {
      */
     @Test
     public void streamingFailedUploadQueuesOrphansForRetentionSweep() throws Exception {
-        VectorIndexCompactor.streamingCompactionEnabled = true;
         Path tmpDir = tmpFolder.newFolder().toPath();
         FailingDsm dsm = new FailingDsm();
         try (PersistentVectorStore store = createStore(tmpDir, dsm)) {
@@ -518,95 +482,6 @@ public class VectorIndexStreamingCompactionTest {
         }
     }
 
-    @Test
-    public void searchResultsConvergeAcrossPaths() throws Exception {
-        // Run an identical workload twice — once streaming, once legacy —
-        // then probe both with the same query. We don't expect bit-identical
-        // recall (the two engines build the graph differently) but the top-K
-        // for a clearly-clustered point should overlap meaningfully.
-        Path tmpDirA = tmpFolder.newFolder().toPath();
-        Path tmpDirB = tmpFolder.newFolder().toPath();
-        MemoryDataStorageManager dsmA = new MemoryDataStorageManager();
-        MemoryDataStorageManager dsmB = new MemoryDataStorageManager();
-        int dim = 16;
-        int topK = 10;
-        // Build a small clustered dataset so the closest neighbours are
-        // unambiguous: 200 vectors near the origin + 100 vectors offset by 100.
-        Random rng = new Random(42);
-        List<float[]> dataset = new ArrayList<>();
-        for (int i = 0; i < 200; i++) {
-            float[] v = new float[dim];
-            for (int d = 0; d < dim; d++) {
-                v[d] = rng.nextFloat();
-            }
-            dataset.add(v);
-        }
-        for (int i = 0; i < 100; i++) {
-            float[] v = new float[dim];
-            for (int d = 0; d < dim; d++) {
-                v[d] = 100f + rng.nextFloat();
-            }
-            dataset.add(v);
-        }
-
-        Set<Bytes> streamingTopK;
-        Set<Bytes> legacyTopK;
-        try {
-            VectorIndexCompactor.streamingCompactionEnabled = true;
-            try (PersistentVectorStore store = createStore(tmpDirA, dsmA)) {
-                store.start();
-                for (int c = 0; c < 5; c++) {
-                    for (int i = 0; i < 60; i++) {
-                        int idx = c * 60 + i;
-                        if (idx >= dataset.size()) {
-                            break;
-                        }
-                        store.addVector(Bytes.from_int(idx), dataset.get(idx));
-                    }
-                    store.checkpoint();
-                }
-                store.runCompactionCycle();
-                List<Map.Entry<Bytes, Float>> hits = store.search(dataset.get(0), topK);
-                streamingTopK = new HashSet<>();
-                for (Map.Entry<Bytes, Float> h : hits) {
-                    streamingTopK.add(h.getKey());
-                }
-            }
-
-            VectorIndexCompactor.streamingCompactionEnabled = false;
-            try (PersistentVectorStore store = createStore(tmpDirB, dsmB)) {
-                store.start();
-                for (int c = 0; c < 5; c++) {
-                    for (int i = 0; i < 60; i++) {
-                        int idx = c * 60 + i;
-                        if (idx >= dataset.size()) {
-                            break;
-                        }
-                        store.addVector(Bytes.from_int(idx), dataset.get(idx));
-                    }
-                    store.checkpoint();
-                }
-                store.runCompactionCycle();
-                List<Map.Entry<Bytes, Float>> hits = store.search(dataset.get(0), topK);
-                legacyTopK = new HashSet<>();
-                for (Map.Entry<Bytes, Float> h : hits) {
-                    legacyTopK.add(h.getKey());
-                }
-            }
-        } finally {
-            VectorIndexCompactor.streamingCompactionEnabled = savedStreamingFlag;
-        }
-
-        // Intersection should be substantial — any near-zero overlap signals
-        // that the streaming output is materially worse than the legacy path
-        // (the whole point of the deletion-equivalence test is parity, but a
-        // clustered query has to land on cluster #1, not the offset cluster).
-        Set<Bytes> intersection = new HashSet<>(streamingTopK);
-        intersection.retainAll(legacyTopK);
-        assertTrue("streaming top-K must overlap legacy top-K substantially "
-                        + "(streaming=" + streamingTopK + " legacy=" + legacyTopK + ")",
-                intersection.size() >= Math.min(topK / 2, 3));
-    }
 
     /**
      * Exercises the streaming compaction code path end-to-end with the
@@ -637,8 +512,6 @@ public class VectorIndexStreamingCompactionTest {
      */
     @Test
     public void streamingCompactionUsesEagerDownload() throws Exception {
-        VectorIndexCompactor.streamingCompactionEnabled = true;
-
         // FusedPQ requires dim >= MIN_DIM_FOR_FUSED_PQ (8) and
         // vectors-per-shard >= MIN_VECTORS_FOR_FUSED_PQ (256).
         final int dim = 16;

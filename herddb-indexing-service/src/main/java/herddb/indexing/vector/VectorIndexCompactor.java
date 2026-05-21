@@ -103,37 +103,13 @@ final class VectorIndexCompactor {
             syntheticShardObserverForTest;
 
     /**
-     * Master switch for the streaming compaction engine introduced in issue
-     * #485. When {@code true}, {@link #rebuildSegment} delegates to
-     * {@link io.github.jbellis.jvector.graph.disk.OnDiskGraphIndexCompactor}
-     * instead of building a fresh in-memory {@link GraphIndexBuilder}. The
-     * streaming engine bounds memory by {@code taskWindowSize × maxDegree}
-     * instead of {@code numTotalNodes × dimension}, lifting the conservative
-     * 1 GB cap previously baked into {@code vector.index.compaction.maxBytes}.
-     *
-     * <p>The same flag governs the optimizer-pod path
-     * ({@link RemoteSegmentGraphMerger}).
-     *
-     * <p>Default: {@code true}. Operators may flip via the
-     * {@code herddb.vectorindex.streamingCompactionEnabled} system property.
-     * The non-streaming path is retained as an escape hatch for the lifetime
-     * of the issue #485 rollout.
-     *
-     * <p>Non-final to allow tests to flip the flag in a {@code @Before} /
-     * {@code @After} block without process restart.
-     */
-    static volatile boolean streamingCompactionEnabled =
-            Boolean.parseBoolean(System.getProperty(
-                    "herddb.vectorindex.streamingCompactionEnabled", "true"));
-
-    /**
      * Process-wide counter of times the streaming path fell back to the
      * legacy in-memory rebuild because {@code OnDiskGraphIndexCompactor}'s
      * {@code sources.size() >= 2} precondition was not met (i.e. only one
      * candidate slipped through). Surfaced for operational visibility — a
      * non-zero value with high cadence indicates the compaction policy is
      * picking single-candidate cycles and the streaming path is effectively
-     * idle. Per-process (not per-store) since the flag itself is per-process.
+     * idle. Process-wide for parity with the rest of the compaction metrics.
      */
     static final java.util.concurrent.atomic.AtomicLong STREAMING_FALLBACK_TO_LEGACY_TOTAL =
             new java.util.concurrent.atomic.AtomicLong(0);
@@ -890,28 +866,46 @@ final class VectorIndexCompactor {
         // The on-disk-merge path bounds memory by O(taskWindowSize × maxDegree)
         // instead of O(numTotalNodes × dimension), lifting the in-memory cap that
         // previously forced vector.index.compaction.maxBytes ≤ 1 GB.
-        if (streamingCompactionEnabled) {
-            return rebuildSegmentStreaming(store, candidates, authority, dim,
-                    keptCount, filteredCount, liveBitsets);
-        }
-
-        return rebuildSegmentLegacy(store, candidates, authority, dim,
-                keptCount, filteredCount);
+        //
+        // Issue #628 — streaming is unconditional. The legacy in-memory rebuild
+        // still exists, but only as the automatic fallback from
+        // rebuildSegmentStreaming for the two cases jvector's compactor cannot
+        // serve: heterogeneous candidate feature sets and fewer than two valid
+        // source graphs. Both fallback arms now receive the eager-downloaded
+        // local-file-backed graphs so reads bypass SegmentBlockCache / gRPC.
+        return rebuildSegmentStreaming(store, candidates, authority, dim,
+                keptCount, filteredCount, liveBitsets);
     }
 
     /**
      * Fills the synthetic shard by reading authoritative vectors from
      * every candidate segment's on-disk graph.
+     *
+     * <p>Issue #628: when {@code localSources} is non-null, vector reads come
+     * from the pre-downloaded local-file-backed {@link OnDiskGraphIndex}
+     * objects (built by {@link #eagerlyDownloadCandidates}) instead of
+     * {@code seg.onDiskGraph}. The two lists are parallel — index {@code i}
+     * in {@code localSources} corresponds to {@code candidates.get(i)}. The
+     * local-source path bypasses {@code SegmentBlockCache} / gRPC entirely,
+     * which is the root-cause fix: the previous behaviour issued tens of
+     * millions of small remote block reads per cycle at large segment
+     * counts, stalling Phase B for hours.
      */
     private static void populateSyntheticShard(
             PersistentVectorStore store,
             List<VectorSegment> candidates,
+            List<OnDiskGraphIndex> localSources,
             CompactionAuthorityMap authority,
             PersistentVectorStore.LiveGraphShard syntheticShard,
             AtomicInteger localOrdCounter) throws CompactionException {
 
-        for (VectorSegment seg : candidates) {
-            OnDiskGraphIndex odg = seg.onDiskGraph;
+        for (int s = 0; s < candidates.size(); s++) {
+            VectorSegment seg = candidates.get(s);
+            // Prefer the eagerly-downloaded local-file graph (issue #628);
+            // fall back to seg.onDiskGraph only when no local source was
+            // provided (legacy callers — currently none in production, but
+            // kept defensively so an unexpected null doesn't NPE here).
+            OnDiskGraphIndex odg = (localSources != null) ? localSources.get(s) : seg.onDiskGraph;
             if (odg == null) {
                 throw new CompactionException(FailureReason.CORRUPTION,
                         "candidate segment " + seg.segmentId + " has no on-disk graph");
@@ -1081,28 +1075,24 @@ final class VectorIndexCompactor {
             requireInlineVectorsFeature(seg.segmentId, odg.getFeatures());
         }
 
-        // Issue #543: OnDiskGraphIndexCompactor.validateFeatures() requires all
-        // source segments to have the same FeatureId keyset. If the candidates
-        // were written by different code paths (e.g. some above and some below
-        // MIN_VECTORS_FOR_FUSED_PQ) their feature sets can differ. Detect this
-        // before handing control to the compactor and fall back to the legacy
-        // rebuild path (which reconstructs the graph from raw vectors and does
-        // not require feature-set uniformity).
-        if (!allCandidatesHaveUniformFeatures(candidates)) {
-            LOGGER.log(Level.WARNING,
-                    "VectorIndexCompactor (streaming): detected heterogeneous feature"
-                            + " sets across {0} candidates — falling back to legacy rebuild",
-                    candidates.size());
-            return rebuildSegmentLegacy(store, candidates, authority, dim,
-                    keptCount, filteredCount);
-        }
-
         // -----------------------------------------------------------------------
-        // Step 1: Pre-download / eagerly open all source graph files (issue #602).
-        // Bypasses SegmentBlockCache / gRPC for the hot merge path — every read
-        // during OnDiskGraphIndexCompactor.compact() and writeStreamingCompactedMapFile
-        // comes from a local temp file (direct-download path) or a sequential
-        // reader copy, not from per-node block-cache round-trips.
+        // Step 1: Pre-download / eagerly open all source graph files
+        // (issues #602 + #628). Bypasses SegmentBlockCache / gRPC for the hot
+        // merge path — every read during OnDiskGraphIndexCompactor.compact() and
+        // writeStreamingCompactedMapFile comes from a local temp file
+        // (direct-download path) or a sequential reader copy, not from per-node
+        // block-cache round-trips.
+        //
+        // Issue #628: the eager download MUST run before the
+        // {@link #allCandidatesHaveUniformFeatures} guard below. If we deferred
+        // it, the heterogeneous-feature fallback (and the
+        // {@code localSources.size() < 2} fallback further down) would hand the
+        // legacy rebuild a list of {@code VectorSegment}s whose
+        // {@code seg.onDiskGraph} is backed by {@link RemoteRandomAccessReader}
+        // — every authoritative vector read would round-trip the block cache
+        // over gRPC. At 48M vectors / 123 segments this stalls Phase B for 4+
+        // hours (issue #628 evidence). Downloading first means both fallback
+        // paths receive the local-file-backed graphs and read from disk.
         // -----------------------------------------------------------------------
         DataStorageManager dsm = store.dataStorageManager();
         String tsUUID = store.tableSpaceUUID();
@@ -1205,6 +1195,29 @@ final class VectorIndexCompactor {
             }
 
             // -----------------------------------------------------------------------
+            // Issue #543: OnDiskGraphIndexCompactor.validateFeatures() requires all
+            // source segments to have the same FeatureId keyset. If the candidates
+            // were written by different code paths (e.g. some above and some below
+            // MIN_VECTORS_FOR_FUSED_PQ) their feature sets can differ. Detect this
+            // before handing control to the compactor and fall back to the legacy
+            // rebuild path (which reconstructs the graph from raw vectors and does
+            // not require feature-set uniformity).
+            //
+            // Issue #628: this guard moved from before the download loop to here so
+            // that the legacy fallback also reads from local-file-backed graphs
+            // (passed as {@code localSources}) instead of {@code seg.onDiskGraph}.
+            // -----------------------------------------------------------------------
+            if (!allCandidatesHaveUniformFeatures(candidates)) {
+                LOGGER.log(Level.WARNING,
+                        "VectorIndexCompactor (streaming): detected heterogeneous feature"
+                                + " sets across {0} candidates — falling back to legacy rebuild"
+                                + " (reading from eagerly-downloaded local graph files)",
+                        candidates.size());
+                return rebuildSegmentLegacy(store, candidates, localSources, authority,
+                        dim, keptCount, filteredCount);
+            }
+
+            // -----------------------------------------------------------------------
             // Step 2: Build per-source dense ordinal mappers using the local graphs.
             // -----------------------------------------------------------------------
             // Build per-source dense ordinal mappers so the merged segment occupies
@@ -1256,8 +1269,10 @@ final class VectorIndexCompactor {
                         "streaming compaction: only {0} candidate(s); falling back to legacy"
                                 + " in-memory rebuild (fallbackTotal={1})",
                         new Object[]{localSources.size(), STREAMING_FALLBACK_TO_LEGACY_TOTAL.get()});
-                return rebuildSegmentLegacy(store, candidates, authority, dim,
-                        keptCount, filteredCount);
+                // Issue #628: pass the eagerly-downloaded local graphs so the legacy
+                // rebuild reads from local files instead of seg.onDiskGraph.
+                return rebuildSegmentLegacy(store, candidates, localSources, authority,
+                        dim, keptCount, filteredCount);
             }
 
             // PQ reader factory: open a FRESH ReaderSupplier from the local temp file for
@@ -1708,18 +1723,50 @@ final class VectorIndexCompactor {
     }
 
     /**
-     * Legacy in-memory rebuild path. Identical to the body that previously
-     * lived inside {@link #rebuildSegment} prior to issue #485 — split out so
-     * the dispatcher can choose between streaming and legacy paths cleanly.
+     * Legacy in-memory rebuild path. Originally lived inside
+     * {@link #rebuildSegment} prior to issue #485; split out so the dispatcher
+     * could choose between streaming and legacy paths cleanly. After issue
+     * #628 (toggle removal), this path is reached only as the automatic
+     * fallback from {@link #rebuildSegmentStreaming} for the two cases
+     * jvector's {@code OnDiskGraphIndexCompactor} cannot serve:
+     * heterogeneous candidate feature sets, and fewer than two valid source
+     * graphs.
+     *
+     * @param localSources eagerly-downloaded local-file-backed
+     *                     {@link OnDiskGraphIndex} objects parallel to
+     *                     {@code candidates}. Vectors are read from these
+     *                     rather than from {@code seg.onDiskGraph} so the
+     *                     authoritative-vector loop in
+     *                     {@link #populateSyntheticShard} bypasses
+     *                     {@code SegmentBlockCache} + gRPC entirely. This
+     *                     argument must be non-null and the same length as
+     *                     {@code candidates}; the caller
+     *                     ({@code rebuildSegmentStreaming}) owns the temp-file
+     *                     and reader-supplier lifecycle and will close them
+     *                     in its outer {@code finally} after this method
+     *                     returns. Issue #628.
      */
     private static RebuildResult rebuildSegmentLegacy(
             PersistentVectorStore store,
             List<VectorSegment> candidates,
+            List<OnDiskGraphIndex> localSources,
             CompactionAuthorityMap authority,
             int dim,
             int keptCount,
             int filteredCount)
             throws CompactionException, IOException, DataStorageManagerException {
+
+        if (localSources == null || localSources.size() != candidates.size()) {
+            // Surface as CORRUPTION rather than asserting so a hypothetical
+            // caller mismatch fails the cycle, not the JVM. Must hold by
+            // construction — rebuildSegmentStreaming is the only caller and
+            // builds the two lists in lock-step.
+            throw new CompactionException(FailureReason.CORRUPTION,
+                    "rebuildSegmentLegacy: localSources size mismatch (candidates="
+                            + candidates.size()
+                            + ", localSources=" + (localSources == null ? "null" : localSources.size())
+                            + ")");
+        }
 
         List<String[]> orphans = new ArrayList<>();
 
@@ -1757,7 +1804,7 @@ final class VectorIndexCompactor {
         boolean success = false;
         VectorSegment mergedSegment = null;
         try {
-            populateSyntheticShard(store, candidates, authority, synthetic,
+            populateSyntheticShard(store, candidates, localSources, authority, synthetic,
                     localOrdCounter);
 
             try {

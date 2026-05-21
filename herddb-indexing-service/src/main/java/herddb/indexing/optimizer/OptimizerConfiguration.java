@@ -132,28 +132,6 @@ public final class OptimizerConfiguration {
     public static final String PROPERTY_EVENT_DEBOUNCE_MS = "indexoptimizer.event.debounce.ms";
     public static final long PROPERTY_EVENT_DEBOUNCE_MS_DEFAULT = 500L;
 
-    /**
-     * Streaming compaction (issue #485). When {@code true}, the optimizer
-     * pod drives the merge through jvector's
-     * {@code OnDiskGraphIndexCompactor} (memory bounded by
-     * {@code O(taskWindowSize × maxDegree × float[dim])}); when {@code
-     * false}, the legacy in-memory {@code GraphIndexBuilder} rebuild path
-     * is used instead.
-     *
-     * <p>The optimizer pod runs in a separate process from the IS, so the
-     * IS-side config key {@code vector.index.compaction.streaming.enabled}
-     * does NOT reach this pod. Operators must set this key on the
-     * optimizer's own configuration to honor the escape hatch on the
-     * optimizer side (the IS-local path obeys the IS-side key
-     * independently). Default {@code true}; the JVM system property
-     * {@code herddb.vectorindex.streamingCompactionEnabled} is consumed
-     * as the static initializer for the underlying flag — this config
-     * key takes precedence at {@code IndexOptimizerMain.start()}.
-     */
-    public static final String PROPERTY_MERGE_STREAMING_ENABLED =
-            "indexoptimizer.merge.streaming.enabled";
-    public static final boolean PROPERTY_MERGE_STREAMING_ENABLED_DEFAULT = true;
-
     // -------------------------------------------------------------------------
     // Remote file service client (issue #484: merger needs a DataStorageManager
     // pointing at remote storage to download/upload segment files). The

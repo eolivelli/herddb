@@ -118,39 +118,6 @@ public class IndexingServerConfigurationTest {
                 IndexingServerConfiguration.PROPERTY_WATERMARK_CHECKPOINT_INTERVAL_ENTRIES_DEFAULT));
     }
 
-    /**
-     * Issue #485 (PR #494): the streaming-compaction config key on the IS
-     * side. Locks in the constant name (so a rename breaks the build, not a
-     * silent operator-config drift) and the documented default
-     * ({@code true}). The wiring through {@code IndexingServiceEngine.start()}
-     * to {@code PersistentVectorStore.setStreamingCompactionEnabled(...)}
-     * is exercised end-to-end by the existing integration tests that drive
-     * the engine's start path.
-     */
-    @Test
-    public void streamingCompactionConfigKeyIsDocumentedAndDefaultsToTrue() {
-        // Constant exists with the wire-format key documented in VECTOR.md.
-        assertEquals("vector.index.compaction.streaming.enabled",
-                IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_STREAMING_ENABLED);
-        // Default is true (streaming is the production default for issue #485).
-        assertTrue(IndexingServerConfiguration
-                .PROPERTY_VECTOR_INDEX_COMPACTION_STREAMING_ENABLED_DEFAULT);
-
-        // Round-trip through getBoolean (operator can flip it at runtime).
-        IndexingServerConfiguration config = new IndexingServerConfiguration();
-        assertTrue(config.getBoolean(
-                IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_STREAMING_ENABLED,
-                IndexingServerConfiguration
-                        .PROPERTY_VECTOR_INDEX_COMPACTION_STREAMING_ENABLED_DEFAULT));
-        config.set(
-                IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_STREAMING_ENABLED,
-                false);
-        assertFalse(config.getBoolean(
-                IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_STREAMING_ENABLED,
-                IndexingServerConfiguration
-                        .PROPERTY_VECTOR_INDEX_COMPACTION_STREAMING_ENABLED_DEFAULT));
-    }
-
     @Test
     public void testBooleanGetterSetter() {
         IndexingServerConfiguration config = new IndexingServerConfiguration();

@@ -65,21 +65,17 @@ public class StreamingCompactionBatchProgressTest {
     @Rule
     public TemporaryFolder tmpFolder = new TemporaryFolder();
 
-    private boolean savedStreamingFlag;
     private int savedMinLiveVectors;
 
     @Before
     public void setUp() {
         savedMinLiveVectors = PersistentVectorStore.minLiveVectorsForCheckpoint;
         PersistentVectorStore.minLiveVectorsForCheckpoint = 0;
-        savedStreamingFlag = VectorIndexCompactor.streamingCompactionEnabled;
-        VectorIndexCompactor.streamingCompactionEnabled = true;
     }
 
     @After
     public void tearDown() {
         PersistentVectorStore.minLiveVectorsForCheckpoint = savedMinLiveVectors;
-        VectorIndexCompactor.streamingCompactionEnabled = savedStreamingFlag;
     }
 
     private static float[] vec(Random rng, int dim) {

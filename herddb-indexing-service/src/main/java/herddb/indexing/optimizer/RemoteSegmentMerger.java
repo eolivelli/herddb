@@ -238,23 +238,19 @@ public final class RemoteSegmentMerger implements SegmentMerger {
                                 + " skipping merge until IS recheckpoints the segment");
             }
             long mapFileSizeHint = m.getMapFileSize();
-            // Issue #485: derive graphFileSize from the existing znode fields
-            // (sizeBytes = graphFileSize + mapFileSize per
+            // Derive graphFileSize from the existing znode fields (sizeBytes =
+            // graphFileSize + mapFileSize per
             // PersistentVectorStore.SegmentWriteResult). The streaming merge
             // path needs the exact graph size to drive the multipart reader;
-            // the legacy in-memory path ignores it. Compute and pass through
-            // unconditionally — the dispatcher in RemoteSegmentGraphMerger.merge
-            // chooses the path.
-            long graphFileSizeHint = m.getSizeBytes() - m.getMapFileSize();
-            if (graphFileSizeHint <= 0L) {
-                throw new LegacyMetadataException(m.getSegmentUuid(),
-                        m.getSizeBytes(),
-                        "input segment " + m.getSegmentUuid() + " has invalid"
-                                + " graphFileSize=" + graphFileSizeHint
-                                + " (sizeBytes=" + m.getSizeBytes()
-                                + " mapFileSize=" + m.getMapFileSize()
-                                + "); skipping merge until IS recheckpoints the segment");
-            }
+            // the legacy in-memory rebuild ignores it. When the derived value
+            // is non-positive — e.g. a znode that predates the per-file size
+            // split, or a partial upload that left sizeBytes == mapFileSize —
+            // pass 0 through. The dispatcher in
+            // {@code RemoteSegmentGraphMerger.merge} then routes the cycle to
+            // the legacy in-memory rebuild via its {@code allInputsHaveGraphFileSize}
+            // check, which doesn't read the graph file at all.
+            long derivedGraphFileSize = m.getSizeBytes() - m.getMapFileSize();
+            long graphFileSizeHint = derivedGraphFileSize > 0L ? derivedGraphFileSize : 0L;
             graphInputs.add(new RemoteSegmentGraphMerger.RemoteSegmentInput(
                     m.getTablespaceUuid(), m.getIndexUuid(), m.getSegmentUuid(),
                     m.getSegmentId(), mapFileSizeHint, graphFileSizeHint, m.getGeneration(),

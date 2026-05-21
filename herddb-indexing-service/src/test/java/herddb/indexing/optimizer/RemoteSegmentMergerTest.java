@@ -79,25 +79,17 @@ public class RemoteSegmentMergerTest {
 
     private MemoryDataStorageManager dsm;
     private Path tmpDir;
-    private boolean savedStreamingFlag;
 
     @Before
     public void setUp() throws Exception {
         dsm = new MemoryDataStorageManager();
         tmpDir = tmp.newFolder("merger-tmp").toPath();
-        // Issue #485: this suite produces synthetic inputs with only a map
-        // file (no real graph file) and arbitrary sizeBytes, so it can only
-        // be exercised via the legacy in-memory rebuild. The streaming path
-        // (default-on as of issue #485) requires a real graph multipart file
-        // per input. Force the legacy path here; streaming coverage lives in
-        // RemoteSegmentMergerStreamingTest, which produces real graph files.
-        savedStreamingFlag = herddb.indexing.vector.PersistentVectorStore.isStreamingCompactionEnabled();
-        herddb.indexing.vector.PersistentVectorStore.setStreamingCompactionEnabled(false);
-    }
-
-    @org.junit.After
-    public void tearDown() {
-        herddb.indexing.vector.PersistentVectorStore.setStreamingCompactionEnabled(savedStreamingFlag);
+        // This suite produces synthetic inputs with only a map file (no real
+        // graph file). The streaming dispatch in {@code RemoteSegmentGraphMerger}
+        // requires a real graph multipart file per input ({@code graphFileSize > 0});
+        // without one it automatically routes to the legacy in-memory rebuild
+        // path. No explicit flag flip is needed — the absent graph file is
+        // itself the route.
     }
 
     private SegmentMetadata writeInputSegmentToDsm(String uuid, long segmentId,
@@ -140,7 +132,8 @@ public class RemoteSegmentMergerTest {
                 .graphPath("g/" + uuid)
                 .mapPath(mapPath)
                 .baseLsn(new LogSequenceNumber(1L, 100L * generation))
-                .sizeBytes(mapSize * 2L)  // arbitrary — not consulted by the merger
+                .sizeBytes(mapSize)  // == mapFileSize → derived graphFileSize == 0
+                // forces RemoteSegmentGraphMerger.merge into mergeLegacy
                 .mapFileSize(mapSize)
                 .vectorCount(VECTORS_PER_SEGMENT)
                 .generation(generation)

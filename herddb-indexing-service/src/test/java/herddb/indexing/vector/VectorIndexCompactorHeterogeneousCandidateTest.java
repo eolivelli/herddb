@@ -50,19 +50,14 @@ public class VectorIndexCompactorHeterogeneousCandidateTest {
     @Rule
     public TemporaryFolder tmpFolder = new TemporaryFolder();
 
-    private boolean savedStreamingFlag;
-
     @Before
     public void setUp() {
         PersistentVectorStore.minLiveVectorsForCheckpoint = 0;
-        savedStreamingFlag = VectorIndexCompactor.streamingCompactionEnabled;
-        VectorIndexCompactor.streamingCompactionEnabled = true;
     }
 
     @After
     public void tearDown() {
         PersistentVectorStore.minLiveVectorsForCheckpoint = 50_000;
-        VectorIndexCompactor.streamingCompactionEnabled = savedStreamingFlag;
     }
 
     private static float[] vec(Random rng, int dim) {

@@ -57,24 +57,15 @@ public class Issue256CompactionReleaseTest {
     @Rule
     public TemporaryFolder tmpFolder = new TemporaryFolder();
 
-    private boolean savedStreamingFlag;
-
     @Before
     public void disableDeferral() {
         PersistentVectorStore.minLiveVectorsForCheckpoint = 0;
-        // The synthetic-shard reclamation invariant only exists on the legacy
-        // in-memory rebuild path. The streaming path (issue #485) doesn't
-        // construct a LiveGraphShard at all, so its observer never fires.
-        // Force the legacy path for this suite.
-        savedStreamingFlag = VectorIndexCompactor.streamingCompactionEnabled;
-        VectorIndexCompactor.streamingCompactionEnabled = false;
     }
 
     @After
     public void tearDown() {
         PersistentVectorStore.minLiveVectorsForCheckpoint = 50_000;
         VectorIndexCompactor.syntheticShardObserverForTest = null;
-        VectorIndexCompactor.streamingCompactionEnabled = savedStreamingFlag;
     }
 
     private static float[] vec(Random rng, int dim) {
@@ -96,15 +87,33 @@ public class Issue256CompactionReleaseTest {
         return store;
     }
 
+    /**
+     * Seeds five segments with {@em heterogeneous} feature sets so the
+     * streaming compactor's {@code allCandidatesHaveUniformFeatures} guard
+     * sends control to the legacy in-memory rebuild — the path whose
+     * synthetic-shard reclamation contract this test class exists to lock
+     * in. Four small checkpoints stay below
+     * {@code MIN_VECTORS_FOR_FUSED_PQ} (InlineVectors only); one large
+     * checkpoint produces a FusedPQ + InlineVectors segment. Together they
+     * form a 5-segment mix that compaction picks up wholesale.
+     */
     private void seedFiveSegments(PersistentVectorStore store) throws Exception {
         Random rng = new Random(1);
         int dim = 16;
-        for (int c = 0; c < 5; c++) {
-            for (int i = 0; i < 300; i++) {
+        // Four small segments (InlineVectors only).
+        for (int c = 0; c < 4; c++) {
+            for (int i = 0; i < 30; i++) {
                 store.addVector(Bytes.from_int(c * 10_000 + i), vec(rng, dim));
             }
             store.checkpoint();
         }
+        // One large segment (FusedPQ + InlineVectors) so the candidate set is
+        // heterogeneous — required to route compaction through the legacy path
+        // after the {@code streamingCompactionEnabled} toggle was removed.
+        for (int i = 0; i < PersistentVectorStore.MIN_VECTORS_FOR_FUSED_PQ; i++) {
+            store.addVector(Bytes.from_int(4 * 10_000 + i), vec(rng, dim));
+        }
+        store.checkpoint();
         assertTrue(store.getSegmentCount() >= 4);
     }
 

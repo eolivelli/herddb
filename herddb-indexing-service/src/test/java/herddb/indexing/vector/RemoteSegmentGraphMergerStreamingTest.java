@@ -75,20 +75,16 @@ public class RemoteSegmentGraphMergerStreamingTest {
     @Rule
     public TemporaryFolder tmpFolder = new TemporaryFolder();
 
-    private boolean savedStreamingFlag;
-
     @Before
     public void setUp() {
         // Streaming-compaction tests need the in-memory checkpoint deferral
         // gate disabled so small per-checkpoint shards are flushed.
         PersistentVectorStore.minLiveVectorsForCheckpoint = 0;
-        savedStreamingFlag = VectorIndexCompactor.streamingCompactionEnabled;
     }
 
     @After
     public void tearDown() {
         PersistentVectorStore.minLiveVectorsForCheckpoint = 50_000;
-        VectorIndexCompactor.streamingCompactionEnabled = savedStreamingFlag;
     }
 
     private static float[] vec(Random rng, int dim) {
@@ -210,7 +206,6 @@ public class RemoteSegmentGraphMergerStreamingTest {
 
     @Test
     public void streamingMergeProducesValidOnDiskGraphAndMatchingPkSet() throws Exception {
-        VectorIndexCompactor.streamingCompactionEnabled = true;
         int dim = 16;
         Path tmpDir = tmpFolder.newFolder().toPath();
         MemoryDataStorageManager dsm = new MemoryDataStorageManager();
@@ -273,54 +268,7 @@ public class RemoteSegmentGraphMergerStreamingTest {
     }
 
     @Test
-    public void legacyAndStreamingProduceSameSurvivingPkSet() throws Exception {
-        // Build TWO independent fixtures (one per path) so the legacy
-        // multipart files don't collide with the streaming ones.
-        int dim = 16;
-        Path tmpDirA = tmpFolder.newFolder().toPath();
-        Path tmpDirB = tmpFolder.newFolder().toPath();
-        MemoryDataStorageManager dsmA = new MemoryDataStorageManager();
-        MemoryDataStorageManager dsmB = new MemoryDataStorageManager();
-        List<Bytes> insertedA = new ArrayList<>();
-        List<Bytes> insertedB = new ArrayList<>();
-        List<RemoteSegmentGraphMerger.RemoteSegmentInput> inputsA =
-                buildInputs(tmpDirA, dsmA, dim, 2, 150, 9L, insertedA);
-        List<RemoteSegmentGraphMerger.RemoteSegmentInput> inputsB =
-                buildInputs(tmpDirB, dsmB, dim, 2, 150, 9L, insertedB);
-
-        // The two fixtures use the same seed so the PK sets are identical.
-        assertEquals(new HashSet<>(insertedA), new HashSet<>(insertedB));
-
-        RemoteSegmentGraphMerger mergerA = new RemoteSegmentGraphMerger(
-                dsmA, tmpDirA, 16, 100, 1.2f, 1.4f, VectorSimilarityFunction.COSINE);
-        RemoteSegmentGraphMerger mergerB = new RemoteSegmentGraphMerger(
-                dsmB, tmpDirB, 16, 100, 1.2f, 1.4f, VectorSimilarityFunction.COSINE);
-
-        // Streaming path
-        VectorIndexCompactor.streamingCompactionEnabled = true;
-        RemoteSegmentGraphMerger.MergeOutput streamingOut = mergerA.merge(
-                inputsA, "tsuuid", inputsA.get(0).indexUuid, 4242L, dim);
-        assertNotNull(streamingOut);
-        Set<Bytes> streamingPks = readPksFromMapMultipart(dsmA, "tsuuid",
-                inputsA.get(0).indexUuid + "_seg" + 4242L, streamingOut.mapFileSize, dim);
-
-        // Legacy path
-        VectorIndexCompactor.streamingCompactionEnabled = false;
-        RemoteSegmentGraphMerger.MergeOutput legacyOut = mergerB.merge(
-                inputsB, "tsuuid", inputsB.get(0).indexUuid, 4242L, dim);
-        assertNotNull(legacyOut);
-        Set<Bytes> legacyPks = readPksFromMapMultipart(dsmB, "tsuuid",
-                inputsB.get(0).indexUuid + "_seg" + 4242L, legacyOut.mapFileSize, dim);
-
-        // Parity: same surviving PK set across paths.
-        assertEquals(streamingPks, legacyPks);
-        // Both must equal the ground-truth inserted set.
-        assertEquals(new HashSet<>(insertedA), streamingPks);
-    }
-
-    @Test
     public void streamingDispatchFallsBackToLegacyOnZeroGraphFileSize() throws Exception {
-        VectorIndexCompactor.streamingCompactionEnabled = true;
         int dim = 16;
         Path tmpDir = tmpFolder.newFolder().toPath();
         MemoryDataStorageManager dsm = new MemoryDataStorageManager();
@@ -361,7 +309,6 @@ public class RemoteSegmentGraphMergerStreamingTest {
     @Test
     public void emptyAuthorityReturnsNullOnStreamingPath() throws Exception {
         // Build 2 segments + tombstone every PK to force authority.isEmpty() == true.
-        VectorIndexCompactor.streamingCompactionEnabled = true;
         int dim = 16;
         Path tmpDir = tmpFolder.newFolder().toPath();
         MemoryDataStorageManager dsm = new MemoryDataStorageManager();

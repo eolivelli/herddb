@@ -83,28 +83,18 @@ public class RemoteSegmentMergerLegacyMapFileSizeTest {
 
     private MemoryDataStorageManager dsm;
     private Path tmpDir;
-    private boolean savedStreamingFlag;
 
     @Before
     public void setUp() throws Exception {
         dsm = new MemoryDataStorageManager();
         tmpDir = tmp.newFolder("merger-tmp").toPath();
-        // Issue #485: this suite uses synthetic inputs with only a fake map
-        // file (no real graph multipart object). The streaming compaction
-        // path (default-on per issue #485) requires a real graph file per
-        // input, so this suite can only be exercised via the legacy
-        // in-memory rebuild. Force the legacy path; streaming coverage
-        // lives in RemoteSegmentGraphMergerStreamingTest, which produces
-        // real graphs via PersistentVectorStore.
-        savedStreamingFlag =
-                herddb.indexing.vector.PersistentVectorStore.isStreamingCompactionEnabled();
-        herddb.indexing.vector.PersistentVectorStore.setStreamingCompactionEnabled(false);
-    }
-
-    @org.junit.After
-    public void tearDown() {
-        herddb.indexing.vector.PersistentVectorStore.setStreamingCompactionEnabled(
-                savedStreamingFlag);
+        // Synthetic inputs carry only a fake map file (no real graph
+        // multipart object). The streaming dispatch in
+        // {@code RemoteSegmentGraphMerger.merge} automatically routes to
+        // {@code mergeLegacy} when {@code graphFileSize <= 0} for any input,
+        // so this suite hits the legacy path without any explicit toggle.
+        // Streaming coverage lives in {@code RemoteSegmentGraphMergerStreamingTest},
+        // which produces real graphs via {@code PersistentVectorStore}.
     }
 
     private SegmentMetadata writeLegacyInput(String segUuid, long segId, int seed) throws Exception {
@@ -218,7 +208,9 @@ public class RemoteSegmentMergerLegacyMapFileSizeTest {
                 .ownerInstanceId(0).segmentId(500L)
                 .graphPath("g").mapPath("m")
                 .baseLsn(new LogSequenceNumber(1L, 100L))
-                .sizeBytes(2048L)
+                // sizeBytes == mapFileSize → derived graphFileSize == 0
+                // forces RemoteSegmentGraphMerger.merge into mergeLegacy
+                .sizeBytes(1024L)
                 .mapFileSize(1024L) // far larger than the 16-byte real file
                 .vectorCount(1L).generation(1L)
                 .createdAtEpochMillis(0L)
@@ -229,7 +221,9 @@ public class RemoteSegmentMergerLegacyMapFileSizeTest {
                 .ownerInstanceId(0).segmentId(600L)
                 .graphPath("g").mapPath("m")
                 .baseLsn(new LogSequenceNumber(1L, 100L))
-                .sizeBytes(2048L)
+                // sizeBytes == mapFileSize → derived graphFileSize == 0
+                // forces RemoteSegmentGraphMerger.merge into mergeLegacy
+                .sizeBytes(1024L)
                 .mapFileSize(1024L)
                 .vectorCount(1L).generation(2L)
                 .createdAtEpochMillis(0L)
@@ -307,7 +301,9 @@ public class RemoteSegmentMergerLegacyMapFileSizeTest {
                 .ownerInstanceId(0).segmentId(300L)
                 .graphPath("g").mapPath("m")
                 .baseLsn(new LogSequenceNumber(1L, 100L))
-                .sizeBytes(realSize * 4L)
+                // sizeBytes == mapFileSize → derived graphFileSize == 0
+                // forces RemoteSegmentGraphMerger.merge into mergeLegacy
+                .sizeBytes(realSize)
                 .mapFileSize(realSize)
                 .vectorCount(10L).generation(1L)
                 .createdAtEpochMillis(0L)
@@ -338,7 +334,9 @@ public class RemoteSegmentMergerLegacyMapFileSizeTest {
                 .ownerInstanceId(0).segmentId(400L)
                 .graphPath("g").mapPath("m")
                 .baseLsn(new LogSequenceNumber(1L, 100L))
-                .sizeBytes(realSizeB * 4L)
+                // sizeBytes == mapFileSize → derived graphFileSize == 0
+                // forces RemoteSegmentGraphMerger.merge into mergeLegacy
+                .sizeBytes(realSizeB)
                 .mapFileSize(realSizeB)
                 .vectorCount(10L).generation(2L)
                 .createdAtEpochMillis(0L)
