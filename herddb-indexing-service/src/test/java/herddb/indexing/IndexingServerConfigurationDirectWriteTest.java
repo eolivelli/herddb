@@ -20,7 +20,7 @@
 package herddb.indexing;
 
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.assertFalse;
 import java.util.Properties;
 import org.junit.Test;
 
@@ -34,15 +34,17 @@ public class IndexingServerConfigurationDirectWriteTest {
 
     /**
      * The flag key and default are documented in {@code IndexingServerConfiguration}
-     * and referenced in the Helm chart. Default is {@code true} so existing
-     * deployments that already have direct-read enabled get direct-write for
-     * free on upgrade — that is the rollout shape the issue called for.
+     * and referenced in the Helm chart. Default is {@code false} for the initial
+     * release so that existing IS pods with direct-read enabled are not silently
+     * switched to the new bulk write format on upgrade. Operators opt in explicitly
+     * by setting {@code indexing.s3.direct.write.enabled=true} once they have
+     * verified the bulk path in their environment.
      */
     @Test
     public void directWriteEnabledKeyAndDefault() {
         assertEquals("indexing.s3.direct.write.enabled",
                 IndexingServerConfiguration.PROPERTY_S3_DIRECT_WRITE_ENABLED);
-        assertTrue("default must be true",
+        assertFalse("default must be false (safe rollout: opt-in, not opt-out)",
                 IndexingServerConfiguration.PROPERTY_S3_DIRECT_WRITE_ENABLED_DEFAULT);
     }
 

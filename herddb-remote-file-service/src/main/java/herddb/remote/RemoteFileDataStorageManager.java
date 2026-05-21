@@ -118,6 +118,9 @@ public class RemoteFileDataStorageManager extends DataStorageManager
      * via the S3 Multipart Upload API (driven by {@code S3TransferManager}),
      * bypassing the gRPC file-server hop. Symmetric to the
      * {@link #directObjectStorage} read-side flag.
+     *
+     * <p>Set via {@link #enableDirectUpload(long)} at startup only. Calling
+     * {@link #enableDirectUpload(long)} while uploads are in flight is unsafe.
      */
     private volatile boolean directUploadEnabled;
 
@@ -213,6 +216,13 @@ public class RemoteFileDataStorageManager extends DataStorageManager
         if (maxInflightBytes <= 0L) {
             throw new IllegalArgumentException(
                     "maxInflightBytes must be > 0, got " + maxInflightBytes);
+        }
+        // Idempotency: if already enabled with the same cap, skip re-initialisation
+        // to avoid discarding an existing semaphore that has outstanding permits.
+        // Re-invocation with a different cap is only safe at startup (before any
+        // upload has been dispatched).
+        if (directUploadEnabled && maxInflightBytes == this.maxDirectInflightUploadBytes) {
+            return;
         }
         // Cap to Integer.MAX_VALUE because Semaphore counts permits as int.
         int permits = (int) Math.min(maxInflightBytes, Integer.MAX_VALUE);
@@ -1275,7 +1285,7 @@ public class RemoteFileDataStorageManager extends DataStorageManager
      * payload exceeds the semaphore's total capacity we acquire up to the
      * cap (smaller concurrent uploads can interleave between chunks).
      */
-    private Runnable reserveDirectInflightUploadBytes(long bytes) {
+    private Runnable reserveDirectInflightUploadBytes(long bytes) throws IOException {
         java.util.concurrent.Semaphore s = this.directInflightUploadBytes;
         if (s == null) {
             // disableDirectUpload() raced with the upload — return a no-op
@@ -1298,7 +1308,26 @@ public class RemoteFileDataStorageManager extends DataStorageManager
                     new Object[]{toAcquire, s.availablePermits(),
                             this.maxDirectInflightUploadBytes});
             long startNanos = System.nanoTime();
-            s.acquireUninterruptibly(toAcquire);
+            // Bounded wait (10 min). A stuck TM future (CRT bug, network partition)
+            // would otherwise stall every subsequent direct upload silently forever.
+            // 10 min is generous enough for any realistic multipart upload.
+            try {
+                boolean acquired = s.tryAcquire(toAcquire, 10L,
+                        java.util.concurrent.TimeUnit.MINUTES);
+                if (!acquired) {
+                    throw new IOException(
+                            "direct-upload inflight semaphore timed out after 10 minutes "
+                                    + "(requested=" + toAcquire + " bytes, available="
+                                    + s.availablePermits() + "/"
+                                    + this.maxDirectInflightUploadBytes
+                                    + "). Consider raising "
+                                    + "indexing.remote.file.client.max.inflight.direct.write.bytes.");
+                }
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                throw new IOException(
+                        "Interrupted while waiting for direct-upload inflight semaphore", ie);
+            }
             long elapsedMs = java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(
                     System.nanoTime() - startNanos);
             if (elapsedMs >= 50L) {
@@ -1397,7 +1426,7 @@ public class RemoteFileDataStorageManager extends DataStorageManager
         try {
             present = Boolean.TRUE.equals(
                     storage.existsObject(logicalPath + BULK_LAYOUT_SUFFIX).get(
-                            60L, java.util.concurrent.TimeUnit.SECONDS));
+                            15L, java.util.concurrent.TimeUnit.SECONDS));
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
             return false;
@@ -1417,7 +1446,21 @@ public class RemoteFileDataStorageManager extends DataStorageManager
                     new Object[]{logicalPath, probeErr.toString()});
             return false;
         }
-        bulkLayoutCache.put(logicalPath, present);
+        // Only cache positive results. Caching false permanently would pin
+        // a logical path as "not bulk" for the entire JVM lifetime, causing
+        // read failures in two scenarios:
+        //   (1) A writer removes the cache entry (before upload) and a
+        //       concurrent probe fires a HEAD that returns false (upload still
+        //       in flight). If we cached that false, a subsequent put(TRUE) from
+        //       the writer would race against our stale put(false), and whichever
+        //       wins last pins the wrong state.
+        //   (2) A legacy path later rewritten in bulk format (by another pod or
+        //       after restart) would remain permanently invisible until JVM restart.
+        // The cost is one extra HEAD per cold read on non-bulk paths — acceptable
+        // given that probes are cheap and uploads are not.
+        if (present) {
+            bulkLayoutCache.put(logicalPath, Boolean.TRUE);
+        }
         return present;
     }
 
@@ -1553,7 +1596,7 @@ public class RemoteFileDataStorageManager extends DataStorageManager
         if (storage != null) {
             try {
                 storage.delete(logicalPath + BULK_LAYOUT_SUFFIX)
-                        .get(60L, java.util.concurrent.TimeUnit.SECONDS);
+                        .get(15L, java.util.concurrent.TimeUnit.SECONDS);
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
                 LOGGER.log(Level.WARNING,

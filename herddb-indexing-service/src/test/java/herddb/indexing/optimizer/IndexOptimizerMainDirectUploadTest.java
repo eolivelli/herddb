@@ -69,28 +69,59 @@ public class IndexOptimizerMainDirectUploadTest {
     }
 
     /**
-     * With direct read enabled AND direct write enabled (the default), the
-     * optimizer must call both {@code setDirectObjectStorage} (read path)
-     * and {@code enableDirectUpload(...)} (write path, issue #638) on the
-     * DSM.
+     * With direct read enabled but {@code indexoptimizer.s3.direct.write.enabled}
+     * not set, the optimizer must NOT call {@code enableDirectUpload} because the
+     * default is {@code false} (safe rollout: operators opt in explicitly). The
+     * read setter ({@code setDirectObjectStorage}) is still called.
      */
     @Test
-    public void enablesDirectUploadWhenWriteFlagDefault() throws Exception {
+    public void skipsDirectUploadWhenWriteFlagDefault() throws Exception {
         Properties p = new Properties();
         p.setProperty(OptimizerConfiguration.PROPERTY_S3_DIRECT_ENABLED, "true");
-        // PROPERTY_S3_DIRECT_WRITE_ENABLED defaults to true (issue #638).
+        // PROPERTY_S3_DIRECT_WRITE_ENABLED defaults to false (safe rollout opt-in).
         p.setProperty(OptimizerConfiguration.PROPERTY_S3_BUCKET, "test-bucket");
         OptimizerConfiguration cfg = configWith(p);
 
         RecordingDsm dsm = newRecordingDsm();
-        // We need env vars for the helper to reach the upload-enable step
-        // — exercise the inner pure path directly so the test is hermetic.
         ObjectStorage storage = IndexOptimizerMain.buildDirectS3ObjectStorage(
                 cfg, "ak", "sk");
         try {
             dsm.setDirectObjectStorage(storage);
-            // Mimic the IndexOptimizerMain.maybeEnableDirectS3 flow that
-            // happens immediately after setDirectObjectStorage.
+            boolean directWriteEnabled = cfg.getBoolean(
+                    OptimizerConfiguration.PROPERTY_S3_DIRECT_WRITE_ENABLED,
+                    OptimizerConfiguration.PROPERTY_S3_DIRECT_WRITE_ENABLED_DEFAULT);
+            if (directWriteEnabled) {
+                dsm.enableDirectUpload(1L);
+            }
+
+            assertFalse("direct write must be disabled by default (opt-in)", directWriteEnabled);
+            assertEquals("enableDirectUpload must NOT be called when write flag is default-false",
+                    0, dsm.enableCalls);
+            assertFalse("supportsDirectMultipartUpload must be false when write flag is off",
+                    dsm.supportsDirectMultipartUpload());
+        } finally {
+            tryClose(dsm);
+        }
+    }
+
+    /**
+     * With direct read enabled AND {@code indexoptimizer.s3.direct.write.enabled=true}
+     * set explicitly, the optimizer must call both {@code setDirectObjectStorage} (read
+     * path) and {@code enableDirectUpload(...)} (write path, issue #638) on the DSM.
+     */
+    @Test
+    public void enablesDirectUploadWhenWriteFlagExplicitTrue() throws Exception {
+        Properties p = new Properties();
+        p.setProperty(OptimizerConfiguration.PROPERTY_S3_DIRECT_ENABLED, "true");
+        p.setProperty(OptimizerConfiguration.PROPERTY_S3_DIRECT_WRITE_ENABLED, "true");
+        p.setProperty(OptimizerConfiguration.PROPERTY_S3_BUCKET, "test-bucket");
+        OptimizerConfiguration cfg = configWith(p);
+
+        RecordingDsm dsm = newRecordingDsm();
+        ObjectStorage storage = IndexOptimizerMain.buildDirectS3ObjectStorage(
+                cfg, "ak", "sk");
+        try {
+            dsm.setDirectObjectStorage(storage);
             boolean directWriteEnabled = cfg.getBoolean(
                     OptimizerConfiguration.PROPERTY_S3_DIRECT_WRITE_ENABLED,
                     OptimizerConfiguration.PROPERTY_S3_DIRECT_WRITE_ENABLED_DEFAULT);
@@ -100,7 +131,7 @@ public class IndexOptimizerMainDirectUploadTest {
                     OptimizerConfiguration
                             .PROPERTY_REMOTE_FILE_CLIENT_MAX_INFLIGHT_DIRECT_WRITE_BYTES_DEFAULT);
 
-            assertTrue("direct write enabled by default", directWriteEnabled);
+            assertTrue("direct write enabled by explicit flag", directWriteEnabled);
             if (directWriteEnabled) {
                 dsm.enableDirectUpload(maxInflight);
             }
@@ -196,18 +227,17 @@ public class IndexOptimizerMainDirectUploadTest {
      * path added in issue #638.
      */
     @Test
-    public void maybeEnableDirectS3_endToEnd_callsBothSetters() throws Exception {
-        // Skip the test if we cannot set environment variables in this
-        // JVM (true on most JVMs without a back-door). The pure builder
-        // path is already covered by the other tests in this class.
+    public void maybeEnableDirectS3_endToEnd_callsBothSettersWhenWriteExplicitTrue()
+            throws Exception {
+        // This test exercises the full sequence with direct write explicitly enabled.
+        // With default=false, we must set the flag explicitly to prove both setters
+        // fire when the operator opts in.
         Properties p = new Properties();
         p.setProperty(OptimizerConfiguration.PROPERTY_S3_DIRECT_ENABLED, "true");
+        p.setProperty(OptimizerConfiguration.PROPERTY_S3_DIRECT_WRITE_ENABLED, "true");
         p.setProperty(OptimizerConfiguration.PROPERTY_S3_BUCKET, "test-bucket");
         OptimizerConfiguration cfg = configWith(p);
 
-        // We can't reliably set System env vars in a portable way from
-        // a unit test. Instead, exercise the direct sequence the public
-        // helper performs once both env vars are present.
         ObjectStorage storage = IndexOptimizerMain.buildDirectS3ObjectStorage(
                 cfg, "envAk", "envSk");
         RecordingDsm dsm = newRecordingDsm();
@@ -229,7 +259,8 @@ public class IndexOptimizerMainDirectUploadTest {
             if (directWriteEnabled) {
                 dsm.enableDirectUpload(maxInflight);
             }
-            assertEquals(1, dsm.enableCalls);
+            assertEquals("both read and write setters must fire when write flag is true",
+                    1, dsm.enableCalls);
             assertTrue(dsm.supportsDirectMultipartUpload());
             assertNotNull("storage must have been attached", dsm.lastAttachedStorage);
         } finally {

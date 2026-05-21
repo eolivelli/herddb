@@ -165,11 +165,13 @@ public class S3DirectBulkUploadIT {
         // Confirm the bulk object exists.
         assertTrue("bulk object must exist after uploadFile",
                 storage.existsObject(objectKey).get());
-        // Confirm NO per-block keys were created — bulk layout is single-object.
+        // Confirm exactly one S3 object was created — bulk layout is single-object,
+        // with no per-block layout siblings. Using size()==1 catches any future
+        // regression that writes extra keys regardless of naming convention.
         List<String> all = storage.list("ts/uuid-bulk/multipart/").get();
-        assertFalse("no .multipart/{i} per-block keys must exist in bulk layout",
-                all.stream().anyMatch(k -> k.contains(".multipart/")
-                        && k.endsWith("/0")));
+        assertEquals("exactly one S3 object must exist for the bulk layout", 1, all.size());
+        assertEquals("the single object must be the expected bulk key",
+                objectKey, all.get(0));
 
         Path dest = tmpFolder.newFile("dst.bin").toPath();
         storage.downloadFileBulk(objectKey, dest).get();

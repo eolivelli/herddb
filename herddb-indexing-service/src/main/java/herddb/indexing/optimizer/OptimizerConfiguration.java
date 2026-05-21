@@ -253,7 +253,12 @@ public final class OptimizerConfiguration {
      */
     public static final String PROPERTY_S3_DIRECT_WRITE_ENABLED =
             "indexoptimizer.s3.direct.write.enabled";
-    public static final boolean PROPERTY_S3_DIRECT_WRITE_ENABLED_DEFAULT = true;
+    /**
+     * Default is {@code false} for the initial release — mirrors the IS-server
+     * flag policy. Enable explicitly after verifying the bulk upload path in
+     * your environment.
+     */
+    public static final boolean PROPERTY_S3_DIRECT_WRITE_ENABLED_DEFAULT = false;
 
     /**
      * Issue #638: maximum number of bytes that may be in flight across

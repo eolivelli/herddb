@@ -23,7 +23,6 @@ package herddb.remote;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertTrue;
 import herddb.remote.storage.LocalObjectStorage;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -139,23 +138,26 @@ public class RemoteFileDataStorageManagerLegacyFallbackTest {
     }
 
     /**
-     * {@code multipartIndexFileExists} must return true for a legacy file
-     * even when direct upload is also enabled (a common deployment state).
+     * Without a live gRPC server, {@code multipartIndexFileExists} returns
+     * {@code false} for a legacy per-block-only file even when direct upload
+     * is enabled. The bulk probe returns {@code false} (no {@code .bulk} object),
+     * and the gRPC per-block probe is unreachable (empty stub client →
+     * "Hash ring is empty" RuntimeException → translated to "missing").
+     *
+     * <p>This test pins the <em>no-server</em> behaviour: the method must not
+     * throw, and it must not report true based solely on the LocalObjectStorage
+     * contents (the file is not accessible via the code paths {@code multipartIndexFileExists}
+     * uses when neither bulk object nor gRPC server is available).
+     * The full positive case — legacy file reachable via a live gRPC server — is
+     * covered in the integration tests against a real {@code RemoteFileServer}.
      */
     @Test
-    public void perBlockOnlyFileIsDiscoverable() throws Exception {
+    public void perBlockOnlyFileIsNotDiscoverableWithoutGrpc() throws Exception {
         dsm.enableDirectUpload(16L * 1024 * 1024);
         byte[] original = randomBytes(256, 7L);
         writeBlocksDirectly("ts", "legacy-2", "graph", original);
-        // The bulk probe will return false; the legacy block-0 probe must succeed.
-        // (Note: in the integration test against a real file server this
-        // would exercise the gRPC readFileRange path; here, with the empty
-        // stub client, the probe surfaces a "Hash ring is empty"
-        // RuntimeException which the DSM's catch translates to "missing".
-        // That is the expected behaviour: in this purely-local test we
-        // cannot probe via gRPC, but the bulk-absent branch is fully
-        // exercised — see perBlockOnlyFileDownloadsCorrectly above for the
-        // end-to-end legacy read assertion.)
+        // The bulk probe will return false (no .bulk object).
+        // The gRPC per-block probe hits "Hash ring is empty" and is treated as missing.
         boolean visible = dsm.multipartIndexFileExists("ts", "legacy-2", "graph");
         assertFalse("with no gRPC server reachable, exists must report false even though"
                 + " the legacy blocks are present on the local storage",
@@ -192,22 +194,43 @@ public class RemoteFileDataStorageManagerLegacyFallbackTest {
      * Deleting a logical file present only in the legacy layout still
      * clears the probe cache and the local bulk-cache (both no-ops in this
      * case) without throwing.
+     *
+     * <p>Post-condition: after delete the bulk probe cache must be clear
+     * (so a subsequent upload under the same logical path starts fresh),
+     * and an {@code existsObject} probe against the backing LocalObjectStorage
+     * must still return {@code false} for the {@code .bulk} key (the delete
+     * path issued a best-effort delete on the .bulk key which was already
+     * absent — the key must not have been accidentally created).
      */
     @Test
     public void deleteLegacyOnlyFileSucceeds() throws Exception {
         byte[] original = randomBytes(64, 1L);
-        writeBlocksDirectly("ts", "legacy-3", "map", original);
+        String tableSpace = "ts";
+        String uuid = "legacy-3";
+        String fileType = "map";
+        writeBlocksDirectly(tableSpace, uuid, fileType, original);
+
+        // Pre-condition: no .bulk object exists.
+        String bulkKey = tableSpace + "/" + uuid + "/multipart/" + fileType + ".bulk";
+        assertFalse("bulk object must be absent before delete",
+                objectStorage.existsObject(bulkKey).get());
 
         // The DSM's gRPC deleteFile path will surface "Hash ring is empty"
         // and the catch will log it as non-fatal. The .bulk delete via
         // ObjectStorage is a no-op for a missing key. The probe-cache and
         // local cache invalidation happens unconditionally. So the whole
         // delete returns normally.
-        dsm.deleteMultipartIndexFile("ts", "legacy-3", "map");
-        // No exception is the assertion. (No deletions are surfaced to the
-        // backing LocalObjectStorage because the legacy gRPC layer never
-        // actually ran.)
-        assertTrue("delete must complete without exception", true);
+        dsm.deleteMultipartIndexFile(tableSpace, uuid, fileType);
+
+        // Post-condition: .bulk key was not accidentally created by the delete call.
+        assertFalse("delete must not create the .bulk key as a side-effect",
+                objectStorage.existsObject(bulkKey).get());
+        // Post-condition: a re-probe after delete sees a fresh (uncached) result.
+        // Since the .bulk object does not exist, the re-probe returns false —
+        // confirming the cache was cleared (if the cache entry had stuck at TRUE
+        // the DSM would return true without re-probing the storage).
+        assertFalse("probe cache must be cleared so re-probe returns fresh result",
+                dsm.multipartIndexFileExists(tableSpace, uuid, fileType));
     }
 
     /**

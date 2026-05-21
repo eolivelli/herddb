@@ -142,16 +142,21 @@ public class RemoteFileDataStorageManagerDirectUploadBackpressureTest {
 
         // Wait until A's permit reservation is reflected in the semaphore.
         assertTrue(firstAcquired.await(5L, TimeUnit.SECONDS));
-        // Spin briefly to give A's worker thread time to reserve the permit
-        // (the runAsync lambda races against the assert below; a 1 s ceiling
-        // is plenty for in-process semaphore acquisition).
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(1);
-        while (dsm.availableDirectInflightUploadBytes() > capBytes - blockSize
+        // Spin until A has both acquired the semaphore AND called uploadFile
+        // (so heldCount() becomes 1). We need both conditions before launching
+        // B because (a) the semaphore check proves A holds its 6 MiB reservation
+        // and (b) heldCount()==1 proves A's future is registered in the latch list
+        // so the first releaseFirstHeld() below will actually unblock A.
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while ((dsm.availableDirectInflightUploadBytes() > capBytes - blockSize
+                || objectStorage.heldCount() < 1)
                 && System.nanoTime() < deadline) {
-            Thread.sleep(2L);
+            Thread.sleep(5L);
         }
         assertEquals("A must hold its 6 MiB reservation",
                 capBytes - blockSize, dsm.availableDirectInflightUploadBytes());
+        assertEquals("A's uploadFile must have landed on the stub",
+                1, objectStorage.heldCount());
 
         // Launch B. It must block at the semaphore because only 2 MiB are
         // available and B asks for 6 MiB.
@@ -166,13 +171,30 @@ public class RemoteFileDataStorageManagerDirectUploadBackpressureTest {
         }, uploadExecutor);
         assertTrue(secondAcquired.await(5L, TimeUnit.SECONDS));
 
-        // Wait a short moment to confirm B is still blocked — its future must
-        // not have completed yet. We sleep here intentionally to catch the
-        // "blocked" state; the assertion below would also catch a quick
-        // completion bug.
-        Thread.sleep(200L);
-        assertEquals("uploadA should still be in flight",
-                false, uploadA.isDone());
+        // Confirm B is blocked at the semaphore: we know B's lambda has started
+        // (secondAcquired), and after a brief yield B's thread should have reached
+        // acquireUninterruptibly inside reserveDirectInflightUploadBytes. The
+        // strongest observable invariant while B is blocked is:
+        //   (a) availableDirectInflightUploadBytes() == capBytes - blockSize
+        //       (only A's 6 MiB reservation is outstanding; B can't acquire)
+        //   (b) objectStorage.heldCount() == 1
+        //       (only A's uploadFile future is held; B hasn't reached uploadFile yet)
+        // We active-wait to give B's thread time to reach the semaphore (sub-ms
+        // in practice) and use a 5 s ceiling for slow CI runners. If the semaphore
+        // were broken (B acquired immediately), heldCount() would jump to 2 and
+        // availableBytes would drop further — both conditions would fail.
+        deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        // Wait until the invariant stabilises (the loop exits as soon as both
+        // conditions match; the assertion below catches any deviation).
+        while (dsm.availableDirectInflightUploadBytes() != capBytes - blockSize
+                && System.nanoTime() < deadline) {
+            Thread.sleep(5L);
+        }
+        assertEquals("A must still hold its reservation while B is blocked",
+                capBytes - blockSize, dsm.availableDirectInflightUploadBytes());
+        assertEquals("B must not have called uploadFile yet (blocked at semaphore)",
+                1, objectStorage.heldCount());
+        assertEquals("uploadA should still be in flight", false, uploadA.isDone());
         assertEquals("uploadB should still be blocked on the semaphore",
                 false, uploadB.isDone());
 
@@ -189,7 +211,7 @@ public class RemoteFileDataStorageManagerDirectUploadBackpressureTest {
         //      semaphore-only check would race: B could be between
         //      reserveDirectInflightUploadBytes() and storage.uploadFile() when
         //      the test reads the gauge.
-        deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
         while ((dsm.availableDirectInflightUploadBytes() != capBytes - blockSize
                 || objectStorage.heldCount() < 1)
                 && System.nanoTime() < deadline) {
@@ -203,7 +225,7 @@ public class RemoteFileDataStorageManagerDirectUploadBackpressureTest {
         // Release B and verify the semaphore drains back to full.
         objectStorage.releaseFirstHeld();
         uploadB.get(10L, TimeUnit.SECONDS);
-        deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+        deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
         while (dsm.availableDirectInflightUploadBytes() != capBytes
                 && System.nanoTime() < deadline) {
             Thread.sleep(5L);

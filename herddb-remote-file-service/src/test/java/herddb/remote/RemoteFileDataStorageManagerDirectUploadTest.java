@@ -294,6 +294,112 @@ public class RemoteFileDataStorageManagerDirectUploadTest {
     }
 
     /**
+     * Calling {@code enableDirectUpload} twice with the same cap is idempotent:
+     * the second call must be a no-op (must not reset the existing semaphore or
+     * change any state). Calling with a different cap is a startup-only operation
+     * and causes the semaphore to be recreated.
+     */
+    @Test
+    public void enableDirectUploadIsIdempotentForSameCap() {
+        long cap = 16L * 1024 * 1024;
+        dsm.enableDirectUpload(cap);
+        assertEquals(cap, dsm.availableDirectInflightUploadBytes());
+        assertEquals(cap, dsm.maxDirectInflightUploadBytes());
+        assertTrue(dsm.supportsDirectMultipartUpload());
+
+        // Second call with the same cap — must be a no-op.
+        dsm.enableDirectUpload(cap);
+        assertEquals("idempotent: cap unchanged", cap, dsm.availableDirectInflightUploadBytes());
+        assertEquals("idempotent: max unchanged", cap, dsm.maxDirectInflightUploadBytes());
+        assertTrue("idempotent: supportsDirectMultipartUpload still true",
+                dsm.supportsDirectMultipartUpload());
+
+        // Different cap — must be accepted at startup time (replaces the semaphore).
+        long newCap = 32L * 1024 * 1024;
+        dsm.enableDirectUpload(newCap);
+        assertEquals("new cap replaces old semaphore", newCap,
+                dsm.availableDirectInflightUploadBytes());
+        assertEquals(newCap, dsm.maxDirectInflightUploadBytes());
+    }
+
+    /**
+     * Simulates a write/probe race that, before the fix in issue #638, could
+     * permanently pin a logical path as "not bulk" in the cache:
+     *
+     * <ol>
+     *   <li>Writer removes the cache entry (start of writeMultipartIndexFile).</li>
+     *   <li>Concurrent probe fires {@code isBulkLayout()} — the bulk object is not
+     *       yet present, so it gets {@code false} from the storage.</li>
+     *   <li>Writer's upload completes and puts {@code true} into the cache.</li>
+     *   <li>Probe must NOT have overwritten the {@code true} with a stale
+     *       {@code false}.</li>
+     * </ol>
+     *
+     * <p>After the fix, {@code isBulkLayout()} only caches positive results: a
+     * {@code false} probe is returned without touching the cache. So even if a
+     * probe sees a transient {@code false} during an upload, the post-upload
+     * {@code true} that the writer places into the cache is never overwritten.
+     * The next probe hits the cache and correctly returns {@code true}.
+     */
+    @Test
+    public void cacheRaceWriteThenProbeDoesNotPinNegativeResult() throws Exception {
+        dsm.enableDirectUpload(16L * 1024 * 1024);
+        String tableSpace = "ts";
+        String uuid = "race-probe";
+        String fileType = "graph";
+        String logicalPath = tableSpace + "/" + uuid + "/multipart/" + fileType;
+        String bulkKey = logicalPath + ".bulk";
+
+        byte[] payload = new byte[128];
+        Path tempFile = writeTempFile("race.bin", payload);
+
+        // Step 1: Simulate a probe that fires BEFORE the upload and returns false
+        // (the .bulk object does not exist yet). Because isBulkLayout only caches
+        // positives, this false result must not be cached.
+        assertFalse("pre-upload probe must return false (object absent)",
+                objectStorage.existsObject(bulkKey).get());
+        // Manually simulate what isBulkLayout does: it checked storage and got
+        // false, then returned without caching. We assert no positive entry exists.
+        assertFalse("no positive cache entry must be present before write",
+                objectStorage.objects.containsKey(bulkKey));
+
+        // Step 2: Writer uploads the file (caches the positive result).
+        dsm.writeMultipartIndexFile(tableSpace, uuid, fileType, tempFile, null);
+        assertTrue("bulk object must exist after upload",
+                objectStorage.objects.containsKey(bulkKey));
+
+        // Step 3: The probe-then-write race. We verify that the upload's put(TRUE)
+        // is not overwritten by a stale probe: call multipartIndexFileExists which
+        // goes through isBulkLayout() and must return true WITHOUT issuing a new
+        // HEAD (the cache was set to true by the write, and only positives are cached).
+        long probesBefore = objectStorage.existsCount.get();
+        assertTrue("post-upload probe must return true via cache (no HEAD round-trip)",
+                dsm.multipartIndexFileExists(tableSpace, uuid, fileType));
+        assertEquals("cache must be hit — no new existsObject call",
+                probesBefore, objectStorage.existsCount.get());
+
+        // Step 4: Simulate a stale false probe arriving AFTER the write completes.
+        // In the buggy version this would call bulkLayoutCache.put(logicalPath, false)
+        // and overwrite the TRUE. In the fixed version, false probes are not cached,
+        // so the TRUE remains. We emulate this by removing the object from storage
+        // (so the next real probe would return false) but the cache still returns true.
+        objectStorage.objects.remove(bulkKey);
+        // A fresh isBulkLayout call (via multipartIndexFileExists) should still return
+        // true from cache — it must NOT re-probe the storage.
+        probesBefore = objectStorage.existsCount.get();
+        assertTrue("cached true must survive object removal (cache hit)",
+                dsm.multipartIndexFileExists(tableSpace, uuid, fileType));
+        assertEquals("cache must be hit — still no new existsObject call",
+                probesBefore, objectStorage.existsCount.get());
+
+        // Step 5: After deleteMultipartIndexFile clears the cache, a fresh probe
+        // returns false (object was removed in step 4).
+        dsm.deleteMultipartIndexFile(tableSpace, uuid, fileType);
+        assertFalse("after cache clear and object removal, probe must return false",
+                dsm.multipartIndexFileExists(tableSpace, uuid, fileType));
+    }
+
+    /**
      * {@code disableDirectUpload} flips support off and zeros the gauges.
      */
     @Test

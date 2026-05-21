@@ -556,7 +556,15 @@ public final class IndexingServerConfiguration {
      */
     public static final String PROPERTY_S3_DIRECT_WRITE_ENABLED =
             "indexing.s3.direct.write.enabled";
-    public static final boolean PROPERTY_S3_DIRECT_WRITE_ENABLED_DEFAULT = true;
+    /**
+     * Default is {@code false} for the initial release so that existing IS
+     * pods that already have direct-read enabled are not silently switched to
+     * the new bulk format on upgrade without an explicit opt-in. Operators
+     * should enable this flag only after verifying the bulk upload path is
+     * stable in their environment. Set to {@code true} in a future release
+     * once telemetry confirms correctness at scale.
+     */
+    public static final boolean PROPERTY_S3_DIRECT_WRITE_ENABLED_DEFAULT = false;
 
     /**
      * Issue #638: maximum number of bytes that may be in flight across

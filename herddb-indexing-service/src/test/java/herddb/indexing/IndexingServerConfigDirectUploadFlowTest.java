@@ -69,16 +69,53 @@ public class IndexingServerConfigDirectUploadFlowTest {
     }
 
     /**
-     * IS-server wiring: when {@code indexing.s3.direct.enabled=true} and
-     * {@code indexing.s3.direct.write.enabled=true} (the default), the
-     * IS-server's buildDataStorageManager calls both setters on the DSM.
-     * This test exercises that exact sequence on a recording DSM.
+     * IS-server wiring: when {@code indexing.s3.direct.enabled=true} but
+     * {@code indexing.s3.direct.write.enabled} is NOT set (relying on the
+     * default), the IS-server must NOT call {@code enableDirectUpload} because
+     * the default is {@code false} (safe rollout: operators opt in explicitly).
+     * The read setter ({@code setDirectObjectStorage}) is still called.
      */
     @Test
-    public void isServerEnablesDirectUploadWhenWriteFlagDefault() throws Exception {
+    public void isServerSkipsDirectUploadWhenWriteFlagDefault() throws Exception {
         Properties p = new Properties();
         p.setProperty(IndexingServerConfiguration.PROPERTY_S3_DIRECT_ENABLED, "true");
-        // PROPERTY_S3_DIRECT_WRITE_ENABLED defaults to true (issue #638).
+        // PROPERTY_S3_DIRECT_WRITE_ENABLED defaults to false (safe rollout opt-in).
+        IndexingServerConfiguration cfg = configWith(p);
+        RecordingDsm dsm = newRecordingDsm();
+        ObjectStorage fake = new NoopObjectStorage();
+
+        // Mirror the IndexingServer.buildDataStorageManager direct-upload block:
+        dsm.setDirectObjectStorage(fake);
+        boolean directWriteEnabled = cfg.getBoolean(
+                IndexingServerConfiguration.PROPERTY_S3_DIRECT_WRITE_ENABLED,
+                IndexingServerConfiguration.PROPERTY_S3_DIRECT_WRITE_ENABLED_DEFAULT);
+        if (directWriteEnabled) {
+            long maxInflight = cfg.getLong(
+                    IndexingServerConfiguration
+                            .PROPERTY_REMOTE_FILE_CLIENT_MAX_INFLIGHT_DIRECT_WRITE_BYTES,
+                    IndexingServerConfiguration
+                            .PROPERTY_REMOTE_FILE_CLIENT_MAX_INFLIGHT_DIRECT_WRITE_BYTES_DEFAULT);
+            dsm.enableDirectUpload(maxInflight);
+        }
+
+        assertEquals(1, dsm.setterCalls);
+        assertEquals("write flag defaults to false — enableDirectUpload must NOT be called",
+                0, dsm.enableCalls);
+        assertFalse("supportsDirectMultipartUpload must be false when write flag is off",
+                dsm.supportsDirectMultipartUpload());
+        assertNotNull("read setter must still have been called", dsm.lastAttachedStorage);
+    }
+
+    /**
+     * IS-server wiring: when {@code indexing.s3.direct.write.enabled=true} is
+     * set explicitly, the IS-server calls both setters on the DSM with the
+     * configured (or default) inflight cap.
+     */
+    @Test
+    public void isServerEnablesDirectUploadWhenWriteFlagExplicitTrue() throws Exception {
+        Properties p = new Properties();
+        p.setProperty(IndexingServerConfiguration.PROPERTY_S3_DIRECT_ENABLED, "true");
+        p.setProperty(IndexingServerConfiguration.PROPERTY_S3_DIRECT_WRITE_ENABLED, "true");
         IndexingServerConfiguration cfg = configWith(p);
         RecordingDsm dsm = newRecordingDsm();
         ObjectStorage fake = new NoopObjectStorage();
