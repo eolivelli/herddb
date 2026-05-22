@@ -416,7 +416,67 @@ final class VectorIndexCompactor {
     }
 
     /**
-     * Full entry point adding the per-segment graduation cap (issue #631).
+     * Backward-compatible 8-arg entry point (graduation cap, no output-node cap):
+     * equivalent to the 9-arg overload with the per-cycle output-node cap disabled
+     * ({@code maxOutputNodes == 0L}). Kept so callers and tests that pin the
+     * pre-#643 selection contract compile unchanged.
+     *
+     * <p>Package-private for unit tests.
+     */
+    static List<VectorSegment> chooseSegmentsToMerge(
+            List<VectorSegment> candidates,
+            int minCount,
+            long minTotalBytes,
+            long maxTotalBytes,
+            int maxCount,
+            long microSegmentMaxNodes,
+            int maxInputs,
+            long targetMaxBytes) {
+        return chooseSegmentsToMerge(candidates, minCount, minTotalBytes,
+                maxTotalBytes, maxCount, microSegmentMaxNodes, maxInputs,
+                targetMaxBytes, /*maxOutputNodes*/ 0L);
+    }
+
+    /**
+     * Full entry point adding the per-cycle output-node cap (issue #643).
+     *
+     * <p>The graduation-cap filter (issue #631) runs first, exactly as before:
+     * segments whose {@link VectorSegment#estimatedSizeBytes} is at or above
+     * {@code targetMaxBytes} are excluded from every later step. See the
+     * paragraphs below for the unchanged graduation-cap semantics.
+     *
+     * <p><b>Per-cycle output-node cap (issue #643).</b> After the byte
+     * accumulation loop has selected the smallest-first picked set, this method
+     * additionally truncates {@code picked} so that the sum of
+     * {@link VectorSegment#size()} (the live-vector count of each input, which
+     * equals the live-node count contributed to the merged output) stays at or
+     * below {@code maxOutputNodes}. The cap is applied <em>after</em> the
+     * fire/no-fire trigger and <em>before</em> {@link #capInputs}, on the normal
+     * selection only — the micro-segment fast path is deliberately bypassed
+     * (mirroring the {@code maxInputs} cap, see issue #570). Without this cap,
+     * each compaction cycle's wall-clock time grew with the table size rather
+     * than with the per-cycle work budget: as small segments were consumed and
+     * merged into medium segments, the "smallest 20" candidates shifted upward
+     * over time, until each input was close to the graduation cap. jvector's
+     * {@code OnDiskGraphIndexCompactor.buildBatches} emits
+     * {@code max(40, srcNodes/128)} batches per source segment, so wall-clock
+     * time tracks the total live-node count of the merge inputs. Capping that
+     * sum bounds cycle duration to roughly the time required to merge a fixed
+     * number of vectors regardless of how large the index has grown.
+     *
+     * <p><b>Always keeps at least 2 inputs.</b> Even when the first two
+     * candidates by ascending byte size already exceed {@code maxOutputNodes},
+     * the cap retains both so the cycle still performs a meaningful merge (a
+     * one-input "merge" is degenerate and would defeat the policy). Operators
+     * who configure an aggressively low cap therefore still get monotonic
+     * progress: the segment count decreases by one per cycle, while per-cycle
+     * cost stays bounded by the two-segment minimum.
+     *
+     * <p><b>Disabled by default.</b> Set {@code maxOutputNodes <= 0} to disable
+     * the cap and restore the pre-#643 unbounded-output behaviour; this is the
+     * default so the new cap is purely additive.
+     *
+     * <p>The pre-existing graduation-cap docs follow.
      *
      * <p>Before any of the trigger / smallest-first / micro-segment / input-count
      * logic runs, {@code candidates} is filtered to retain only those whose
@@ -457,6 +517,10 @@ final class VectorIndexCompactor {
      *     {@code estimatedSizeBytes} is {@code >= targetMaxBytes} are filtered
      *     out before any other selection logic runs.
      *     {@link Long#MAX_VALUE} disables the filter.
+     * @param maxOutputNodes per-cycle cap on the sum of selected inputs'
+     *     {@link VectorSegment#size()} (issue #643). {@code 0} (or negative)
+     *     disables the cap. The cap never applies to the micro-segment fast
+     *     path; it always keeps at least 2 inputs.
      */
     static List<VectorSegment> chooseSegmentsToMerge(
             List<VectorSegment> candidates,
@@ -466,7 +530,8 @@ final class VectorIndexCompactor {
             int maxCount,
             long microSegmentMaxNodes,
             int maxInputs,
-            long targetMaxBytes) {
+            long targetMaxBytes,
+            long maxOutputNodes) {
         if (candidates == null || candidates.isEmpty()) {
             return new ArrayList<>();
         }
@@ -568,11 +633,66 @@ final class VectorIndexCompactor {
             if (microPicked.size() >= 2) {
                 // Deliberately NOT capped — see method javadoc: the
                 // micro-segment fast path must stay a fast slot-reclaiming
-                // cycle (issue #570).
+                // cycle (issue #570). The output-node cap (issue #643) is
+                // deliberately skipped here for the same reason: micro-segment
+                // merges are bounded by microSegmentMaxNodes per input by
+                // construction, so the cycle is already short.
                 return microPicked;
             }
         }
+        // Issue #643 — per-cycle output-node cap. Applied AFTER the trigger
+        // decision (we never change whether a cycle fires) and BEFORE
+        // capInputs so the smaller of the two caps wins. Always keeps at
+        // least 2 inputs for a meaningful merge (see method javadoc).
+        picked = capOutputNodes(picked, maxOutputNodes);
         return capInputs(picked, maxInputs);
+    }
+
+    /**
+     * Truncates {@code picked} to the largest smallest-first prefix whose total
+     * live-node count (sum of {@link VectorSegment#size()}) stays at or below
+     * {@code maxOutputNodes} (issue #643). A no-op when the cap is disabled
+     * ({@code maxOutputNodes <= 0}) or when the full picked set already fits.
+     *
+     * <p>The input list is expected to be sorted smallest-bytes-first by the
+     * caller, so the prefix kept after truncation continues to maximise the
+     * contraction ratio (consume the smallest segments first).
+     *
+     * <p><b>Always keeps at least 2 inputs.</b> Even when the first two
+     * segments already exceed the cap, the helper keeps both — a single-input
+     * "merge" is degenerate, so a flat cap that could reduce {@code picked} to
+     * one segment would defeat the policy. Operators who configure an
+     * aggressively low cap therefore still get monotonic progress: the segment
+     * count decreases by one per cycle, while per-cycle cost stays bounded by
+     * the two-segment minimum.
+     *
+     * <p>Logs at INFO when the cap actually bites, mirroring {@link #capInputs}.
+     *
+     * <p>Package-private for unit tests.
+     */
+    static List<VectorSegment> capOutputNodes(List<VectorSegment> picked, long maxOutputNodes) {
+        if (maxOutputNodes <= 0L || picked.size() < 2) {
+            return picked;
+        }
+        long total = 0L;
+        int keep = 0;
+        for (VectorSegment seg : picked) {
+            long segNodes = Math.max(0L, seg.size());
+            if (keep >= 2 && total + segNodes > maxOutputNodes) {
+                break;
+            }
+            total += segNodes;
+            keep++;
+        }
+        if (keep == picked.size()) {
+            return picked;
+        }
+        LOGGER.log(Level.INFO,
+                "compaction: capping merge inputs from {0} to {1} segments "
+                        + "(vector.index.compaction.maxOutputNodes={2}; output liveCount={3}); "
+                        + "remaining segments compact in subsequent cycles",
+                new Object[]{picked.size(), keep, maxOutputNodes, total});
+        return new ArrayList<>(picked.subList(0, keep));
     }
 
     // -------------------------------------------------------------------------
@@ -732,6 +852,38 @@ final class VectorIndexCompactor {
             return Integer.MAX_VALUE;
         }
         return baseMaxInputs * multiplier;
+    }
+
+    /**
+     * Returns the effective per-cycle output-node cap (issue #643) after applying
+     * the tiered scaling factor for {@code totalSegmentCount}.
+     *
+     * <p>Tier-scaling the cap is what makes it starvation-safe — the same
+     * argument as for {@link #computeTieredMaxInputs}. The per-cycle drain rate
+     * rises with the backlog (2×/4×/8× at 100/300/500 segments), mirroring
+     * {@link #computeTieredMaxCount}, so the cap can never let the segment
+     * count grow unboundedly toward the back-pressure threshold while still
+     * bounding worst-case per-cycle wall-clock time at each tier.
+     *
+     * <p>A disabled cap ({@code baseMaxOutputNodes <= 0}) is returned unchanged
+     * so it stays disabled. The result is capped at {@link Long#MAX_VALUE} to
+     * avoid overflow.
+     *
+     * <p>Package-private for unit tests.
+     */
+    static long computeTieredMaxOutputNodes(int totalSegmentCount, long baseMaxOutputNodes) {
+        if (baseMaxOutputNodes <= 0L) {
+            return baseMaxOutputNodes;
+        }
+        int multiplier = tieredMultiplier(totalSegmentCount);
+        if (multiplier == 1) {
+            return baseMaxOutputNodes;
+        }
+        // Guard against overflow.
+        if (baseMaxOutputNodes > Long.MAX_VALUE / multiplier) {
+            return Long.MAX_VALUE;
+        }
+        return baseMaxOutputNodes * multiplier;
     }
 
     /**
