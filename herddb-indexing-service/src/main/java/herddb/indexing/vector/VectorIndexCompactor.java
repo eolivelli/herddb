@@ -464,6 +464,19 @@ final class VectorIndexCompactor {
      * sum bounds cycle duration to roughly the time required to merge a fixed
      * number of vectors regardless of how large the index has grown.
      *
+     * <p><b>Approximate on heavily-tombstoned segments.</b> The cap is on
+     * {@link VectorSegment#size()} (live count), but jvector's batch loop
+     * iterates over the on-disk graph including tombstoned ordinals (work
+     * scales with {@code maxOrdinal}, not {@code liveCount}). For a segment
+     * where most PKs have been tombstoned, {@code liveCount} can be much
+     * smaller than {@code maxOrdinal} — the wall-clock cap under-estimates
+     * the actual per-cycle work in that case. This is intentional: heavily
+     * tombstoned segments are exactly the ones whose merge most aggressively
+     * reclaims storage (the rebuild drops every tombstoned ordinal), so
+     * letting the picker over-pick them is the right trade-off. Operators
+     * with workloads dominated by deletes should size {@code maxOutputNodes}
+     * with the expected tombstone fraction in mind.
+     *
      * <p><b>Always keeps at least 2 inputs.</b> Even when the first two
      * candidates by ascending byte size already exceed {@code maxOutputNodes},
      * the cap retains both so the cycle still performs a meaningful merge (a
