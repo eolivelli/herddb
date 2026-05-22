@@ -375,7 +375,15 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
                     .setUploadBytesDone(details.uploadBytesDone)
                     .setUploadBytesTotal(details.uploadBytesTotal)
                     .setNextNodeId(details.nextNodeId)
-                    .setNumShards(details.numShards);
+                    .setNumShards(details.numShards)
+                    // Issue #640: real-time compaction observability fields.
+                    .setCompactionBatchesDone(details.compactionBatchesDone)
+                    .setCompactionBatchesTotal(details.compactionBatchesTotal)
+                    .setCompactionCycleId(details.compactionCycleId)
+                    .setCompactionInputSegmentCount(details.compactionInputSegmentCount)
+                    .setCompactionInputVectorCount(details.compactionInputVectorCount)
+                    .setCompactionElapsedMs(details.compactionElapsedMs)
+                    .setCompactionRunning(details.compactionRunning);
             responseObserver.onNext(builder.build());
             responseObserver.onCompleted();
         } catch (RuntimeException e) {
@@ -480,6 +488,36 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
             addInt64(b, "jvm_heap_max_bytes", heapMax);
             addInt64(b, "jvm_heap_used_pct", heapPct);
 
+            // Issue #640: aggregate compaction state across all loaded
+            // PersistentVectorStores so a single top-level engine-stats call
+            // reveals whether any index is currently compacting, without
+            // requiring a describe-index per index.
+            //
+            //   compaction_running : true iff at least one PVS has an active
+            //                        cycle (started-nanos != 0).
+            //   compaction_phase   : the most advanced phase string observed
+            //                        across all PVSs (priority:
+            //                        uploading-segment > compacting-graph >
+            //                        writing-graph > idle). "idle" when no
+            //                        store reports any activity.
+            boolean anyRunning = false;
+            String aggregatePhase = "idle";
+            int aggregateRank = 0;
+            for (herddb.indexing.vector.PersistentVectorStore pvs
+                    : engine.getPersistentVectorStoresSnapshot()) {
+                if (pvs.isCompactionRunning()) {
+                    anyRunning = true;
+                }
+                String ph = pvs.getCompactionPhase();
+                int rank = phaseRank(ph);
+                if (rank > aggregateRank) {
+                    aggregateRank = rank;
+                    aggregatePhase = ph;
+                }
+            }
+            addBool(b, "compaction_running", anyRunning);
+            addString(b, "compaction_phase", aggregatePhase);
+
             responseObserver.onNext(b.build());
             responseObserver.onCompleted();
         } catch (RuntimeException e) {
@@ -503,6 +541,37 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
                 .setKey(key)
                 .setValue(MetricValue.newBuilder().setBoolValue(value).build())
                 .build());
+    }
+
+    // Issue #640: string-valued engine-stats metric helper. Mirrors
+    // addInt64/addBool — used so the aggregated `compaction_phase` can be
+    // surfaced as a human-readable string rather than an opaque integer
+    // rank.
+    private static void addString(GetEngineStatsResponse.Builder b, String key, String value) {
+        b.addMetrics(MetricEntry.newBuilder()
+                .setKey(key)
+                .setValue(MetricValue.newBuilder()
+                        .setStringValue(value == null ? "" : value)
+                        .build())
+                .build());
+    }
+
+    /**
+     * Rank used to pick the "most advanced" compaction phase across all
+     * loaded stores in {@link #getEngineStats}. Matches the priority order
+     * of {@link herddb.indexing.vector.PersistentVectorStore#getCompactionPhase}.
+     */
+    private static int phaseRank(String phase) {
+        if (phase == null) {
+            return 0;
+        }
+        switch (phase) {
+            case "uploading-segment": return 3;
+            case "compacting-graph":  return 2;
+            case "writing-graph":     return 1;
+            case "idle":
+            default:                  return 0;
+        }
     }
 
     @Override

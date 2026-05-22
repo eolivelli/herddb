@@ -147,6 +147,15 @@ public class IndexingServiceDiagnosticsGrpcTest {
         assertEquals(0L, response.getCompactionNodesTotal());
         assertEquals(0L, response.getUploadBytesDone());
         assertEquals(0L, response.getUploadBytesTotal());
+        // Issue #640: new real-time compaction observability fields default
+        // to zero / false for any non-PersistentVectorStore.
+        assertEquals(0L, response.getCompactionBatchesDone());
+        assertEquals(0L, response.getCompactionBatchesTotal());
+        assertEquals(0L, response.getCompactionCycleId());
+        assertEquals(0, response.getCompactionInputSegmentCount());
+        assertEquals(0L, response.getCompactionInputVectorCount());
+        assertEquals(0L, response.getCompactionElapsedMs());
+        assertEquals(false, response.getCompactionRunning());
     }
 
     @Test
@@ -249,6 +258,17 @@ public class IndexingServiceDiagnosticsGrpcTest {
                 metrics.containsKey("tailer_entries_shard_filtered"));
         assertEquals("tailer_entries_shard_filtered", 0L,
                 metrics.get("tailer_entries_shard_filtered").getInt64Value());
+        // Issue #640: aggregate compaction state — for an idle in-memory
+        // setup with no PersistentVectorStores loaded, compaction_running
+        // is false and compaction_phase is "idle".
+        assertTrue("compaction_running must be present",
+                metrics.containsKey("compaction_running"));
+        assertEquals("compaction_running default is false on an idle service",
+                false, metrics.get("compaction_running").getBoolValue());
+        assertTrue("compaction_phase must be present",
+                metrics.containsKey("compaction_phase"));
+        assertEquals("compaction_phase default is 'idle' on an idle service",
+                "idle", metrics.get("compaction_phase").getStringValue());
     }
 
     private static Map<String, MetricValue> indexMetricsByKey(GetEngineStatsResponse r) {

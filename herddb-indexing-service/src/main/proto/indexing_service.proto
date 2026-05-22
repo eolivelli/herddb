@@ -195,7 +195,11 @@ message DescribeIndexResponse {
     bool persistent = 17;
     string store_class = 18;
     // Compaction progress (issue #80). compaction_phase is one of
-    // "idle", "writing-graph", "uploading-segment". compaction_progress
+    // "idle", "writing-graph", "compacting-graph", "uploading-segment".
+    // "compacting-graph" (issue #640) covers the streaming-compaction
+    // Phase B I/O loop driven by jvector's OnDiskGraphIndexCompactor —
+    // a busy phase that used to read as "idle" because nothing surrounding
+    // it flipped writingGraphActive/uploadingActive. compaction_progress
     // is an integer 0..100, or -1 when idle.
     string compaction_phase = 19;
     int32 compaction_progress = 20;
@@ -231,6 +235,36 @@ message DescribeIndexResponse {
     // genuine live-vector heap from on-disk segment overhead — the latter
     // grows with segment_count and does not shrink on checkpoint.
     int64 ondisk_segment_memory_bytes = 31;
+
+    // Real-time compaction observability (issue #640). These fields are
+    // updated continuously while a compaction cycle is active so the
+    // describe-index API reflects the *current* cycle's I/O progress
+    // instead of the stale terminal state of the previous one.
+    //
+    //  - compaction_batches_done / compaction_batches_total reflect the
+    //    OnDiskGraphIndexCompactor.runBatchesWithBackpressure counter that
+    //    the IS log prints as "Compaction I/O progress: X/Y batches".
+    //  - compaction_cycle_id is a monotonic counter that bumps once per
+    //    runCompactionCycle / checkpoint Phase B call; consumers can use
+    //    it to detect that a new cycle has begun even if the other
+    //    counters were still at 100% from the previous cycle.
+    //  - compaction_input_segment_count is how many segments are being
+    //    merged in the active cycle (0 on the checkpoint Phase B path,
+    //    which folds live shards rather than merging on-disk segments).
+    //  - compaction_input_vector_count is the total vector count of the
+    //    input set.
+    //  - compaction_elapsed_ms is the wall-clock milliseconds since the
+    //    current cycle started (0 when idle).
+    //  - compaction_running is true while a cycle holds the compaction
+    //    or checkpoint Phase B lock. Mirrors what GetEngineStats now
+    //    surfaces aggregated across all loaded stores.
+    int64 compaction_batches_done = 32;
+    int64 compaction_batches_total = 33;
+    int64 compaction_cycle_id = 34;
+    int32 compaction_input_segment_count = 35;
+    int64 compaction_input_vector_count = 36;
+    int64 compaction_elapsed_ms = 37;
+    bool compaction_running = 38;
 }
 
 message ListPrimaryKeysRequest {

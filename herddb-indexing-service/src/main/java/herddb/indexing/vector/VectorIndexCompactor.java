@@ -27,6 +27,7 @@ import io.github.jbellis.jvector.disk.RandomAccessReader;
 import io.github.jbellis.jvector.disk.ReaderSupplier;
 import io.github.jbellis.jvector.disk.ReaderSupplierFactory;
 import io.github.jbellis.jvector.graph.GraphIndexBuilder;
+import io.github.jbellis.jvector.graph.disk.CompactionProgressListener;
 import io.github.jbellis.jvector.graph.disk.OnDiskGraphIndex;
 import io.github.jbellis.jvector.graph.disk.OnDiskGraphIndexCompactor;
 import io.github.jbellis.jvector.graph.disk.OrdinalMapper;
@@ -1483,7 +1484,43 @@ final class VectorIndexCompactor {
                             localSources, liveBitsets, mappers, store.compactionSimilarity(),
                             PhysicalCoreExecutor.pool(),
                             pqReaderFactory);
-                    compactor.compact(graphTemp);
+                    // Issue #640: wire a CompactionProgressListener so the
+                    // IS gRPC describe-index API reflects real-time
+                    // Phase B I/O progress. The listener fires every 10
+                    // batches from jvector's runBatchesWithBackpressure
+                    // with (completed, total) — exactly the numbers the
+                    // IS log already prints as "Compaction I/O progress:
+                    // X/Y batches written to disk". Push them straight
+                    // into the store's atomic batch counters; describe-index
+                    // / engine-stats read them every tick.
+                    //
+                    // We also flip the streaming-active flag around the
+                    // call so getCompactionPhase() returns
+                    // "compacting-graph" while the batch loop runs
+                    // (previously "idle" for the entire multi-minute
+                    // jvector run — the central symptom of issue #640).
+                    //
+                    // Order matters: set `done` BEFORE `total` so a racing
+                    // describe-index reader that observes the new `done`
+                    // alongside the still-old `total` sees a strictly
+                    // non-decreasing perceived progress. Setting `total`
+                    // first would briefly expose `done > total` on a new
+                    // level (jvector internally resets `total` per level
+                    // and ramps `done` from 0); `Math.min(100, ...)` in
+                    // getCompactionProgressPercent() keeps the visible
+                    // percent bounded, but the swap is cheap insurance
+                    // for monotonic perception.
+                    CompactionProgressListener progressListener =
+                            (completed, total) -> {
+                                store.setCompactionBatchesDone(completed);
+                                store.setCompactionBatchesTotal(total);
+                            };
+                    store.incrementCompactionStreamingActive();
+                    try {
+                        compactor.compact(graphTemp, progressListener);
+                    } finally {
+                        store.decrementCompactionStreamingActive();
+                    }
                 } catch (java.io.FileNotFoundException | RuntimeException | Error e) {
                     // jvector boundary — wrap unchecked OR FileNotFoundException
                     // (declared on compact()) failures so they never reach the
