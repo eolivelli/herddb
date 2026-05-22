@@ -27,6 +27,7 @@ import io.github.jbellis.jvector.disk.RandomAccessReader;
 import io.github.jbellis.jvector.disk.ReaderSupplier;
 import io.github.jbellis.jvector.disk.ReaderSupplierFactory;
 import io.github.jbellis.jvector.graph.GraphIndexBuilder;
+import io.github.jbellis.jvector.graph.disk.CompactionProgressListener;
 import io.github.jbellis.jvector.graph.disk.OnDiskGraphIndex;
 import io.github.jbellis.jvector.graph.disk.OnDiskGraphIndexCompactor;
 import io.github.jbellis.jvector.graph.disk.OrdinalMapper;
@@ -1483,7 +1484,33 @@ final class VectorIndexCompactor {
                             localSources, liveBitsets, mappers, store.compactionSimilarity(),
                             PhysicalCoreExecutor.pool(),
                             pqReaderFactory);
-                    compactor.compact(graphTemp);
+                    // Issue #640: wire a CompactionProgressListener so the
+                    // IS gRPC describe-index API reflects real-time
+                    // Phase B I/O progress. The listener fires every 10
+                    // batches from jvector's runBatchesWithBackpressure
+                    // with (completed, total) — exactly the numbers the
+                    // IS log already prints as "Compaction I/O progress:
+                    // X/Y batches written to disk". Push them straight
+                    // into the store's atomic batch counters; describe-index
+                    // / engine-stats read them every tick.
+                    //
+                    // We also flip the streaming-active flag around the
+                    // call so getCompactionPhase() returns
+                    // "compacting-graph" while the batch loop runs
+                    // (previously "idle" for the entire multi-minute
+                    // jvector run — the central symptom of issue #640).
+                    final PersistentVectorStore storeRef = store;
+                    CompactionProgressListener progressListener =
+                            (completed, total) -> {
+                                storeRef.setCompactionBatchesTotal(total);
+                                storeRef.setCompactionBatchesDone(completed);
+                            };
+                    store.incrementCompactionStreamingActive();
+                    try {
+                        compactor.compact(graphTemp, progressListener);
+                    } finally {
+                        store.decrementCompactionStreamingActive();
+                    }
                 } catch (java.io.FileNotFoundException | RuntimeException | Error e) {
                     // jvector boundary — wrap unchecked OR FileNotFoundException
                     // (declared on compact()) failures so they never reach the

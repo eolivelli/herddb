@@ -1063,6 +1063,36 @@ public class PersistentVectorStore extends AbstractVectorStore {
     private final AtomicLong uploadBytesDone = new AtomicLong();
     private final AtomicLong uploadBytesTotal = new AtomicLong();
 
+    // Real-time streaming-compaction observability (issue #640).
+    //
+    // Until this issue, describe-index showed the previous compaction
+    // cycle's terminal state for the entire duration of the next cycle,
+    // because:
+    //   - Phase tracking was blind during OnDiskGraphIndexCompactor.compact()
+    //     (writingGraphActive / uploadingActive were only flipped by the
+    //     surrounding writeStreamingCompactedSegment, which runs AFTER the
+    //     batch loop), and
+    //   - the four legacy counters above were never reset on the streaming
+    //     compaction path — only the legacy doCheckpointFusedPQThreePhase
+    //     reset them.
+    //
+    // The new state below closes both gaps. `compactionStreamingActive`
+    // is a counter (not a bool) so overlapping streaming cycles are
+    // representable in principle, even though runCompactionCycle's
+    // compactionLock serialises them today. `compactionBatchesDone/Total`
+    // are fed by a CompactionProgressListener that jvector calls every 10
+    // batches from runBatchesWithBackpressure. `compactionCycleId` is the
+    // generation token consumers can use to detect a new cycle even when
+    // the per-cycle counters happen to be at 100% from the previous one.
+    private final AtomicInteger compactionStreamingActive = new AtomicInteger();
+    private final AtomicLong compactionBatchesDone = new AtomicLong();
+    private final AtomicLong compactionBatchesTotal = new AtomicLong();
+    private final AtomicLong compactionCycleId = new AtomicLong();
+    private final AtomicLong compactionInputSegmentCount = new AtomicLong();
+    private final AtomicLong compactionInputVectorCount = new AtomicLong();
+    /** Nanos when the current compaction cycle started, or 0 when idle. */
+    private final AtomicLong compactionStartedNanos = new AtomicLong();
+
     // Deferred shard metrics (issue #107).
     //
     // Track shard deferral due to Phase A byte-cap logic, for visibility into
@@ -1363,18 +1393,37 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
     /**
      * Returns the current compaction phase: {@code "idle"},
-     * {@code "writing-graph"}, or {@code "uploading-segment"}. Priority is
-     * upload &gt; graph-write, so when segment writes overlap (Phase B
-     * parallelism) the most advanced phase wins.
+     * {@code "writing-graph"}, {@code "compacting-graph"}, or
+     * {@code "uploading-segment"}. Priority is
+     * upload &gt; compacting-graph &gt; writing-graph, so the most advanced
+     * phase wins when multiple sub-phases overlap.
+     *
+     * <p>{@code "compacting-graph"} (issue #640) covers the streaming
+     * Phase B I/O loop driven by jvector's {@code
+     * OnDiskGraphIndexCompactor.runBatchesWithBackpressure}; before #640
+     * this multi-minute interval was reported as {@code "idle"} because
+     * nothing surrounding it flipped a phase flag.
      */
     public String getCompactionPhase() {
         if (uploadingActive.get() > 0) {
             return "uploading-segment";
         }
+        if (compactionStreamingActive.get() > 0) {
+            return "compacting-graph";
+        }
         if (writingGraphActive.get() > 0) {
             return "writing-graph";
         }
         return "idle";
+    }
+
+    /**
+     * Whether a compaction or checkpoint Phase B cycle is currently
+     * in flight (issue #640). True from {@link #beginCompactionCycle}
+     * until the matching {@link #endCompactionCycle}.
+     */
+    public boolean isCompactionRunning() {
+        return compactionStartedNanos.get() != 0L;
     }
 
     public int getWritingGraphActiveCount() {
@@ -1401,16 +1450,65 @@ public class PersistentVectorStore extends AbstractVectorStore {
         return uploadBytesTotal.get();
     }
 
+    // -------------------------------------------------------------------------
+    // Issue #640: real-time compaction observability accessors.
+    // -------------------------------------------------------------------------
+
+    public long getCompactionBatchesDone() {
+        return compactionBatchesDone.get();
+    }
+
+    public long getCompactionBatchesTotal() {
+        return compactionBatchesTotal.get();
+    }
+
+    /**
+     * Monotonic cycle id bumped on every {@link #beginCompactionCycle} call.
+     * Consumers polling {@code describe-index} can use the change in this
+     * value to detect that a new compaction cycle has begun even when the
+     * other progress counters happen to be at 100% from the previous one.
+     */
+    public long getCompactionCycleId() {
+        return compactionCycleId.get();
+    }
+
+    public long getCompactionInputSegmentCount() {
+        return compactionInputSegmentCount.get();
+    }
+
+    public long getCompactionInputVectorCount() {
+        return compactionInputVectorCount.get();
+    }
+
+    /**
+     * Wall-clock milliseconds since the current compaction cycle started,
+     * or 0 when no cycle is in flight.
+     */
+    public long getCompactionElapsedMs() {
+        long startedNanos = compactionStartedNanos.get();
+        if (startedNanos == 0L) {
+            return 0L;
+        }
+        long elapsed = System.nanoTime() - startedNanos;
+        return elapsed < 0L ? 0L : elapsed / 1_000_000L;
+    }
+
     /**
      * Returns the progress percentage of whichever phase is currently
      * active, or {@code -1} when idle. During {@code uploading-segment} it
-     * reflects bytes-based progress; during {@code writing-graph} it
-     * reflects node-count progress.
+     * reflects bytes-based progress; during {@code compacting-graph} it
+     * reflects batch-based progress (issue #640); during
+     * {@code writing-graph} it reflects node-count progress.
      */
     public int getCompactionProgressPercent() {
         if (uploadingActive.get() > 0) {
             long total = uploadBytesTotal.get();
             long done = uploadBytesDone.get();
+            return total > 0 ? (int) Math.min(100L, (100L * done) / total) : 0;
+        }
+        if (compactionStreamingActive.get() > 0) {
+            long total = compactionBatchesTotal.get();
+            long done = compactionBatchesDone.get();
             return total > 0 ? (int) Math.min(100L, (100L * done) / total) : 0;
         }
         if (writingGraphActive.get() > 0) {
@@ -1419,6 +1517,90 @@ public class PersistentVectorStore extends AbstractVectorStore {
             return total > 0 ? (int) Math.min(100L, (100L * done) / total) : 0;
         }
         return -1;
+    }
+
+    /**
+     * Marks the start of a compaction or checkpoint Phase B cycle
+     * (issue #640). Zeroes every per-cycle progress counter
+     * ({@code compactionNodesDone/Total}, {@code uploadBytesDone/Total},
+     * {@code compactionBatchesDone/Total}), records the input shape and
+     * the wall-clock start, and bumps {@link #compactionCycleId} so
+     * external observers can see the cycle change.
+     *
+     * <p>Must be paired with exactly one {@link #endCompactionCycle} in
+     * a {@code finally} block. Calls are serialised by
+     * {@code compactionLock} (for runCompactionCycle) and by
+     * {@code stateLock.writeLock()} (for checkpoint Phase B), so there
+     * is no concurrency exposure on the reset itself.
+     *
+     * @param inputSegmentCount how many on-disk segments are being merged
+     *                          in this cycle; 0 on the checkpoint Phase B
+     *                          path which folds live shards instead of
+     *                          merging on-disk segments
+     * @param inputVectorCount  total vector count across the input set
+     */
+    public void beginCompactionCycle(int inputSegmentCount, long inputVectorCount) {
+        compactionNodesDone.set(0);
+        compactionNodesTotal.set(0);
+        uploadBytesDone.set(0);
+        uploadBytesTotal.set(0);
+        compactionBatchesDone.set(0);
+        compactionBatchesTotal.set(0);
+        compactionInputSegmentCount.set(Math.max(0, inputSegmentCount));
+        compactionInputVectorCount.set(Math.max(0L, inputVectorCount));
+        compactionCycleId.incrementAndGet();
+        // Set started-nanos last so a reader that sees a non-zero
+        // started-nanos also sees the freshly-bumped cycle id and the
+        // freshly-zeroed counters.
+        long now = System.nanoTime();
+        // Guard against the (theoretical) System.nanoTime() == 0 reading
+        // which would be indistinguishable from "idle".
+        compactionStartedNanos.set(now == 0L ? 1L : now);
+    }
+
+    /**
+     * Marks the end of the cycle started by {@link #beginCompactionCycle}.
+     * The progress counters are left populated so a post-hoc
+     * {@code describe-index} still shows the final totals of the last
+     * compaction; only the running flag (started-nanos) is cleared.
+     */
+    public void endCompactionCycle() {
+        compactionStartedNanos.set(0L);
+    }
+
+    /**
+     * Increments the streaming-active counter (issue #640) — flips
+     * {@link #getCompactionPhase()} to {@code "compacting-graph"} while
+     * jvector's {@code OnDiskGraphIndexCompactor.compact()} runs.
+     * Must be balanced by {@link #decrementCompactionStreamingActive()}
+     * in a {@code finally} block.
+     */
+    public void incrementCompactionStreamingActive() {
+        compactionStreamingActive.incrementAndGet();
+    }
+
+    public void decrementCompactionStreamingActive() {
+        compactionStreamingActive.decrementAndGet();
+    }
+
+    /**
+     * Sets the batch total reported by jvector's
+     * {@code CompactionProgressListener.onProgress(completed, total)}.
+     * Issue #640.
+     */
+    public void setCompactionBatchesTotal(long total) {
+        compactionBatchesTotal.set(Math.max(0L, total));
+    }
+
+    /**
+     * Sets the running batch count reported by jvector's
+     * {@code CompactionProgressListener.onProgress(completed, total)}.
+     * The listener fires every 10 batches with a strictly non-decreasing
+     * {@code completed} value within a level, so a {@code set} (not an
+     * {@code addAndGet}) is the right idiom. Issue #640.
+     */
+    public void setCompactionBatchesDone(long done) {
+        compactionBatchesDone.set(Math.max(0L, done));
     }
 
     public int getDeferralEvents() {
@@ -2808,6 +2990,21 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
             compactionActive.set(1);
 
+            // Issue #640: open a new compaction cycle in the progress
+            // counters. Resets compaction_batches_done/total,
+            // compaction_nodes_done/total, upload_bytes_done/total to 0,
+            // bumps compaction_cycle_id, records inputSegmentCount +
+            // inputVectorCount, and starts the elapsed-ms clock — so a
+            // describe-index sampled during this cycle reflects this
+            // cycle's progress instead of the previous cycle's terminal
+            // state. Paired with endCompactionCycle() in the outer finally
+            // below.
+            long inputVectorCount = 0L;
+            for (VectorSegment seg : candidates) {
+                inputVectorCount += Math.max(0, seg.liveCount.get());
+            }
+            beginCompactionCycle(candidates.size(), inputVectorCount);
+
             // Allocate the BLink-backed pendingCompactionDeletes set + the
             // BLink-backed authority map (issue #290): both replace the prior
             // unbounded HashMap/HashSet structures so memory stays bounded by
@@ -3055,6 +3252,15 @@ public class PersistentVectorStore extends AbstractVectorStore {
             }
         } finally {
             compactionActive.set(0);
+            // Issue #640: clear the cycle's running flag here regardless of
+            // outcome. Per-cycle progress counters are left at their final
+            // values so a post-hoc describe-index still shows the totals of
+            // the last cycle (mirrors the legacy checkpoint Phase B
+            // behaviour the issue called out as desirable). Idempotent if
+            // beginCompactionCycle was never called on this path (early
+            // returns before candidate selection): endCompactionCycle just
+            // sets started-nanos to 0, which was already 0.
+            endCompactionCycle();
             // Issue #535: drain segments queued for close by any concurrent
             // dropSegmentByUuid that landed during this cycle. Doing this
             // BEFORE releasing compactionLock guarantees the close cannot
@@ -6078,6 +6284,10 @@ public class PersistentVectorStore extends AbstractVectorStore {
         List<VectorSegment> sealedSegments;
         List<VectorSegment> mergeableSegments;
         int snapshotDimension;
+        // Hoisted out of the Phase A writeLock scope (issue #640) so the
+        // beginCompactionCycle(...) call below — which runs without the
+        // writeLock — can still see this checkpoint's input vector count.
+        int totalSnapshotSize;
 
         stateLock.writeLock().lock();
         try {
@@ -6160,7 +6370,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
             this.pendingCheckpointDeletes = createTempPagedPkSet(
                     "ckpdel_" + totalCheckpointCount.get());
             this.checkpointPhaseComplete = new CountDownLatch(1);
-            int totalSnapshotSize = 0;
+            totalSnapshotSize = 0;
             for (LiveGraphShard shard : snapshotShards) {
                 totalSnapshotSize += shard.nodeToPk.size();
             }
@@ -6203,12 +6413,12 @@ public class PersistentVectorStore extends AbstractVectorStore {
         // checkpoint.
         this.provisionalPageIds = Collections.synchronizedList(new ArrayList<>());
         this.provisionalMultipartFiles = Collections.synchronizedList(new ArrayList<>());
-        // Reset compaction progress counters so a describe-index sampled
-        // mid-Phase-B reflects this checkpoint's totals, not the previous one.
-        compactionNodesDone.set(0);
-        compactionNodesTotal.set(0);
-        uploadBytesDone.set(0);
-        uploadBytesTotal.set(0);
+        // Issue #640: replace the four ad-hoc counter resets with a single
+        // beginCompactionCycle call so the checkpoint path shares the same
+        // cycle-id / elapsed-ms / input-shape bookkeeping the runCompactionCycle
+        // path uses. inputSegmentCount=0 because this is the live-shard fold,
+        // not an on-disk segment merge; inputVectorCount is the snapshot size.
+        beginCompactionCycle(0, totalSnapshotSize);
         List<SegmentWriteResult> newSegmentResults;
         try {
             newSegmentResults = doCheckpointFusedPQPhaseB(
@@ -6247,6 +6457,10 @@ public class PersistentVectorStore extends AbstractVectorStore {
             consecutiveCheckpointFailures.incrementAndGet();
             totalCheckpointFailures.incrementAndGet();
             recoverFromPhaseBFailure(snapshotShards);
+            // Issue #640: the cycle is over, even on failure — clear the
+            // running flag so describe-index does not show a stale "in
+            // progress" state until the next cycle begins.
+            endCompactionCycle();
             throw e;
         }
 
@@ -6320,6 +6534,9 @@ public class PersistentVectorStore extends AbstractVectorStore {
             consecutiveCheckpointFailures.incrementAndGet();
             totalCheckpointFailures.incrementAndGet();
             recoverFromPhaseBFailure(snapshotShards);
+            // Issue #640: clear the cycle running flag on the Phase C-prep
+            // failure path too.
+            endCompactionCycle();
             throw e;
         }
 
@@ -6572,6 +6789,10 @@ public class PersistentVectorStore extends AbstractVectorStore {
             this.checkpointPhaseComplete = null;
             stateLock.writeLock().unlock();
             lastPhaseCWriteLockNanos.set(System.nanoTime() - stage2Start);
+            // Issue #640: terminate the cycle (clear running flag) on the
+            // happy path. Idempotent w.r.t. the catch-side endCompactionCycle
+            // calls above — a double-clear is just a no-op set(0).
+            endCompactionCycle();
             if (latch != null) {
                 latch.countDown();
             }

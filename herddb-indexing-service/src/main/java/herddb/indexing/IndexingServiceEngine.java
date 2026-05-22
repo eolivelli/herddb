@@ -1665,6 +1665,23 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         return vectorStores.size();
     }
 
+    /**
+     * Snapshot of every loaded {@link PersistentVectorStore}. Used by
+     * {@code GetEngineStats} (issue #640) to aggregate compaction state
+     * across all indexes without holding the {@code vectorStores} map
+     * lock. The returned list is a defensive copy: it is safe to iterate
+     * concurrently with engine mutations.
+     */
+    public java.util.List<PersistentVectorStore> getPersistentVectorStoresSnapshot() {
+        java.util.List<PersistentVectorStore> out = new java.util.ArrayList<>(vectorStores.size());
+        for (AbstractVectorStore s : vectorStores.values()) {
+            if (s instanceof PersistentVectorStore) {
+                out.add((PersistentVectorStore) s);
+            }
+        }
+        return out;
+    }
+
     public int getApplyQueueSize() {
         ExecutorService[] workers = this.applyWorkers;
         if (workers == null) {
@@ -4239,6 +4256,15 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             d.compactionNodesTotal = pvs.getCompactionNodesTotal();
             d.uploadBytesDone = pvs.getUploadBytesDone();
             d.uploadBytesTotal = pvs.getUploadBytesTotal();
+            // Issue #640: real-time compaction observability fields.
+            d.compactionBatchesDone = pvs.getCompactionBatchesDone();
+            d.compactionBatchesTotal = pvs.getCompactionBatchesTotal();
+            d.compactionCycleId = pvs.getCompactionCycleId();
+            d.compactionInputSegmentCount = (int) Math.min(Integer.MAX_VALUE,
+                    pvs.getCompactionInputSegmentCount());
+            d.compactionInputVectorCount = pvs.getCompactionInputVectorCount();
+            d.compactionElapsedMs = pvs.getCompactionElapsedMs();
+            d.compactionRunning = pvs.isCompactionRunning();
             d.nextNodeId = pvs.getNextNodeId();
             if (!"idle".equals(d.compactionPhase)) {
                 d.status = d.compactionPhase;
@@ -5783,6 +5809,14 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         public long compactionNodesTotal;
         public long uploadBytesDone;
         public long uploadBytesTotal;
+        // Real-time compaction observability (issue #640).
+        public long compactionBatchesDone;
+        public long compactionBatchesTotal;
+        public long compactionCycleId;
+        public int compactionInputSegmentCount;
+        public long compactionInputVectorCount;
+        public long compactionElapsedMs;
+        public boolean compactionRunning;
         // Global monotonic node-id counter (issue #256). Widened to long end-to-end;
         // surfaced so clients and dashboards can observe the burn rate.
         public long nextNodeId;

@@ -538,6 +538,14 @@ public final class IndexingAdminCli {
         m.put("compaction_nodes_total", r.getCompactionNodesTotal());
         m.put("upload_bytes_done", r.getUploadBytesDone());
         m.put("upload_bytes_total", r.getUploadBytesTotal());
+        // Issue #640: real-time compaction observability fields.
+        m.put("compaction_batches_done", r.getCompactionBatchesDone());
+        m.put("compaction_batches_total", r.getCompactionBatchesTotal());
+        m.put("compaction_cycle_id", r.getCompactionCycleId());
+        m.put("compaction_input_segment_count", r.getCompactionInputSegmentCount());
+        m.put("compaction_input_vector_count", r.getCompactionInputVectorCount());
+        m.put("compaction_elapsed_ms", r.getCompactionElapsedMs());
+        m.put("compaction_running", r.getCompactionRunning());
         m.put("num_shards", r.getNumShards());
         return m;
     }
