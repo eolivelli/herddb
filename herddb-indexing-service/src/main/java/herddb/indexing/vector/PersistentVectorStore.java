@@ -6418,7 +6418,16 @@ public class PersistentVectorStore extends AbstractVectorStore {
         // cycle-id / elapsed-ms / input-shape bookkeeping the runCompactionCycle
         // path uses. inputSegmentCount=0 because this is the live-shard fold,
         // not an on-disk segment merge; inputVectorCount is the snapshot size.
+        //
+        // The whole post-Phase-A body runs inside the single try/finally
+        // below so a throw from ANY point — Phase B, Phase C-prep,
+        // warmUpNewSegmentsBeforePublish, the Stage-1 deletes apply,
+        // phaseCPostDeletesApplyHook, or Stage 2 — always clears the
+        // running flag. Pre-#640-review the cleanup was scattered across
+        // three open-coded catch arms, which left the running flag stuck
+        // on the catch-less "happy-path" Stage 1 / hook / warmup throws.
         beginCompactionCycle(0, totalSnapshotSize);
+        try {
         List<SegmentWriteResult> newSegmentResults;
         try {
             newSegmentResults = doCheckpointFusedPQPhaseB(
@@ -6457,10 +6466,6 @@ public class PersistentVectorStore extends AbstractVectorStore {
             consecutiveCheckpointFailures.incrementAndGet();
             totalCheckpointFailures.incrementAndGet();
             recoverFromPhaseBFailure(snapshotShards);
-            // Issue #640: the cycle is over, even on failure — clear the
-            // running flag so describe-index does not show a stale "in
-            // progress" state until the next cycle begins.
-            endCompactionCycle();
             throw e;
         }
 
@@ -6534,9 +6539,6 @@ public class PersistentVectorStore extends AbstractVectorStore {
             consecutiveCheckpointFailures.incrementAndGet();
             totalCheckpointFailures.incrementAndGet();
             recoverFromPhaseBFailure(snapshotShards);
-            // Issue #640: clear the cycle running flag on the Phase C-prep
-            // failure path too.
-            endCompactionCycle();
             throw e;
         }
 
@@ -6789,16 +6791,24 @@ public class PersistentVectorStore extends AbstractVectorStore {
             this.checkpointPhaseComplete = null;
             stateLock.writeLock().unlock();
             lastPhaseCWriteLockNanos.set(System.nanoTime() - stage2Start);
-            // Issue #640: terminate the cycle (clear running flag) on the
-            // happy path. Idempotent w.r.t. the catch-side endCompactionCycle
-            // calls above — a double-clear is just a no-op set(0).
-            endCompactionCycle();
             if (latch != null) {
                 latch.countDown();
             }
             synchronized (memoryPressureMonitor) {
                 memoryPressureMonitor.notifyAll();
             }
+        }
+        } finally {
+            // Issue #640: top-level cycle-clear so a throw from ANY point in
+            // the post-Phase-A body — Phase B, Phase C-prep,
+            // warmUpNewSegmentsBeforePublish, the Stage-1 deletes apply,
+            // phaseCPostDeletesApplyHook, or Stage 2 — always clears the
+            // running flag. Per the pr-reviewer pass on #640, the previous
+            // three open-coded calls left a coverage hole for the
+            // unprotected stretch between Phase C-prep success and the
+            // Stage 2 try block. A single finally here makes that category
+            // impossible to forget.
+            endCompactionCycle();
         }
     }
 

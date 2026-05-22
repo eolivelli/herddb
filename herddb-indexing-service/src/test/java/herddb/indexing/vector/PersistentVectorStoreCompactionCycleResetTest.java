@@ -175,6 +175,67 @@ public class PersistentVectorStoreCompactionCycleResetTest {
         }
     }
 
+    /**
+     * pr-reviewer pass #640 follow-up: a throw from the window between
+     * Phase B success and Stage 2 (specifically:
+     * {@code warmUpNewSegmentsBeforePublish}, the Stage-1 deletes apply,
+     * or {@code phaseCPostDeletesApplyHook}) was previously uncovered by
+     * an {@code endCompactionCycle()} call — the running flag would stay
+     * stuck at {@code true} until the next cycle began. With the
+     * top-level try/finally introduced by the review fix, ANY throw from
+     * the checkpoint body must clear the flag.
+     *
+     * <p>This test injects a {@link RuntimeException} via
+     * {@link PersistentVectorStore#setPhaseCPostDeletesApplyHookForTest},
+     * confirms it escapes {@code checkpoint()}, and asserts that
+     * {@link PersistentVectorStore#isCompactionRunning()} is {@code false}
+     * afterwards — i.e. the cycle running flag was cleared by the
+     * top-level finally, not by a path-specific catch arm.
+     */
+    @Test
+    public void runningFlagClearsOnPhaseCHookThrow() throws Exception {
+        Path tmpDir = tmpFolder.newFolder("phasec-throw").toPath();
+        try (PersistentVectorStore store = createStore(tmpDir)) {
+            store.start();
+            // Add a vector so the checkpoint actually does Phase B work.
+            store.addVector(herddb.utils.Bytes.from_int(1), new float[16]);
+
+            // Pre-checkpoint sanity.
+            assertFalse(store.isCompactionRunning());
+            long preCycleId = store.getCompactionCycleId();
+
+            // Force a RuntimeException from the post-deletes-apply hook,
+            // which runs AFTER Phase B success and BEFORE the Stage 2
+            // try/finally — the unprotected window the review flagged.
+            store.setPhaseCPostDeletesApplyHookForTest(() -> {
+                throw new RuntimeException("forced phase-C throw (issue #640 review)");
+            });
+
+            Throwable caught = null;
+            try {
+                store.checkpoint();
+            } catch (Throwable t) {
+                caught = t;
+            }
+            assertTrue("checkpoint must surface the hook's RuntimeException",
+                    caught instanceof RuntimeException);
+
+            // Headline assertion: even though the throw bypassed every
+            // path-specific catch arm, the top-level finally cleared the
+            // running flag. Pre-fix this would have stayed `true` forever.
+            assertFalse("isCompactionRunning() must be false after a Phase-C"
+                            + " hook throw (issue #640 review)",
+                    store.isCompactionRunning());
+            assertEquals("getCompactionElapsedMs() reads 0 once the cycle ends",
+                    0L, store.getCompactionElapsedMs());
+            // The cycle id must still have been bumped by beginCompactionCycle
+            // even though the cycle failed — observers can still detect that
+            // a cycle attempt occurred.
+            assertTrue("compactionCycleId must have bumped on the failed cycle",
+                    store.getCompactionCycleId() > preCycleId);
+        }
+    }
+
     @Test
     public void streamingActiveCounterFlipsPhase() throws Exception {
         Path tmpDir = tmpFolder.newFolder("streaming-phase").toPath();

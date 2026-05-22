@@ -1499,11 +1499,21 @@ final class VectorIndexCompactor {
                     // "compacting-graph" while the batch loop runs
                     // (previously "idle" for the entire multi-minute
                     // jvector run — the central symptom of issue #640).
-                    final PersistentVectorStore storeRef = store;
+                    //
+                    // Order matters: set `done` BEFORE `total` so a racing
+                    // describe-index reader that observes the new `done`
+                    // alongside the still-old `total` sees a strictly
+                    // non-decreasing perceived progress. Setting `total`
+                    // first would briefly expose `done > total` on a new
+                    // level (jvector internally resets `total` per level
+                    // and ramps `done` from 0); `Math.min(100, ...)` in
+                    // getCompactionProgressPercent() keeps the visible
+                    // percent bounded, but the swap is cheap insurance
+                    // for monotonic perception.
                     CompactionProgressListener progressListener =
                             (completed, total) -> {
-                                storeRef.setCompactionBatchesTotal(total);
-                                storeRef.setCompactionBatchesDone(completed);
+                                store.setCompactionBatchesDone(completed);
+                                store.setCompactionBatchesTotal(total);
                             };
                     store.incrementCompactionStreamingActive();
                     try {

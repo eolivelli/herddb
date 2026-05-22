@@ -149,6 +149,17 @@ public class StreamingCompactionISLiveProgressTest {
                     if (cid != observedCycleId.get()) {
                         observedCycleId.set(cid);
                     }
+                    // Throttle the polling loop: this is a sampler, not an
+                    // event-wait. An unthrottled spin on a single-vCPU CI
+                    // runner can starve the thread that drives the cycle,
+                    // slowing the test and increasing the flake surface
+                    // (pr-reviewer pass #640).
+                    try {
+                        Thread.sleep(1);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
                 }
             }, "is-live-progress-watcher");
             watcher.setDaemon(true);

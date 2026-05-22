@@ -177,6 +177,17 @@ public class IndexingServiceEngineStatsCompactionTest {
                         sawNonIdlePhase.set(true);
                         lastNonIdlePhase.set(phase);
                     }
+                    // Throttle the polling loop: every iteration issues an
+                    // RPC, which at full spin produces tens of thousands of
+                    // calls per cycle. On a single-vCPU CI runner that
+                    // starves the cycle thread and amplifies flake risk
+                    // (pr-reviewer pass #640).
+                    try {
+                        Thread.sleep(2);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
                 }
             }, "engine-stats-watcher");
             watcher.setDaemon(true);
