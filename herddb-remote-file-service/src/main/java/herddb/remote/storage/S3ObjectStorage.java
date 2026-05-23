@@ -426,10 +426,28 @@ public class S3ObjectStorage implements ObjectStorage {
     }
 
     /**
-     * Issue #638: single-key existence probe via S3 {@code HEAD} — the cheap,
-     * canonical way to check whether a logical multipart file is stored in
-     * the bulk layout ({@code {logicalPath}.bulk}) before deciding the read
-     * path.
+     * Issue #638/#645: single-key existence probe via S3 {@code HEAD} — the
+     * cheap, canonical way to check whether a logical multipart file is
+     * stored in the bulk layout ({@code {logicalPath}.bulk}) before deciding
+     * the read path.
+     *
+     * <p>Honours the tri-state contract documented on
+     * {@link ObjectStorage#existsObject(String)} (tightened in issue #645):
+     * <ul>
+     *   <li>HEAD 200 → {@code true};</li>
+     *   <li>{@link NoSuchKeyException} or {@link AwsServiceException} with
+     *       HTTP status 404 → {@code false} (definitively absent);</li>
+     *   <li>anything else — generic {@link AwsServiceException} (5xx,
+     *       403, throttling), {@link SdkClientException} (DNS, connect,
+     *       socket timeout), arbitrary {@link RuntimeException} from
+     *       transformer code — completes the future exceptionally.</li>
+     * </ul>
+     *
+     * <p>The previous best-effort behaviour (everything → {@code false})
+     * caused issue #645: a transient MinIO blip on IS restart silently
+     * misrouted reads of direct-S3-uploaded segments through the gRPC
+     * file-server, which crashed the IS with {@code Block not found}
+     * because the file-server has no record of direct-uploaded objects.
      */
     @Override
     public CompletableFuture<Boolean> existsObject(String path) {
@@ -441,15 +459,16 @@ public class S3ObjectStorage implements ObjectStorage {
                 .<Boolean>thenApply(resp -> Boolean.TRUE)
                 .exceptionally(t -> {
                     Throwable cause = (t instanceof CompletionException) ? t.getCause() : t;
-                    // Known S3 "missing object" surfaces — both AWS native and CRT/MinIO —
-                    // map to false; anything else also maps to false to honour the
-                    // best-effort contract of existsObject (must not throw on missing).
+                    // Known S3 "missing object" surface (AWS native).
                     if (cause instanceof NoSuchKeyException) {
                         return Boolean.FALSE;
                     }
-                    // Some S3-compatible stores return a generic SdkServiceException
-                    // with HTTP 404 instead of NoSuchKey. Inspect the status code if
-                    // available — otherwise default to false for the best-effort probe.
+                    // Some S3-compatible stores (CRT, MinIO under some
+                    // configurations) return a generic SdkServiceException
+                    // with HTTP 404 instead of NoSuchKey. Inspect the status
+                    // code — only a true 404 collapses to {@code false}; any
+                    // other status code (403, 5xx, throttling, etc.) is a
+                    // transient/unknown condition and MUST propagate.
                     if (cause instanceof software.amazon.awssdk.awscore.exception.AwsServiceException) {
                         int code = ((software.amazon.awssdk.awscore.exception.AwsServiceException) cause)
                                 .statusCode();
@@ -457,7 +476,16 @@ public class S3ObjectStorage implements ObjectStorage {
                             return Boolean.FALSE;
                         }
                     }
-                    return Boolean.FALSE;
+                    // Issue #645: everything else (SdkClientException, generic
+                    // RuntimeException, AwsServiceException with code != 404)
+                    // propagates as an exceptional completion. Re-throw via
+                    // CompletionException so the existing call-site
+                    // (RemoteFileDataStorageManager.isBulkLayoutOrThrow)
+                    // observes the original cause through ExecutionException.
+                    if (cause instanceof RuntimeException) {
+                        throw (RuntimeException) cause;
+                    }
+                    throw new CompletionException(cause);
                 });
     }
 

@@ -188,7 +188,7 @@ public interface ObjectStorage extends AutoCloseable {
     }
 
     /**
-     * Issue #638: best-effort single-key existence probe used by
+     * Issue #645: tri-state single-key existence probe used by
      * {@link RemoteFileDataStorageManager} to discover whether a logical
      * multipart file is stored in the bulk layout
      * ({@code {logicalPath}.bulk}, a single object) or the legacy per-block
@@ -199,16 +199,47 @@ public interface ObjectStorage extends AutoCloseable {
      * {@link #read(String)} which materialises the whole object — correct,
      * but inefficient.
      *
-     * @return a future that completes with {@code true} if {@code path} is
-     *         present, {@code false} otherwise. Must never complete
-     *         exceptionally for a simple "object missing" answer.
+     * <p><b>Contract (tightened in issue #645):</b> the returned future has
+     * exactly three terminal states, and callers MUST honour the distinction:
+     * <ul>
+     *   <li>completes with {@code true} — the object is present;</li>
+     *   <li>completes with {@code false} — the object is <em>definitively</em>
+     *       absent (e.g. S3 {@code NoSuchKey} / HTTP 404, local file does not
+     *       exist). A {@code false} answer is a strong signal that the caller
+     *       may take an alternate code path safely;</li>
+     *   <li>completes exceptionally — the existence could not be determined
+     *       (transient I/O error, network timeout, HTTP 5xx, generic SDK
+     *       error). Callers that rely on a definitive answer to decide a read
+     *       layout MUST treat this as an error and not silently fall through
+     *       to a different layout — see issue #645 for the failure mode that
+     *       motivated this contract.</li>
+     * </ul>
+     *
+     * <p>Before issue #645 the default implementation collapsed every
+     * exception into {@code false}. That silently misrouted reads of
+     * direct-S3-uploaded files through the gRPC file-server on restart and
+     * crash-looped the indexing service. The new default propagates non
+     * {@code NOT_FOUND} errors exceptionally.
      */
     default CompletableFuture<Boolean> existsObject(String path) {
         return read(path).thenApply(result -> {
-            boolean found = result.status() == ReadResult.Status.FOUND;
+            ReadResult.Status status = result.status();
             result.release();
-            return found;
-        }).exceptionally(t -> Boolean.FALSE);
+            if (status == ReadResult.Status.FOUND) {
+                return Boolean.TRUE;
+            }
+            if (status == ReadResult.Status.NOT_FOUND) {
+                return Boolean.FALSE;
+            }
+            // Defensive: any future ReadResult.Status that is neither FOUND
+            // nor NOT_FOUND is a transient/unknown condition. Surface as an
+            // exceptional completion so the caller can disambiguate (see
+            // issue #645 contract above).
+            throw new java.util.concurrent.CompletionException(
+                    new java.io.IOException(
+                            "existsObject probe returned unrecognised status "
+                                    + status + " for path=" + path));
+        });
     }
 
     /**
