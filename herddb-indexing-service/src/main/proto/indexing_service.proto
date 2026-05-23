@@ -277,10 +277,15 @@ message DescribeIndexResponse {
     //  - memory_pressure_checkpoint_bypass_count is a monotonic counter that
     //    increments every time shouldTriggerMemoryPressureCheckpoint() forced
     //    a checkpoint past the min-live-vectors deferral gate. Operators can
-    //    correlate spikes here with micro_segment_count growth.
+    //    correlate spikes here with micro_segment_count growth. The counter
+    //    is in-memory only: it is monotonic ONLY within a single process
+    //    lifetime and resets to zero on restart (including rolling restarts
+    //    of the indexing-service StatefulSet). Dashboards that alert on
+    //    rate-of-change (rate(...) / irate(...)) handle this correctly;
+    //    dashboards that show the raw counter must annotate restarts to
+    //    avoid the apparent "counter went backwards" jump.
     //  - early_checkpoint_fraction echoes the configured
-    //    indexing.memory.vector.early.checkpoint.fraction (default 0.90 after
-    //    issue #646; was an unconfigurable 0.70 before).
+    //    indexing.memory.vector.early.checkpoint.fraction (default 0.90).
     int32 micro_segment_count = 39;
     int64 memory_pressure_checkpoint_bypass_count = 40;
     double early_checkpoint_fraction = 41;

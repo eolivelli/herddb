@@ -173,7 +173,7 @@ public class MinLiveGateBypassObservabilityTest {
                     1L, store.getTotalMemoryPressureCheckpointBypassCount());
 
             // Phase 4: add another trickle and trigger another bypass cycle.
-            // The counter must accumulate (it is monotonic).
+            // The counter must accumulate (it is monotonic within the process).
             PersistentVectorStore.minLiveVectorsForCheckpoint = 50_000;
             for (int i = 210; i < 220; i++) {
                 store.addVector(Bytes.from_int(i), vec(rng));
@@ -181,6 +181,39 @@ public class MinLiveGateBypassObservabilityTest {
             assertTrue("second pressure-driven cycle must run", store.checkpoint());
             assertEquals("bypass counter must accumulate across cycles",
                     2L, store.getTotalMemoryPressureCheckpointBypassCount());
+
+            // Phase 5: the BIGANN 200M path — segments.size() above the
+            // compactionBackpressureThreshold. The sibling deferral gate at
+            // ~PersistentVectorStore.java:6336 fires under back-pressure; the
+            // memory-pressure trigger must bypass it as well, and the counter
+            // must increment. This is the actual scenario the issue describes
+            // (the time-window path covered in phases 1-4 is its sibling, not
+            // the segment-storm regime). To reach this path deterministically
+            // we drop the back-pressure threshold below the current segment
+            // count rather than building hundreds of segments.
+            //
+            // CRITICAL: keep the threshold high (Integer.MAX_VALUE) while
+            // calling addVector — addVectorInternal blocks on
+            // waitForSegmentCountRelief once segments.size() > threshold, and
+            // the compaction loop is parked (Long.MAX_VALUE interval) so the
+            // block would never lift. Drop the threshold AFTER the trickle is
+            // staged but BEFORE checkpoint() so the deferral gate sees the
+            // over-threshold segment count.
+            int segs = store.getSegmentCount();
+            assertTrue("we need at least 2 segments to make the BP threshold meaningful",
+                    segs >= 2);
+            store.setCompactionBackpressureThreshold(Integer.MAX_VALUE);
+            PersistentVectorStore.minLiveVectorsForCheckpoint = 50_000;
+            for (int i = 220; i < 230; i++) {
+                store.addVector(Bytes.from_int(i), vec(rng));
+            }
+            store.setCompactionBackpressureThreshold(segs - 1);
+            // memory-pressure trigger still on from phase 4.
+            assertTrue("memory pressure must bypass the segment-count BP gate as well",
+                    store.checkpoint());
+            assertEquals("bypass counter must increment on the SEGMENT_COUNT_BACKPRESSURE"
+                    + " path too — this is the BIGANN 200M regime",
+                    3L, store.getTotalMemoryPressureCheckpointBypassCount());
         }
     }
 }

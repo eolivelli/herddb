@@ -750,8 +750,19 @@ public class PersistentVectorStore extends AbstractVectorStore {
      * significant fraction of their runtime) and only fires close to the hard
      * 100% back-pressure limit. Overridden at engine start via
      * {@code herddb.indexing.IndexingServerConfiguration.PROPERTY_MEMORY_VECTOR_EARLY_CHECKPOINT_FRACTION}.
+     *
+     * <p>The literal default mirrors
+     * {@link herddb.indexing.IndexingServerConfiguration#PROPERTY_MEMORY_VECTOR_EARLY_CHECKPOINT_FRACTION_DEFAULT}
+     * — they MUST stay in sync. A field-level reference to the constant is
+     * preferred for new fields but a circular package dependency would be
+     * introduced here (the indexing package depends on the indexing.vector
+     * package, not the other way round); the engine factory is the single
+     * production code path that passes the config value through and is the
+     * only practical risk of drift.
      */
-    private volatile double earlyCheckpointFraction = 0.90d;
+    private volatile double earlyCheckpointFraction =
+            herddb.indexing.IndexingServerConfiguration
+                    .PROPERTY_MEMORY_VECTOR_EARLY_CHECKPOINT_FRACTION_DEFAULT;
 
     /**
      * Maximum wall-clock time (ms) a caller may spend in
@@ -4786,6 +4797,22 @@ public class PersistentVectorStore extends AbstractVectorStore {
     }
 
     /**
+     * Distinguishes which deferral gate would have engaged when a memory-pressure
+     * bypass fires (issue #646). The two gates count toward the same bypass
+     * counter — both represent "the gate would have deferred but the budget
+     * forced the checkpoint through" — but the operator-visible log line
+     * carries the label so a human reading the journal can tell which path
+     * is active. {@link #SEGMENT_COUNT_BACKPRESSURE} is the BIGANN 200M
+     * scenario (segments already past back-pressure threshold);
+     * {@link #TIME_WINDOW} is the simpler "tiny shard, recent checkpoint"
+     * case.
+     */
+    enum BypassReason {
+        SEGMENT_COUNT_BACKPRESSURE,
+        TIME_WINDOW
+    }
+
+    /**
      * Emits the issue #646 bypass notice and increments
      * {@link #totalMemoryPressureCheckpointBypassCount}. Called from
      * {@link #doCheckpointUnderLock} exactly once per checkpoint cycle whenever
@@ -4797,8 +4824,12 @@ public class PersistentVectorStore extends AbstractVectorStore {
      * <p>Logged at INFO so a sustained-pressure workload doesn't fill the
      * WARNING bucket while still being visible in default log configurations.
      */
-    private void logMemoryPressureGateBypass(int totalLiveVectors, int minLiveGate) {
+    private void logMemoryPressureGateBypass(int totalLiveVectors, int minLiveGate,
+            BypassReason reason) {
         totalMemoryPressureCheckpointBypassCount.incrementAndGet();
+        if (!LOGGER.isLoggable(Level.INFO)) {
+            return;
+        }
         final long usage;
         final long max;
         final double fraction;
@@ -4814,12 +4845,14 @@ public class PersistentVectorStore extends AbstractVectorStore {
         }
         LOGGER.log(Level.INFO,
                 "checkpoint {0}: minLiveVectorsForCheckpoint gate bypassed by memory"
-                        + " pressure (live={1} < gate={2}, budget={3} / {4} bytes ="
-                        + " {5}%, trigger fraction={6}) — sealing partial shard."
+                        + " pressure (reason={1}, live={2} < gate={3}, segments={4},"
+                        + " budget={5} / {6} bytes = {7}%, trigger fraction={8})"
+                        + " — sealing partial shard."
                         + " Consider raising indexing.memory.vector.early.checkpoint.fraction"
                         + " or indexing.memory.vector.percentage to prevent"
                         + " micro-segment accumulation.",
-                new Object[]{indexName, totalLiveVectors, minLiveGate, usage, max,
+                new Object[]{indexName, reason, totalLiveVectors, minLiveGate,
+                        segments.size(), usage, max,
                         String.format(java.util.Locale.ROOT, "%.1f", fraction * 100.0d),
                         String.format(java.util.Locale.ROOT, "%.2f", earlyCheckpointFraction)});
     }
@@ -6424,12 +6457,30 @@ public class PersistentVectorStore extends AbstractVectorStore {
             // cycles. The conditions mirror the gate above with the
             // memoryPressureTrigger flag flipped: this is exactly the path that
             // produced the BIGANN 200M segment storm.
+            //
+            // We further distinguish two gate variants because they have
+            // different operational meaning:
+            //   - SEGMENT_COUNT_BACKPRESSURE: segments.size() is already above
+            //     compactionBackpressureThreshold (line 6336 sibling gate).
+            //     This is the BIGANN 200M scenario — the live shard is tiny
+            //     AND the on-disk segment count is already past back-pressure,
+            //     so sealing the tiny shard would push the count further past.
+            //   - TIME_WINDOW: the elapsed-since-last-success deferral window
+            //     (line 6356 sibling gate). The segment count is fine but the
+            //     gate would still have deferred for time-bounded reasons.
+            // The two share the same counter (both are "the gate would have
+            // deferred but memory pressure forced through") but log under
+            // distinct labels so an operator parsing logs can tell which path
+            // is firing.
             if (memoryPressureTrigger
                     && minLiveGate > 0
                     && totalLiveVectors < minLiveGate
                     && !anySegmentDirty
                     && !segments.isEmpty()) {
-                logMemoryPressureGateBypass(totalLiveVectors, minLiveGate);
+                BypassReason reason = segments.size() > compactionBackpressureThreshold
+                        ? BypassReason.SEGMENT_COUNT_BACKPRESSURE
+                        : BypassReason.TIME_WINDOW;
+                logMemoryPressureGateBypass(totalLiveVectors, minLiveGate, reason);
             }
         } finally {
             stateLock.writeLock().unlock();

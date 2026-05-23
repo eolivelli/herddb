@@ -120,7 +120,12 @@ public class EarlyCheckpointFractionConfigTest {
                     store.setEarlyCheckpointFraction(bad);
                     fail("expected IllegalArgumentException for fraction " + bad);
                 } catch (IllegalArgumentException expected) {
-                    // ok
+                    // The operator-visible diagnostic must include the offending
+                    // value so a misconfigured IndexingServer (which propagates
+                    // the IAE via start()) tells the operator what to fix.
+                    assertTrue("IAE message must contain the offending value (was: \""
+                                    + expected.getMessage() + "\")",
+                            expected.getMessage().contains(String.valueOf(bad)));
                 }
             }
             // The boundary value 1.0 is accepted (no bypass until the hard
