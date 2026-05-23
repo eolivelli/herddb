@@ -176,6 +176,7 @@ The `IndexingServerConfiguration` class provides typed access to all IndexingSer
 | Log dir | `indexing.log.dir` | `txlog` | WAL directory to tail |
 | Data dir | `indexing.data.dir` | `data` | Data directory for persistence |
 | Max vector memory | `indexing.memory.vector.limit` | `0` | Max memory for vector data. 0 = unbounded. |
+| Early-checkpoint fraction | `indexing.memory.vector.early.checkpoint.fraction` | `0.90` | Fraction of the `VectorMemoryBudget` above which `PersistentVectorStore.shouldTriggerMemoryPressureCheckpoint()` returns true, forcing an early checkpoint and bypassing the `minLiveVectorsForCheckpoint` deferral gate. Range `(0.0, 1.0]`. Lower this to flush earlier (smaller segments, more checkpoint cycles); raise it to keep the gate active longer and run Phase B closer to the hard 100% back-pressure limit. The hard back-pressure path that blocks `addVector` when the budget is fully consumed is unaffected by this knob — it is always armed at the `maxMemoryBytes` ceiling. |
 | Page size | `indexing.memory.page.size` | `1048576` | Logical page size for MemoryManager (1 MB). |
 | Vector M | `indexing.vector.m` | `16` | Default M for new vector stores |
 | Vector beam width | `indexing.vector.beamWidth` | `100` | Default beam width |
@@ -376,7 +377,8 @@ The `memoryMultiplier` (default `5.0`, configurable via `herddb.vector.memoryMul
 
 - `totalEstimatedMemoryUsageBytes()` — sum of all stores' estimates.
 - `maxMemoryBytes()` — the configured global cap (`indexing.memory.vector.limit`; 0 means unbounded, effectively `Long.MAX_VALUE`).
-- `isAboveThreshold(double fraction)` — returns true if total usage exceeds `fraction * maxMemoryBytes`. Used to trigger early checkpoints at 70% utilization.
+- `isAboveThreshold(double fraction)` — returns true if total usage exceeds `fraction * maxMemoryBytes`. Used by `PersistentVectorStore.shouldTriggerMemoryPressureCheckpoint()` to trigger early checkpoints when the budget crosses the configurable `indexing.memory.vector.early.checkpoint.fraction` (default `0.90`; range `(0.0, 1.0]`). Below the fraction the `minLiveVectorsForCheckpoint` deferral gate stays active and produces larger segments; above it the gate is bypassed and the live shard is flushed regardless of size, even when small.
+- `budgetFraction()` — returns the current usage as a fraction of `maxMemoryBytes()` (`0.0` when the limit is `Long.MAX_VALUE` or `<= 0`). The result is not clamped: it can legitimately exceed `1.0` during the brief window between crossing the hard limit and the back-pressure path draining the live shards. Exposed as the `vector_memory_budget_fraction_milli` Prometheus gauge (encoded ×1000 so the double survives the Long-typed gauge channel; divide by 1000 in dashboards to recover the fraction).
 
 ### Backpressure mechanism
 
@@ -423,13 +425,21 @@ This means: **insert threads block inside `addVector` until Phase C completes**.
 - `backpressureActive` (volatile int) — currently blocked insert threads.
 - `lastCheckpointPhaseBDurationMs` — duration of last Phase B.
 - `lastCheckpointVectorsProcessed` — vectors processed in last checkpoint.
+- `totalMemoryPressureCheckpointBypassCount` (AtomicLong) — number of checkpoint cycles where the `minLiveVectorsForCheckpoint` gate would have deferred but was bypassed because the `VectorMemoryBudget` had crossed `earlyCheckpointFraction`. In-memory counter: monotonic only within a single process lifetime, resets to zero on restart, so dashboards alerting on rate-of-change (`rate(...)` / `irate(...)`) handle restarts correctly. Exposed as the per-index Prometheus gauge `tablespace_<>_table_<>_vidx_<>_memory_pressure_checkpoint_bypass_total` and as the `memory_pressure_checkpoint_bypass_count` field of `DescribeIndexResponse`.
+- `microSegmentCount` — number of currently-loaded on-disk segments whose live-node count is strictly below `vector.index.compaction.microsegment.max.nodes`. Computed on-demand by walking the `CopyOnWriteArrayList<VectorSegment>` snapshot and reading each segment's atomic `liveCount`. A rising value is the leading indicator that the segment-count back-pressure is about to fire; pair it with `memory_pressure_checkpoint_bypass_total` to diagnose whether the cause is the early-checkpoint bypass. Exposed as the per-index gauge `tablespace_<>_table_<>_vidx_<>_microsegment_count` and as the `micro_segment_count` field of `DescribeIndexResponse`.
+
+Engine-wide gauges (independent of any specific index, scoped under `vector_memory.*`):
+
+- `vector_memory_budget_max_bytes` — `VectorMemoryBudget.maxMemoryBytes()`; `0` when the budget is unbounded (`Long.MAX_VALUE`).
+- `vector_memory_budget_used_bytes` — `VectorMemoryBudget.totalEstimatedMemoryUsageBytes()` summed across every loaded `PersistentVectorStore`.
+- `vector_memory_budget_fraction_milli` — `VectorMemoryBudget.budgetFraction()` × 1000 (Long-encoded so the double survives the gauge channel; divide by 1000 in dashboards). Values `>1000` are legitimate and indicate the budget is over the hard limit while the back-pressure path drains the live shards.
 
 ### Background compaction thread
 
 `PersistentVectorStore` has its own daemon compaction thread that triggers checkpoint when:
 
 - `dirty.get() == true` — any modification since last checkpoint AND the compaction interval has elapsed.
-- `memoryBudget.isAboveThreshold(0.7)` — global memory is at 70% of configured limit.
+- `memoryBudget.isAboveThreshold(earlyCheckpointFraction)` — global memory has crossed the configured `indexing.memory.vector.early.checkpoint.fraction` (default `0.90`). The trigger logs an INFO line on every truthy reading; when it forces a checkpoint past the `minLiveVectorsForCheckpoint` gate (live shard below the gate, no dirty segments, at least one segment already on disk) the store additionally logs an INFO "gate bypassed by memory pressure" line and increments the `memory_pressure_checkpoint_bypass_total` counter — the operator-visible signal that the store is in the segment-storm regime that motivated issue #646.
 
 The thread wakes on a timer (polling at 50–100 ms) or immediately via `synchronized(compactionWakeUp) { compactionWakeUp.notifyAll() }`. The `IndexingServiceEngine` also runs a `ScheduledExecutorService` that periodically sweeps all registered stores and triggers checkpoints, providing a second level of compaction scheduling.
 

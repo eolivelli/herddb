@@ -383,7 +383,12 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
                     .setCompactionInputSegmentCount(details.compactionInputSegmentCount)
                     .setCompactionInputVectorCount(details.compactionInputVectorCount)
                     .setCompactionElapsedMs(details.compactionElapsedMs)
-                    .setCompactionRunning(details.compactionRunning);
+                    .setCompactionRunning(details.compactionRunning)
+                    // Issue #646 early-checkpoint observability.
+                    .setMicroSegmentCount(details.microSegmentCount)
+                    .setMemoryPressureCheckpointBypassCount(
+                            details.memoryPressureCheckpointBypassCount)
+                    .setEarlyCheckpointFraction(details.earlyCheckpointFraction);
             responseObserver.onNext(builder.build());
             responseObserver.onCompleted();
         } catch (RuntimeException e) {

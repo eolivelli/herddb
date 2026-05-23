@@ -1884,6 +1884,349 @@
           "dashLength": 10,
           "dashes": false,
           "datasource": "Prometheus",
+          "description": "Engine-wide VectorMemoryBudget fraction (used / max), expressed as a percentage. Issue #646 made the early-checkpoint trigger configurable; default fires at 90%. The hard back-pressure path that blocks addVector fires at 100%. Anything sustained above the configured early-checkpoint fraction means the minLiveVectorsForCheckpoint gate is being bypassed — pair this with the per-index 'Early-Checkpoint Gate Bypass' panel.",
+          "fill": 1,
+          "id": 64601,
+          "legend": {
+            "avg": false,
+            "current": true,
+            "max": true,
+            "min": false,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "percentage": false,
+          "pointradius": 5,
+          "points": false,
+          "renderer": "flot",
+          "seriesOverrides": [],
+          "spaceLength": 10,
+          "span": 6,
+          "stack": false,
+          "steppedLine": false,
+          "targets": [
+            {
+              "expr": "vector_memory_budget_fraction_milli{job=\"indexing-service\",instance=~\"$instance\"} / 10",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "{{instance}} budget % of max",
+              "refId": "A"
+            }
+          ],
+          "thresholds": [
+            {
+              "colorMode": "warning",
+              "fill": false,
+              "line": true,
+              "op": "gt",
+              "value": 90,
+              "yaxis": "left"
+            },
+            {
+              "colorMode": "critical",
+              "fill": false,
+              "line": true,
+              "op": "gt",
+              "value": 100,
+              "yaxis": "left"
+            }
+          ],
+          "title": "Vector Memory Budget — Fraction of Max (issue #646)",
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
+          "type": "graph",
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
+          "yaxes": [
+            {
+              "format": "percent",
+              "min": 0,
+              "show": true
+            },
+            {
+              "format": "short",
+              "show": true
+            }
+          ]
+        },
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "description": "Engine-wide VectorMemoryBudget — used vs max bytes, summed across every loaded PersistentVectorStore. Companion to the fraction panel: the percentage hides the absolute headroom you have to either raise the budget or kick more aggressive compaction.",
+          "fill": 1,
+          "id": 64602,
+          "legend": {
+            "avg": false,
+            "current": true,
+            "max": true,
+            "min": false,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "percentage": false,
+          "pointradius": 5,
+          "points": false,
+          "renderer": "flot",
+          "seriesOverrides": [],
+          "spaceLength": 10,
+          "span": 6,
+          "stack": false,
+          "steppedLine": false,
+          "targets": [
+            {
+              "expr": "vector_memory_budget_max_bytes{job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "{{instance}} budget max",
+              "refId": "A"
+            },
+            {
+              "expr": "vector_memory_budget_used_bytes{job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "{{instance}} budget used",
+              "refId": "B"
+            }
+          ],
+          "thresholds": [],
+          "title": "Vector Memory Budget — Used vs Max (issue #646)",
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
+          "type": "graph",
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
+          "yaxes": [
+            {
+              "format": "bytes",
+              "show": true
+            },
+            {
+              "format": "short",
+              "show": true
+            }
+          ]
+        },
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "description": "Number of checkpoint cycles where the minLiveVectorsForCheckpoint deferral gate was bypassed because the global vector memory budget crossed indexing.memory.vector.early.checkpoint.fraction. Each bypass seals the current (possibly tiny) live shard into a new on-disk micro-segment — at the BIGANN 200M scale this was the root cause of the segment storm. NOTE: counter is in-memory only — resets on every process restart. Use rate() or irate() for alerts so rolling restarts are handled correctly.",
+          "fill": 1,
+          "id": 64603,
+          "legend": {
+            "avg": false,
+            "current": true,
+            "max": true,
+            "min": false,
+            "show": true,
+            "total": true,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "span": 6,
+          "targets": [
+            {
+              "expr": "{__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_memory_pressure_checkpoint_bypass_total\",job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "{{__name__}} (cumulative)",
+              "refId": "A"
+            },
+            {
+              "expr": "rate({__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_memory_pressure_checkpoint_bypass_total\",job=\"indexing-service\",instance=~\"$instance\"}[5m])",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "{{__name__}} (rate 5m)",
+              "refId": "B"
+            }
+          ],
+          "thresholds": [],
+          "title": "Early-Checkpoint Gate Bypass — Total + 5m Rate (issue #646)",
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
+          "type": "graph",
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
+          "yaxes": [
+            {
+              "format": "short",
+              "decimals": 0,
+              "show": true
+            },
+            {
+              "format": "short",
+              "show": true
+            }
+          ]
+        },
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "description": "Currently-loaded on-disk segments with live-node count strictly below vector.index.compaction.microsegment.max.nodes. Rising values are the leading indicator that the early-checkpoint bypass is producing micro-segments — confirm by correlating with the bypass counter above. Sustained growth precedes the segment-count back-pressure firing.",
+          "fill": 1,
+          "id": 64604,
+          "legend": {
+            "avg": false,
+            "current": true,
+            "max": true,
+            "min": false,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "span": 6,
+          "targets": [
+            {
+              "expr": "{__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_microsegment_count\",job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "{{__name__}} (micro)",
+              "refId": "A"
+            },
+            {
+              "expr": "{__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_segment_count\",job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "{{__name__}} (total — reference)",
+              "refId": "B"
+            }
+          ],
+          "thresholds": [],
+          "title": "Micro-Segment Count vs Total Segments (issue #646)",
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
+          "type": "graph",
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
+          "yaxes": [
+            {
+              "format": "short",
+              "decimals": 0,
+              "show": true
+            },
+            {
+              "format": "short",
+              "show": true
+            }
+          ]
+        },
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "description": "Echoes the configured indexing.memory.vector.early.checkpoint.fraction (default 0.90). The value is encoded ×1000 on the wire so the double survives the Long-typed gauge channel — this panel divides by 1000 to recover the original fraction. Useful as a configuration-drift sanity check: if a rolling restart changes the value, this panel shows it without grepping configmaps.",
+          "fill": 1,
+          "id": 64605,
+          "legend": {
+            "avg": false,
+            "current": true,
+            "max": false,
+            "min": false,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "span": 12,
+          "targets": [
+            {
+              "expr": "{__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_early_checkpoint_fraction\",job=\"indexing-service\",instance=~\"$instance\"} / 1000",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "{{__name__}}",
+              "refId": "A"
+            }
+          ],
+          "thresholds": [],
+          "title": "Configured Early-Checkpoint Fraction (per index, issue #646)",
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
+          "type": "graph",
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
+          "yaxes": [
+            {
+              "format": "percentunit",
+              "min": 0,
+              "max": 1,
+              "show": true
+            },
+            {
+              "format": "short",
+              "show": true
+            }
+          ]
+        }
+      ],
+      "showTitle": true,
+      "title": "Memory-Pressure Early Checkpoint & Micro-Segments (issue #646)",
+      "titleSize": "h6"
+    },
+    {
+      "collapse": false,
+      "height": 250,
+      "panels": [
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
           "fill": 1,
           "id": 27,
           "legend": {

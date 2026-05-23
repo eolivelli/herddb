@@ -828,6 +828,12 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             final double vectorCompactionLocalKickFraction = config.getDouble(
                     IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_LOCAL_KICK_FRACTION,
                     IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_LOCAL_KICK_FRACTION_DEFAULT);
+            // Issue #646: early-checkpoint memory-pressure fraction. Validated
+            // by {@link PersistentVectorStore#setEarlyCheckpointFraction}, which
+            // throws IllegalArgumentException at start time if out of range.
+            final double vectorMemoryEarlyCheckpointFraction = config.getDouble(
+                    IndexingServerConfiguration.PROPERTY_MEMORY_VECTOR_EARLY_CHECKPOINT_FRACTION,
+                    IndexingServerConfiguration.PROPERTY_MEMORY_VECTOR_EARLY_CHECKPOINT_FRACTION_DEFAULT);
             final boolean vectorCompactionLocalEnabledWithOptimizer = config.getBoolean(
                     IndexingServerConfiguration
                             .PROPERTY_VECTOR_INDEX_COMPACTION_LOCAL_ENABLED_WITH_OPTIMIZER,
@@ -838,7 +844,8 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                             + "backpressureMaxWaitMs={2}, localKickFraction={3},"
                             + " localEnabledWithOptimizer={4},"
                             + " microSegmentMaxNodes={5}, maxInputs={6},"
-                            + " maxInputBytes={7}, targetBytes={8}, maxOutputNodes={9}",
+                            + " maxInputBytes={7}, targetBytes={8}, maxOutputNodes={9},"
+                            + " earlyCheckpointFraction={10}",
                     new Object[]{vectorCompactionTieredEnabled, vectorCompactionBackpressureSegments,
                             vectorCompactionBackpressureMaxWaitMs,
                             vectorCompactionLocalKickFraction,
@@ -847,7 +854,8 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                             vectorCompactionMaxInputs,
                             vectorCompactionMaxInputBytes,
                             vectorCompactionTargetBytes,
-                            vectorCompactionMaxOutputNodes});
+                            vectorCompactionMaxOutputNodes,
+                            vectorMemoryEarlyCheckpointFraction});
             // Async IO pipeline for FusedPQ search (issue #547).
             // Config key takes precedence over the system property.
             final boolean vectorSearchAsyncPipelineEnabled = config.getBoolean(
@@ -977,6 +985,13 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                 store.setLocalCompactionKickFraction(vectorCompactionLocalKickFraction);
                 store.setLocalCompactionEnabledWithOptimizer(
                         vectorCompactionLocalEnabledWithOptimizer);
+                // Issue #646: early-checkpoint memory-pressure fraction. Set
+                // via a setter rather than a constructor argument so the seven
+                // existing PersistentVectorStore constructor variants don't
+                // need yet another overload. Validation is centralised in the
+                // setter and throws IllegalArgumentException at start time if
+                // the operator configured a value outside (0.0, 1.0].
+                store.setEarlyCheckpointFraction(vectorMemoryEarlyCheckpointFraction);
                 // Issue #569: hand the warmup byte budget to the store so it can
                 // warm each new segment's block cache AT CREATION TIME (in the
                 // checkpoint Phase C-prep and compaction merge paths), before the
@@ -4276,6 +4291,11 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             d.compactionElapsedMs = pvs.getCompactionElapsedMs();
             d.compactionRunning = pvs.isCompactionRunning();
             d.nextNodeId = pvs.getNextNodeId();
+            // Issue #646 observability.
+            d.microSegmentCount = pvs.getMicroSegmentCount();
+            d.memoryPressureCheckpointBypassCount =
+                    pvs.getTotalMemoryPressureCheckpointBypassCount();
+            d.earlyCheckpointFraction = pvs.getEarlyCheckpointFraction();
             if (!"idle".equals(d.compactionPhase)) {
                 d.status = d.compactionPhase;
             }
@@ -4366,6 +4386,44 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         // their own netty_ prefix — pass the root logger, not a scope.
         if (statsLogger != null) {
             herddb.core.stats.NettyMemoryMetrics.register(statsLogger);
+            // Issue #646: engine-wide vector budget gauges. The fraction
+            // gauge is exposed ×1000 (Long channel) so dashboards can plot
+            // memory pressure without computing the ratio from raw bytes.
+            // Idempotent: BookKeeper's PrometheusMetricsProvider keeps the
+            // last registration and StatsLogger contracts allow re-register.
+            final IndexingServiceEngine self = this;
+            StatsLogger memoryStats = statsLogger.scope("vector_memory");
+            memoryStats.registerGauge("budget_max_bytes", new Gauge<Long>() {
+                @Override
+                public Long getDefaultValue() {
+                    return 0L;
+                }
+                @Override
+                public Long getSample() {
+                    long max = self.maxMemoryBytes();
+                    return max == Long.MAX_VALUE ? 0L : max;
+                }
+            });
+            memoryStats.registerGauge("budget_used_bytes", new Gauge<Long>() {
+                @Override
+                public Long getDefaultValue() {
+                    return 0L;
+                }
+                @Override
+                public Long getSample() {
+                    return self.totalEstimatedMemoryUsageBytes();
+                }
+            });
+            memoryStats.registerGauge("budget_fraction_milli", new Gauge<Long>() {
+                @Override
+                public Long getDefaultValue() {
+                    return 0L;
+                }
+                @Override
+                public Long getSample() {
+                    return Math.round(self.budgetFraction() * 1000.0d);
+                }
+            });
         }
     }
 
@@ -4951,6 +5009,47 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                 @Override
                 public Long getSample() {
                     return pvs.getSegmentCountBackpressureTimeouts();
+                }
+            });
+            // Issue #646 observability — early-checkpoint memory-pressure
+            // bypass counter, current budget fraction, and micro-segment count.
+            // The counter lets operators tell genuine "shard full" checkpoints
+            // apart from the micro-segment-prone bypass path; the fraction
+            // gauge makes the global memory-pressure ratio dashboardable
+            // without computing it from raw byte counters; the micro-segment
+            // count is a real-time signal that micro-segments are accumulating.
+            indexStats.registerGauge("memory_pressure_checkpoint_bypass_total",
+                    new Gauge<Long>() {
+                @Override
+                public Long getDefaultValue() {
+                    return 0L;
+                }
+                @Override
+                public Long getSample() {
+                    return pvs.getTotalMemoryPressureCheckpointBypassCount();
+                }
+            });
+            indexStats.registerGauge("microsegment_count", new Gauge<Integer>() {
+                @Override
+                public Integer getDefaultValue() {
+                    return 0;
+                }
+                @Override
+                public Integer getSample() {
+                    return pvs.getMicroSegmentCount();
+                }
+            });
+            indexStats.registerGauge("early_checkpoint_fraction", new Gauge<Long>() {
+                @Override
+                public Long getDefaultValue() {
+                    return 0L;
+                }
+                @Override
+                public Long getSample() {
+                    // Stored ×1000 so the fraction (0.0–1.0) survives the
+                    // Long-typed gauge channel without precision loss. Dashboards
+                    // divide by 1000 to recover the original double.
+                    return Math.round(pvs.getEarlyCheckpointFraction() * 1000.0d);
                 }
             });
             indexStats.registerGauge("max_vector_memory_bytes", new Gauge<Long>() {
@@ -5834,5 +5933,12 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         // Controls within-instance HNSW graph-bucket granularity; defaults to
         // 1 when the property is absent. Issue #451.
         public int numShards = 1;
+        // Issue #646 — current micro-segment count, total bypass count, and
+        // configured early-checkpoint fraction. Surfaced via describe-index
+        // / engine-stats --json so operators can diagnose micro-segment
+        // accumulation without scraping logs.
+        public int microSegmentCount;
+        public long memoryPressureCheckpointBypassCount;
+        public double earlyCheckpointFraction;
     }
 }

@@ -740,6 +740,31 @@ public class PersistentVectorStore extends AbstractVectorStore {
     private volatile int compactionBackpressureThreshold = 500;
 
     /**
+     * Fraction of the {@link VectorMemoryBudget} (or per-store
+     * {@link #maxVectorMemoryBytes}) above which
+     * {@link #shouldTriggerMemoryPressureCheckpoint()} returns {@code true},
+     * forcing an early checkpoint and bypassing the {@code minLiveVectorsForCheckpoint}
+     * gate (issue #646). Must be in {@code (0.0, 1.0]}. Default is {@code 0.90}
+     * — high enough that the gate keeps producing reasonably-sized segments
+     * through the 70&ndash;90% range (which is where long ingest workloads spend a
+     * significant fraction of their runtime) and only fires close to the hard
+     * 100% back-pressure limit. Overridden at engine start via
+     * {@code herddb.indexing.IndexingServerConfiguration.PROPERTY_MEMORY_VECTOR_EARLY_CHECKPOINT_FRACTION}.
+     *
+     * <p>The literal default mirrors
+     * {@link herddb.indexing.IndexingServerConfiguration#PROPERTY_MEMORY_VECTOR_EARLY_CHECKPOINT_FRACTION_DEFAULT}
+     * — they MUST stay in sync. A field-level reference to the constant is
+     * preferred for new fields but a circular package dependency would be
+     * introduced here (the indexing package depends on the indexing.vector
+     * package, not the other way round); the engine factory is the single
+     * production code path that passes the config value through and is the
+     * only practical risk of drift.
+     */
+    private volatile double earlyCheckpointFraction =
+            herddb.indexing.IndexingServerConfiguration
+                    .PROPERTY_MEMORY_VECTOR_EARLY_CHECKPOINT_FRACTION_DEFAULT;
+
+    /**
      * Maximum wall-clock time (ms) a caller may spend in
      * {@link #waitForSegmentCountRelief} before back-pressure is
      * force-released with a SEVERE log (issue #370).
@@ -974,6 +999,16 @@ public class PersistentVectorStore extends AbstractVectorStore {
      * "nothing dirty" early return, which represents a durable state.
      */
     private final AtomicLong totalCheckpointsDeferred = new AtomicLong(0);
+    /**
+     * Number of times {@link #doCheckpointUnderLock} ran Phase A with a live
+     * shard below {@link #minLiveVectorsForCheckpoint} only because
+     * {@link #shouldTriggerMemoryPressureCheckpoint()} forced the bypass
+     * (issue #646). Surfaced as the {@code memory_pressure_checkpoint_bypass_total}
+     * metric so operators can tell genuine "shard full" checkpoints apart from
+     * the micro-segment-prone "budget over threshold, gate bypassed" path that
+     * caused the BIGANN 200M segment storm.
+     */
+    private final AtomicLong totalMemoryPressureCheckpointBypassCount = new AtomicLong(0);
     private final AtomicLong lastCheckpointVectorsProcessed = new AtomicLong(0);
     /** Approximate bytes written by the last completed Phase B. */
     private final AtomicLong lastPhaseBBytesWritten = new AtomicLong(0);
@@ -2375,6 +2410,29 @@ public class PersistentVectorStore extends AbstractVectorStore {
     public void setCompactionBackpressureThreshold(int threshold) {
         this.compactionBackpressureThreshold = threshold;
         recomputeKickThresholdCached();
+    }
+
+    /**
+     * Sets the early-checkpoint memory-pressure fraction (issue #646). Must be
+     * in {@code (0.0, 1.0]}. When the {@link VectorMemoryBudget} (or per-store
+     * limit) crosses this fraction of its ceiling,
+     * {@link #shouldTriggerMemoryPressureCheckpoint()} returns {@code true} —
+     * forcing an early checkpoint and bypassing the
+     * {@code minLiveVectorsForCheckpoint} gate. Lower this to flush earlier
+     * (smaller segments, more cycles); raise it to keep the gate active longer
+     * and run Phase B closer to the hard limit.
+     */
+    public void setEarlyCheckpointFraction(double fraction) {
+        if (!(fraction > 0.0d && fraction <= 1.0d)) {
+            throw new IllegalArgumentException(
+                    "earlyCheckpointFraction must be in (0.0, 1.0], got " + fraction);
+        }
+        this.earlyCheckpointFraction = fraction;
+    }
+
+    /** Returns the current early-checkpoint memory-pressure fraction (issue #646). */
+    public double getEarlyCheckpointFraction() {
+        return earlyCheckpointFraction;
     }
 
     /**
@@ -4693,9 +4751,10 @@ public class PersistentVectorStore extends AbstractVectorStore {
         // in-memory HNSW shards onto disk; it cannot reduce the on-disk segment
         // pkData/BLink footprint that {@link #estimatedMemoryUsageBytes()} (and
         // the global budget) also count. With many on-disk segments that
-        // footprint alone can permanently exceed the 70% threshold, so without
-        // this guard the compaction loop fires a spurious, no-op Phase A every
-        // cycle even though there are 0 live vectors.
+        // footprint alone can permanently exceed the early-checkpoint
+        // threshold ({@link #earlyCheckpointFraction}, default 90% post-#646),
+        // so without this guard the compaction loop fires a spurious, no-op
+        // Phase A every cycle even though there are 0 live vectors.
         //
         // The count spans live + frozen + deferred shards — the same shard set
         // {@link #getLiveShardMemoryBytes()} measures — so a checkpoint that
@@ -4704,13 +4763,22 @@ public class PersistentVectorStore extends AbstractVectorStore {
         if (liveFrozenDeferredNodeCount() == 0) {
             return false;
         }
+        // Threshold is configurable per issue #646 — operators can raise it to
+        // keep the minLiveVectorsForCheckpoint gate active longer (preventing
+        // micro-segment accumulation in the 70-90% memory range), or lower it
+        // to flush earlier.
+        final double fraction = earlyCheckpointFraction;
+        final long pct = Math.round(fraction * 100.0d);
         // Check global budget first (covers all stores sharing the same heap)
         if (memoryBudget != null) {
-            boolean trigger = memoryBudget.isAboveThreshold(0.7);
+            boolean trigger = memoryBudget.isAboveThreshold(fraction);
             if (trigger) {
                 LOGGER.log(Level.INFO,
-                        "vector store {0} memory pressure (global): {1} bytes exceeds 70% of global limit {2} bytes, triggering early checkpoint",
-                        new Object[]{indexName, memoryBudget.totalEstimatedMemoryUsageBytes(), memoryBudget.maxMemoryBytes()});
+                        "vector store {0} memory pressure (global): {1} bytes exceeds {2}% of global limit {3} bytes, triggering early checkpoint",
+                        new Object[]{indexName,
+                                memoryBudget.totalEstimatedMemoryUsageBytes(),
+                                pct,
+                                memoryBudget.maxMemoryBytes()});
             }
             return trigger;
         }
@@ -4719,13 +4787,79 @@ public class PersistentVectorStore extends AbstractVectorStore {
             return false;
         }
         long usage = estimatedMemoryUsageBytes();
-        boolean trigger = usage > (long) (maxVectorMemoryBytes * 0.7);
+        boolean trigger = usage > (long) (maxVectorMemoryBytes * fraction);
         if (trigger) {
             LOGGER.log(Level.INFO,
-                    "vector store {0} memory pressure: {1} bytes exceeds 70% of limit {2} bytes, triggering early checkpoint",
-                    new Object[]{indexName, usage, maxVectorMemoryBytes});
+                    "vector store {0} memory pressure: {1} bytes exceeds {2}% of limit {3} bytes, triggering early checkpoint",
+                    new Object[]{indexName, usage, pct, maxVectorMemoryBytes});
         }
         return trigger;
+    }
+
+    /**
+     * Distinguishes which deferral gate would have engaged when a memory-pressure
+     * bypass fires (issue #646). The two gates count toward the same bypass
+     * counter — both represent "the gate would have deferred but the budget
+     * forced the checkpoint through" — but the operator-visible log line
+     * carries the label so a human reading the journal can tell which path
+     * is active. {@link #SEGMENT_COUNT_BACKPRESSURE} is the BIGANN 200M
+     * scenario (segments already past back-pressure threshold);
+     * {@link #TIME_WINDOW} is the simpler "tiny shard, recent checkpoint"
+     * case.
+     */
+    enum BypassReason {
+        SEGMENT_COUNT_BACKPRESSURE,
+        TIME_WINDOW
+    }
+
+    /**
+     * Emits the issue #646 bypass notice and increments
+     * {@link #totalMemoryPressureCheckpointBypassCount}. Called from
+     * {@link #doCheckpointUnderLock} exactly once per checkpoint cycle whenever
+     * the min-live-vectors gate would have deferred this cycle but
+     * {@link #shouldTriggerMemoryPressureCheckpoint()} forced it through. Kept
+     * separate so the gate code stays readable and so tests can assert the
+     * counter without scraping the log stream.
+     *
+     * <p>Logged at INFO so a sustained-pressure workload doesn't fill the
+     * WARNING bucket while still being visible in default log configurations.
+     */
+    private void logMemoryPressureGateBypass(int totalLiveVectors, int minLiveGate,
+            BypassReason reason) {
+        totalMemoryPressureCheckpointBypassCount.incrementAndGet();
+        if (!LOGGER.isLoggable(Level.INFO)) {
+            return;
+        }
+        final long usage;
+        final long max;
+        final double fraction;
+        if (memoryBudget != null) {
+            usage = memoryBudget.totalEstimatedMemoryUsageBytes();
+            max = memoryBudget.maxMemoryBytes();
+            fraction = memoryBudget.budgetFraction();
+        } else {
+            usage = estimatedMemoryUsageBytes();
+            max = maxVectorMemoryBytes;
+            fraction = max == Long.MAX_VALUE || max <= 0L
+                    ? 0.0d : (double) usage / (double) max;
+        }
+        LOGGER.log(Level.INFO,
+                "checkpoint {0}: minLiveVectorsForCheckpoint gate bypassed by memory"
+                        + " pressure (reason={1}, live={2} < gate={3}, segments={4},"
+                        + " budget={5} / {6} bytes = {7}%, trigger fraction={8})"
+                        + " — sealing partial shard."
+                        + " Consider raising indexing.memory.vector.early.checkpoint.fraction"
+                        + " or indexing.memory.vector.percentage to prevent"
+                        + " micro-segment accumulation.",
+                new Object[]{indexName, reason, totalLiveVectors, minLiveGate,
+                        segments.size(), usage, max,
+                        String.format(java.util.Locale.ROOT, "%.1f", fraction * 100.0d),
+                        String.format(java.util.Locale.ROOT, "%.2f", earlyCheckpointFraction)});
+    }
+
+    /** Returns the issue #646 bypass counter. */
+    public long getTotalMemoryPressureCheckpointBypassCount() {
+        return totalMemoryPressureCheckpointBypassCount.get();
     }
 
     private void waitForMemoryPressureRelief() {
@@ -6257,6 +6391,10 @@ public class PersistentVectorStore extends AbstractVectorStore {
             // left behind by stopped ingest is guaranteed to flush.
             int minLiveGate = minLiveVectorsForCheckpoint;
             long deferralBoundMs = maxCheckpointDeferralMs;
+            // Capture once: shouldTriggerMemoryPressureCheckpoint() emits an
+            // INFO log on every truthy call, so calling it three times would
+            // log three identical lines per checkpoint.
+            boolean memoryPressureTrigger = shouldTriggerMemoryPressureCheckpoint();
 
             // Segment-count back-pressure deferral gate (issue #562).
             //
@@ -6280,7 +6418,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
                     && totalLiveVectors < minLiveGate
                     && !anySegmentDirty
                     && !segments.isEmpty()
-                    && !shouldTriggerMemoryPressureCheckpoint()
+                    && !memoryPressureTrigger
                     && segments.size() > compactionBackpressureThreshold) {
                 LOGGER.log(Level.INFO,
                         "checkpoint {0}: deferred during segment-count back-pressure "
@@ -6296,7 +6434,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
                     && totalLiveVectors < minLiveGate
                     && !anySegmentDirty
                     && !segments.isEmpty()
-                    && !shouldTriggerMemoryPressureCheckpoint()) {
+                    && !memoryPressureTrigger) {
                 long elapsed = System.currentTimeMillis() - lastSuccessfulCheckpointMs;
                 if (elapsed < deferralBoundMs) {
                     LOGGER.log(Level.FINE,
@@ -6311,6 +6449,38 @@ public class PersistentVectorStore extends AbstractVectorStore {
                         "checkpoint {0}: deferral bound reached ({1} ms >= {2} ms), "
                                 + "running Phase A with {3} live vectors",
                         new Object[]{indexName, elapsed, deferralBoundMs, totalLiveVectors});
+            }
+
+            // Issue #646: emit observability when memory pressure forces a
+            // checkpoint past the min-live-vectors gate, so operators can tell
+            // micro-segment-prone bypass cycles apart from genuine "shard full"
+            // cycles. The conditions mirror the gate above with the
+            // memoryPressureTrigger flag flipped: this is exactly the path that
+            // produced the BIGANN 200M segment storm.
+            //
+            // We further distinguish two gate variants because they have
+            // different operational meaning:
+            //   - SEGMENT_COUNT_BACKPRESSURE: segments.size() is already above
+            //     compactionBackpressureThreshold (line 6336 sibling gate).
+            //     This is the BIGANN 200M scenario — the live shard is tiny
+            //     AND the on-disk segment count is already past back-pressure,
+            //     so sealing the tiny shard would push the count further past.
+            //   - TIME_WINDOW: the elapsed-since-last-success deferral window
+            //     (line 6356 sibling gate). The segment count is fine but the
+            //     gate would still have deferred for time-bounded reasons.
+            // The two share the same counter (both are "the gate would have
+            // deferred but memory pressure forced through") but log under
+            // distinct labels so an operator parsing logs can tell which path
+            // is firing.
+            if (memoryPressureTrigger
+                    && minLiveGate > 0
+                    && totalLiveVectors < minLiveGate
+                    && !anySegmentDirty
+                    && !segments.isEmpty()) {
+                BypassReason reason = segments.size() > compactionBackpressureThreshold
+                        ? BypassReason.SEGMENT_COUNT_BACKPRESSURE
+                        : BypassReason.TIME_WINDOW;
+                logMemoryPressureGateBypass(totalLiveVectors, minLiveGate, reason);
             }
         } finally {
             stateLock.writeLock().unlock();
@@ -9553,6 +9723,30 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
     public int getSegmentCount() {
         return segments.size();
+    }
+
+    /**
+     * Returns the number of currently-loaded segments whose live-node count is
+     * strictly below {@link #vectorIndexCompactionMicroSegmentMaxNodes} — i.e.
+     * segments the micro-segment fast-path (issue #570) would target on the
+     * next compaction cycle (issue #646 observability). Returns {@code 0}
+     * when the micro-segment fast-path is disabled
+     * ({@code vectorIndexCompactionMicroSegmentMaxNodes <= 0}). Cheap enough
+     * for periodic gauge sampling: iterates the {@code CopyOnWriteArrayList}
+     * snapshot and reads each segment's atomic live counter.
+     */
+    public int getMicroSegmentCount() {
+        long threshold = vectorIndexCompactionMicroSegmentMaxNodes;
+        if (threshold <= 0L) {
+            return 0;
+        }
+        int count = 0;
+        for (VectorSegment seg : segments) {
+            if (seg.size() < threshold) {
+                count++;
+            }
+        }
+        return count;
     }
 
     public long getMaxSegmentSize() {

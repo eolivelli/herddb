@@ -59,4 +59,22 @@ public interface VectorMemoryBudget {
         long max = maxMemoryBytes();
         return max != Long.MAX_VALUE && totalEstimatedMemoryUsageBytes() > (long) (max * fraction);
     }
+
+    /**
+     * Returns the current budget consumption as a fraction of the global
+     * limit. Returns {@code 0.0} when no finite limit is configured
+     * ({@code maxMemoryBytes() == Long.MAX_VALUE} or {@code <= 0}). Useful for
+     * Prometheus gauges exposing memory pressure without forcing dashboards to
+     * compute the ratio from the raw byte counters (issue #646). The result is
+     * not clamped: it can legitimately exceed {@code 1.0} during the brief
+     * window between crossing the hard limit and the back-pressure path
+     * draining the live shards.
+     */
+    default double budgetFraction() {
+        long max = maxMemoryBytes();
+        if (max == Long.MAX_VALUE || max <= 0L) {
+            return 0.0d;
+        }
+        return (double) totalEstimatedMemoryUsageBytes() / (double) max;
+    }
 }

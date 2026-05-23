@@ -265,6 +265,30 @@ message DescribeIndexResponse {
     int64 compaction_input_vector_count = 36;
     int64 compaction_elapsed_ms = 37;
     bool compaction_running = 38;
+
+    // Issue #646 early-checkpoint observability.
+    //
+    //  - micro_segment_count is the number of currently-loaded segments whose
+    //    live-node count is strictly below the configured
+    //    indexing.vector.index.compaction.microsegment.max.nodes threshold.
+    //    A growing value is a leading indicator of segment-count back-pressure
+    //    caused by the min-live-vectors gate being bypassed under memory
+    //    pressure (the BIGANN 200M scenario that motivated this issue).
+    //  - memory_pressure_checkpoint_bypass_count is a monotonic counter that
+    //    increments every time shouldTriggerMemoryPressureCheckpoint() forced
+    //    a checkpoint past the min-live-vectors deferral gate. Operators can
+    //    correlate spikes here with micro_segment_count growth. The counter
+    //    is in-memory only: it is monotonic ONLY within a single process
+    //    lifetime and resets to zero on restart (including rolling restarts
+    //    of the indexing-service StatefulSet). Dashboards that alert on
+    //    rate-of-change (rate(...) / irate(...)) handle this correctly;
+    //    dashboards that show the raw counter must annotate restarts to
+    //    avoid the apparent "counter went backwards" jump.
+    //  - early_checkpoint_fraction echoes the configured
+    //    indexing.memory.vector.early.checkpoint.fraction (default 0.90).
+    int32 micro_segment_count = 39;
+    int64 memory_pressure_checkpoint_bypass_count = 40;
+    double early_checkpoint_fraction = 41;
 }
 
 message ListPrimaryKeysRequest {
