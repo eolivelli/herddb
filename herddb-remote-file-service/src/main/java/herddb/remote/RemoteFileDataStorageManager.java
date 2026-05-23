@@ -1397,7 +1397,22 @@ public class RemoteFileDataStorageManager extends DataStorageManager
         // materialise on first call; subsequent suppliers reuse the same
         // cache file. Per-block files (legacy layout) keep the existing
         // remote-random-access path.
-        if (isBulkLayout(logicalPath)) {
+        // Issue #645: use the strict probe so a transient HEAD failure (5xx,
+        // network blip) does not silently fall through to the gRPC reader
+        // for a file that was actually written via direct-S3. The gRPC
+        // file-server has no record of direct-uploaded blocks, so falling
+        // back to it would always surface as "Block not found" and crash
+        // the IS on restart.
+        boolean bulk;
+        try {
+            bulk = isBulkLayoutOrThrow(logicalPath);
+        } catch (IOException ioe) {
+            throw new DataStorageManagerException(
+                    "bulk-layout probe failed for " + logicalPath
+                            + "; refusing to fall back to gRPC because direct-S3"
+                            + " is wired (issue #645)", ioe);
+        }
+        if (bulk) {
             try {
                 Path localFile = ensureBulkLocalCacheFile(logicalPath, fileSize);
                 return new io.github.jbellis.jvector.disk.MappedChunkReader.Supplier(localFile);
@@ -1413,16 +1428,70 @@ public class RemoteFileDataStorageManager extends DataStorageManager
     }
 
     /**
-     * Issue #638: best-effort probe — returns {@code true} when the logical
-     * multipart file is stored in the bulk layout (single S3 object at
-     * {@code {logicalPath}.bulk}). Honours the in-memory probe cache so
+     * Issue #638/#645: lenient probe — returns {@code true} when the
+     * logical multipart file is stored in the bulk layout (single S3 object
+     * at {@code {logicalPath}.bulk}). Honours the in-memory probe cache so
      * repeated calls for the same logical path issue at most one S3
-     * {@code HEAD}. Returns {@code false} for legacy per-block files and
-     * when the direct-S3 client is not wired.
+     * {@code HEAD}. Returns {@code false} for legacy per-block files,
+     * when the direct-S3 client is not wired, and — best-effort — when
+     * the HEAD probe fails transiently.
+     *
+     * <p>This is the boolean-only variant used by
+     * {@link #multipartIndexFileExists} (whose API contract is "best-effort
+     * presence check"). The read paths
+     * ({@link #multipartIndexReaderSupplier} and
+     * {@link #downloadMultipartIndexFile}) MUST use
+     * {@link #isBulkLayoutOrThrow(String)} instead so a transient probe
+     * failure surfaces loudly instead of silently misrouting through the
+     * gRPC file-server, which is the failure mode that crash-looped the
+     * indexing service in issue #645.
      */
     private boolean isBulkLayout(String logicalPath) {
+        try {
+            return isBulkLayoutOrThrow(logicalPath);
+        } catch (IOException probeErr) {
+            // Lenient-probe path: keep the historical contract of
+            // multipartIndexFileExists ("best-effort, never throws") by
+            // mapping a transient probe failure to a conservative {@code
+            // false} answer. A {@code false} from this method on the
+            // exists-check path is OK because the caller follows up with a
+            // legacy per-block probe; a {@code false} on a read path would
+            // be unsafe, which is why read paths now call
+            // {@link #isBulkLayoutOrThrow} directly.
+            LOGGER.log(Level.FINE,
+                    "bulk-layout probe failed for {0} (best-effort, returning false): {1}",
+                    new Object[]{logicalPath, probeErr.toString()});
+            return false;
+        }
+    }
+
+    /**
+     * Issue #645: strict probe — returns {@code true} when the logical
+     * multipart file is stored in the bulk layout, {@code false} when it
+     * is definitively absent (HEAD 404 / {@code NOT_FOUND}), and throws
+     * {@link IOException} when the existence could not be determined
+     * (transient network error, HTTP 5xx, SDK error, timeout, interrupted).
+     *
+     * <p>Honours the in-memory probe cache so repeated calls for the same
+     * logical path issue at most one S3 {@code HEAD}. Only positive
+     * results are cached; transient probe failures are <em>not</em>
+     * cached (cf. the issue-#638 review note on {@link #isBulkLayout}).
+     *
+     * <p>The contract on the underlying
+     * {@link ObjectStorage#existsObject(String)} call is tri-state as of
+     * issue #645: {@code true} / {@code false} (definitive 404) /
+     * exceptional. This method translates those three terminal states
+     * directly: {@code true} → {@code true}, {@code false} → {@code false},
+     * exceptional → {@code throw IOException}. Read-path callers MUST
+     * surface that throw instead of falling back to gRPC, because the
+     * gRPC file-server has no record of direct-S3-uploaded blocks and
+     * the fallback path would always surface as {@code Block not found}.
+     */
+    private boolean isBulkLayoutOrThrow(String logicalPath) throws IOException {
         ObjectStorage storage = this.directObjectStorage;
         if (storage == null) {
+            // No direct-S3 wiring at all: this installation only uses the
+            // gRPC file-server. The probe is structurally {@code false}.
             return false;
         }
         Boolean cached = bulkLayoutCache.get(logicalPath);
@@ -1436,22 +1505,25 @@ public class RemoteFileDataStorageManager extends DataStorageManager
                             15L, TimeUnit.SECONDS));
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
-            return false;
-        } catch (java.util.concurrent.ExecutionException
-                | java.util.concurrent.TimeoutException
-                | RuntimeException probeErr) {
-            // existsObject is contractually best-effort and must not throw on
-            // missing keys, but defensive: treat any failure as "not bulk"
-            // and fall back to the legacy per-block code path. The
-            // RuntimeException catch is needed because some S3-compatible
-            // backends wrap non-existence in unchecked SDK exceptions; we
-            // intentionally do not cache the negative result here so a
-            // transient probe failure does not pin the logical file to the
-            // wrong layout for the rest of the JVM lifetime.
-            LOGGER.log(Level.FINE,
-                    "bulk-layout probe failed for {0}: {1}",
-                    new Object[]{logicalPath, probeErr.toString()});
-            return false;
+            throw new IOException(
+                    "interrupted while probing bulk layout for " + logicalPath, ie);
+        } catch (java.util.concurrent.TimeoutException te) {
+            // A HEAD that does not return within 15 s is a transient
+            // condition. Don't cache; let the caller decide whether to
+            // retry or fail the read.
+            throw new IOException(
+                    "bulk-layout HEAD probe timed out for " + logicalPath, te);
+        } catch (java.util.concurrent.ExecutionException ee) {
+            // existsObject completed exceptionally — per the tri-state
+            // contract this means "could not determine" (5xx, network,
+            // generic SDK error). NoSuchKey / 404 collapse to {@code
+            // false} inside existsObject itself and never reach here.
+            Throwable cause = ee.getCause();
+            if (cause instanceof IOException) {
+                throw (IOException) cause;
+            }
+            throw new IOException(
+                    "bulk-layout HEAD probe failed for " + logicalPath, cause);
         }
         // Only cache positive results. Caching false permanently would pin
         // a logical path as "not bulk" for the entire JVM lifetime, causing
@@ -1691,7 +1763,13 @@ public class RemoteFileDataStorageManager extends DataStorageManager
         // Multipart Download, parallel parts pipelined by CRT). Falls back to
         // the legacy per-block sequential download when the bulk variant is
         // absent.
-        if (isBulkLayout(logicalPath)) {
+        // Issue #645: use the strict probe — a transient HEAD failure must
+        // NOT silently fall through to the legacy per-block path, because
+        // for a file written via direct-S3 the per-block layout is empty in
+        // S3 and the download would always fail. Throwing here surfaces a
+        // clear diagnostic instead of crash-looping the IS with confusing
+        // "Block not found" errors.
+        if (isBulkLayoutOrThrow(logicalPath)) {
             try {
                 storage.downloadFileBulk(logicalPath + BULK_LAYOUT_SUFFIX, destFile).get();
                 LOGGER.log(Level.FINE,
