@@ -654,6 +654,18 @@ public class PersistentVectorStore extends AbstractVectorStore {
      */
     private volatile long vectorIndexCompactionTargetBytes =
             8L * 1024L * 1024L * 1024L;
+    /**
+     * Per-cycle cap on the sum of live-vector counts across the selected merge
+     * inputs (issue #643). Bounds per-cycle wall-clock time so cycle duration
+     * tracks the per-cycle work budget rather than the table size. When tiered
+     * compaction is enabled this base value is tier-scaled (2×/4×/8×) per cycle
+     * by {@link VectorIndexCompactor#computeTieredMaxOutputNodes} so the
+     * per-cycle drain rate keeps pace with the backlog and the cap cannot
+     * starve the tailer. {@code 0} (or negative) disables the cap — the
+     * default, so the cap is purely additive. Pre-normalised by
+     * {@link #setCompactionMaxOutputNodes}.
+     */
+    private volatile long vectorIndexCompactionMaxOutputNodes = 0L;
     private volatile long vectorIndexCompactionRetentionMs = 10L * 60_000L;
 
     /**
@@ -2325,6 +2337,36 @@ public class PersistentVectorStore extends AbstractVectorStore {
     }
 
     /**
+     * Sets the per-cycle output-node cap (issue #643). Bounds the sum of
+     * live-vector counts across the inputs a single compaction cycle merges,
+     * so per-cycle wall-clock time tracks the per-cycle work budget rather
+     * than the table size. The cap is applied AFTER the trigger / smallest-first
+     * / micro-segment / graduation-cap selection logic (never changes whether
+     * a cycle compacts) and is tier-scaled by
+     * {@link VectorIndexCompactor#computeTieredMaxOutputNodes} when tiered
+     * compaction is enabled.
+     *
+     * <p>The picker always keeps at least 2 inputs even when the first two
+     * candidates already exceed the cap, so an aggressively low value still
+     * produces monotonic progress (segment count decreases by one per cycle).
+     *
+     * @param maxOutputNodes positive cap on summed input
+     *     {@link VectorSegment#size()}; values {@code <= 0} disable the cap
+     *     (the default). Can be called at any time to re-tune a running store.
+     */
+    public void setCompactionMaxOutputNodes(long maxOutputNodes) {
+        this.vectorIndexCompactionMaxOutputNodes = Math.max(0L, maxOutputNodes);
+    }
+
+    /**
+     * Returns the current per-cycle output-node cap (issue #643); {@code 0}
+     * means the cap is disabled.
+     */
+    public long getCompactionMaxOutputNodes() {
+        return vectorIndexCompactionMaxOutputNodes;
+    }
+
+    /**
      * Sets the segment-count back-pressure threshold (issue #354).
      * {@link #addVectorInternal} will block when {@code segments.size()}
      * exceeds this value, waking the compaction thread first.
@@ -2880,6 +2922,11 @@ public class PersistentVectorStore extends AbstractVectorStore {
             // byte/count caps so the per-cycle drain rate rises with the backlog
             // — that is what keeps the flat cap from starving the tailer.
             int effectiveMaxInputs = vectorIndexCompactionMaxInputs;
+            // Issue #643: the output-node cap is tier-scaled too, same starvation
+            // argument as maxInputs — per-cycle work budget rises with the
+            // backlog so a flat cap cannot let the segment count grow toward
+            // back-pressure.
+            long effectiveMaxOutputNodes = vectorIndexCompactionMaxOutputNodes;
             if (vectorIndexCompactionTieredEnabled) {
                 int tier = VectorIndexCompactor.tieredMultiplier(snapshot.size());
                 if (tier > 1) {
@@ -2889,13 +2936,16 @@ public class PersistentVectorStore extends AbstractVectorStore {
                             snapshot.size(), vectorIndexCompactionMaxCount);
                     effectiveMaxInputs = VectorIndexCompactor.computeTieredMaxInputs(
                             snapshot.size(), vectorIndexCompactionMaxInputs);
+                    effectiveMaxOutputNodes = VectorIndexCompactor.computeTieredMaxOutputNodes(
+                            snapshot.size(), vectorIndexCompactionMaxOutputNodes);
                     LOGGER.log(Level.INFO,
                             "vector store {0}: tiered compaction — {1} segments → "
                                     + "effective maxBytes={2} ({3}×), effective maxCount={4} ({3}×),"
-                                    + " effective maxInputs={5} ({3}×)",
+                                    + " effective maxInputs={5} ({3}×),"
+                                    + " effective maxOutputNodes={6} ({3}×)",
                             new Object[]{indexName, snapshot.size(),
                                     effectiveMaxBytes, tier, effectiveMaxCount,
-                                    effectiveMaxInputs});
+                                    effectiveMaxInputs, effectiveMaxOutputNodes});
                 }
             }
 
@@ -2913,7 +2963,12 @@ public class PersistentVectorStore extends AbstractVectorStore {
                     // of every selection step so the policy converges to a fixed
                     // point once every segment crosses the cap — parity with the
                     // optimizer pod's AggressivePolicy.
-                    vectorIndexCompactionTargetBytes);
+                    vectorIndexCompactionTargetBytes,
+                    // Issue #643: per-cycle cap on the sum of input liveCount
+                    // (= output node count). Tier-scaled above. Bounds per-cycle
+                    // wall-clock time so cycle duration tracks the work budget
+                    // rather than the table size.
+                    effectiveMaxOutputNodes);
 
             // Issue #602: apply the per-cycle download budget cap AFTER candidate
             // selection. Tiered scaling can push effectiveMaxBytes to 8 GiB; with

@@ -358,6 +358,40 @@ public final class IndexingServerConfiguration {
             8L * 1024L * 1024L * 1024L; // 8 GiB — matches indexoptimizer.merge.target.bytes
 
     /**
+     * Per-cycle cap on the sum of live-vector counts across the selected merge
+     * inputs (issue #643). Bounds the per-cycle wall-clock time of the IS-local
+     * compaction picker: jvector's {@code OnDiskGraphIndexCompactor.buildBatches}
+     * emits {@code max(40, srcNodes/128)} batches per source segment, so wall-clock
+     * time tracks the total live-node count of the merge inputs. Without this
+     * cap, each successive cycle progressively merges larger segments as the
+     * "smallest 20" candidates shift upward over time — cycle duration grows
+     * with the table size rather than with the per-cycle work budget (see issue
+     * for evidence on a 200M-row BIGANN run).
+     *
+     * <p>Applied AFTER the trigger / smallest-first / micro-segment / graduation
+     * filtering (it never changes whether a cycle compacts, only the size of the
+     * merged output). The cap is also tier-scaled (2×/4×/8× at 100/300/500
+     * segments) when tiered compaction is enabled, so the per-cycle drain rate
+     * rises with the backlog and a flat cap cannot starve the tailer. The cap
+     * never applies to the micro-segment fast path (those merges are bounded
+     * by {@link #PROPERTY_VECTOR_INDEX_COMPACTION_MICROSEGMENT_MAX_NODES} per
+     * input by construction).
+     *
+     * <p><b>Always keeps at least 2 inputs.</b> Even when the first two
+     * candidates already exceed the cap, the picker keeps both so the cycle
+     * still performs a meaningful merge.
+     *
+     * <p>Default is {@code 0} (disabled — preserves the pre-#643 unbounded
+     * output behaviour). Set explicitly when an operator observes per-cycle
+     * stalls growing with table size; a reasonable starting value is
+     * {@code maxLiveGraphSize × maxCount} (e.g. 2,000,000 for a configuration
+     * with {@code maxLiveGraphSize=100000} and {@code maxCount=20}).
+     */
+    public static final String PROPERTY_VECTOR_INDEX_COMPACTION_MAX_OUTPUT_NODES =
+            "vector.index.compaction.maxOutputNodes";
+    public static final long PROPERTY_VECTOR_INDEX_COMPACTION_MAX_OUTPUT_NODES_DEFAULT = 0L;
+
+    /**
      * How long old segment files remain on-disk after a compaction swap
      * before the reaper may physically delete them. Also gated by
      * {@code shadowAckedGeneration}: reclaim waits for the later of the
