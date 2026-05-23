@@ -269,6 +269,13 @@ public class Issue562BackpressureMicroSegmentTest {
                     /*maxCount*/ Integer.MAX_VALUE,
                     /*retentionMs*/ 0);
             store.setTieredCompactionEnabled(false);
+            // The trigger budget below reports usage=80, max=100 (80%). With
+            // the post-#646 default early-checkpoint fraction of 0.90 the
+            // trigger would not fire at 80%; this test pre-dates that change
+            // and specifically exercises the "above the trigger but not under
+            // hard back-pressure" code path, so pin the fraction at the
+            // historical 0.70 to preserve the original semantic.
+            store.setEarlyCheckpointFraction(0.70d);
             store.start();
             Random rng = new Random(562_4);
 

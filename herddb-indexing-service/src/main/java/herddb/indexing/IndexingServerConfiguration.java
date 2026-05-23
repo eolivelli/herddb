@@ -106,6 +106,20 @@ public final class IndexingServerConfiguration {
     public static final String PROPERTY_MEMORY_VECTOR_PERCENTAGE = "indexing.memory.vector.percentage";
     public static final double PROPERTY_MEMORY_VECTOR_PERCENTAGE_DEFAULT = 0.33d;
 
+    /**
+     * Fraction of the {@code VectorMemoryBudget} above which the early-checkpoint
+     * trigger fires and the {@code minLiveVectorsForCheckpoint} deferral gate is
+     * bypassed (issue #646). Must be in {@code (0.0, 1.0]}. Default is {@code 0.90}
+     * — high enough that the gate stays active through the 70&ndash;90% range
+     * (which is where long ingest workloads spend a significant fraction of their
+     * runtime) and only fires close to the hard 100% back-pressure limit, which
+     * is the true safety valve. Lower this to flush earlier; raise it to keep the
+     * gate active longer at the cost of running Phase B closer to the hard limit.
+     */
+    public static final String PROPERTY_MEMORY_VECTOR_EARLY_CHECKPOINT_FRACTION =
+            "indexing.memory.vector.early.checkpoint.fraction";
+    public static final double PROPERTY_MEMORY_VECTOR_EARLY_CHECKPOINT_FRACTION_DEFAULT = 0.90d;
+
     public static final String PROPERTY_MEMORY_PAGE_SIZE = "indexing.memory.page.size";
     public static final long PROPERTY_MEMORY_PAGE_SIZE_DEFAULT = 1048576L;
 
