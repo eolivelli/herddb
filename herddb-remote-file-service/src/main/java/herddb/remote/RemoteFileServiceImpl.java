@@ -458,11 +458,13 @@ public class RemoteFileServiceImpl {
         prefetchRequests.inc();
         // Route through the storage's prefetchRange. Backends with a caching
         // tier (e.g. CachingObjectStorage) admit the block into the disk LRU;
-        // backends without a cache treat this as a no-op via the default
-        // implementation in ObjectStorage. We never return bytes — only a
-        // success/not-found status — so the IS-to-file-server bandwidth used
-        // by prewarm is bounded by the response framing, not by segment size.
-        attachCallback(storage.prefetchRange(path, offset, length, blockSize), readExecutor, (v, t) -> {
+        // backends without a cache fall through to the default impl which
+        // admits via readRange + immediate release. The future resolves
+        // tri-state: TRUE=admitted, FALSE=not-found, exceptional=error. We
+        // never return bytes — only a status PDU — so the IS-to-file-server
+        // bandwidth used by prewarm is bounded by the response framing, not
+        // by segment size.
+        attachCallback(storage.prefetchRange(path, offset, length, blockSize), readExecutor, (admitted, t) -> {
             long elapsedMicros = TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - start);
             if (t != null) {
                 prefetchErrors.inc();
@@ -475,26 +477,29 @@ public class RemoteFileServiceImpl {
                                 "prefetchFileRange failed: " + t.getMessage()));
                 return;
             }
-            prefetchBytes.addCount(length);
             prefetchLatency.registerSuccessfulEvent(elapsedMicros, TimeUnit.MICROSECONDS);
-            LOGGER.log(Level.FINE,
-                    "prefetchFileRange path={0} offset={1} length={2} time={3}ms",
-                    new Object[]{path, offset, length, elapsedMs(start)});
-            channel.sendReplyMessage(messageId,
-                    PduCodec.PrefetchFileRangeResponse.writeOk(messageId));
+            if (Boolean.TRUE.equals(admitted)) {
+                // Admitted: count the requested length as cached. We use the
+                // request length (not the actual admitted bytes) because the
+                // storage layer only signals success/not-found, not byte counts;
+                // for last-block-of-file requests this is an upper bound (the
+                // tail block is short) but operationally close enough for the
+                // cache-throughput dashboard.
+                prefetchBytes.addCount(length);
+                LOGGER.log(Level.FINE,
+                        "prefetchFileRange path={0} offset={1} length={2} time={3}ms (OK)",
+                        new Object[]{path, offset, length, elapsedMs(start)});
+                channel.sendReplyMessage(messageId,
+                        PduCodec.PrefetchFileRangeResponse.writeOk(messageId));
+            } else {
+                prefetchNotFound.inc();
+                LOGGER.log(Level.FINE,
+                        "prefetchFileRange path={0} offset={1} length={2} time={3}ms (NOT_FOUND)",
+                        new Object[]{path, offset, length, elapsedMs(start)});
+                channel.sendReplyMessage(messageId,
+                        PduCodec.PrefetchFileRangeResponse.writeNotFound(messageId));
+            }
         });
-    }
-
-    // Suppress unused-field warning for prefetchNotFound — the counter is
-    // declared for symmetry with readRangeNotFound and may be wired up if a
-    // future change distinguishes NOT_FOUND from generic failures in the
-    // prefetch response. Today, NOT_FOUND from the storage layer manifests as
-    // a successful future with a no-op outcome, since prefetch is best-effort
-    // (a missing object is reported via a subsequent readFileRange failure,
-    // not as a prefetch error).
-    @SuppressWarnings("unused")
-    private void ignorePrefetchNotFoundCounter() {
-        prefetchNotFound.inc();
     }
 
     // ----------------------------------------------------------------------

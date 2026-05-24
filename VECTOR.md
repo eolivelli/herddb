@@ -620,6 +620,8 @@ Each segment's graph and map data is stored as a single object in the object sto
 
 Combined, the first query reads against a newly-published segment are all cache hits at both the file-server disk cache and the IS-side block cache.
 
+**No mixed-version interop.** This layout is the only multipart format the file server understands. There is no per-block (`{path}.multipart/{N}`) or bulk-suffix (`{path}.bulk`) compatibility path: new clients send `PREFETCH_FILE_RANGE` (op-code 58) which old servers reject as unknown, and old clients send `WRITE_FILE_BLOCK` (op-code 51) which the new server no longer registers. Any segment data on disk in the old layouts is unreadable to the new code path. A cluster upgrade therefore requires a coordinated rollout: stop all IS replicas, upgrade every file-server and IS image together, and re-ingest existing segments — there is no in-place migration.
+
 ### Segment Compaction (graph merge)
 
 > **Note (segmented-v2).** When `indexing.optimizer.enabled=true`, the

@@ -197,21 +197,26 @@ public class RemoteFileServiceImplPrefetchTest {
     }
 
     @Test
-    public void prefetchOfMissingObjectDoesNotPopulateCacheAndStillCountsRpc() throws Exception {
-        // Best-effort prewarm: the file server treats a missing object as a
-        // no-op success (no bytes admitted into the cache). Per the
-        // RemoteFileServiceImpl contract, NOT_FOUND from the storage layer
-        // manifests as a successful future on the IS side — the cache simply
-        // ends up not holding a block entry. Callers learn the object is
-        // missing via the subsequent readFileRange failure.
+    public void prefetchOfMissingObjectReportsNotFoundAndDoesNotPopulateCache() throws Exception {
+        // Issue #650 review follow-up: NOT_FOUND is wired end-to-end through
+        // the prefetch RPC. Per the {@link ObjectStorage#prefetchRange}
+        // tri-state contract:
+        //   TRUE  = admitted into cache
+        //   FALSE = NOT_FOUND (no admit, no cache entry)
+        //   exceptional = transient error
+        // The file-server emits STATUS_NOT_FOUND on the wire; the client maps
+        // it to {@code Boolean.FALSE}. Callers (the IS prewarm path) use this
+        // to surface the missing-object case in their per-block accounting
+        // ({@code rfs_prefetch_not_found} on the server, the {@code notFound}
+        // counter inside {@code prewarmMultipartIndexFile} on the IS).
         String path = "ts/uuid/multipart/missing";
         long before = prefetchRequestsCounter();
 
         Boolean ok = client.prefetchFileRangeAsync(path, 0L, 1024, BLOCK_SIZE)
                 .get(15, TimeUnit.SECONDS);
-        assertEquals("prefetch of a missing object must still resolve TRUE "
-                + "(best-effort; the underlying NOT_FOUND is swallowed)",
-                Boolean.TRUE, ok);
+        assertEquals("prefetch of a missing object must resolve to FALSE "
+                + "(NOT_FOUND wired end-to-end)",
+                Boolean.FALSE, ok);
 
         // The cache must NOT hold any block entry for the missing object —
         // a NOT_FOUND inner readRange does not admit a cache entry.

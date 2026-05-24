@@ -6175,12 +6175,20 @@ public class PersistentVectorStore extends AbstractVectorStore {
         }
         String segUuid = segmentStorageKey(seg);
         int parallelism = Math.max(1, this.prewarmFileServerParallelism);
-        // 4 MiB cache-block granularity — matches RemoteFileDataStorageManager's
-        // MULTIPART_BLOCK_SIZE / file-server CachingObjectStorage block-key
-        // alignment. A larger value would mean fewer-but-larger prefetch RPCs;
-        // smaller would mean more round-trips. 4 MiB is the existing pipeline
-        // sweet spot.
-        final int blockSize = 4 * 1024 * 1024;
+        // Cache-block granularity MUST match the read path (issue #650 review
+        // follow-up): `multipartIndexReaderSupplier` builds a
+        // `RemoteRandomAccessReader.Supplier` keyed by `dsm.getMultipartBlockSize()`
+        // and `ConsistentHashRouter` shards reads by
+        // `path + "#block" + (offset / blockSize)`. Prewarming at a different
+        // block size would route to a different replica and cache under a
+        // different `path#{N}` key — silent zero cache-hit on the first query.
+        final int blockSize = dataStorageManager.getMultipartBlockSize();
+        if (blockSize <= 0) {
+            LOGGER.log(Level.WARNING,
+                    "prewarmFileServerForSegment {0}: invalid blockSize {1} from {2}; skipping",
+                    new Object[]{indexName, blockSize, dataStorageManager.getClass().getName()});
+            return false;
+        }
         try {
             dataStorageManager.prewarmMultipartIndexFile(
                     tableSpaceUUID, segUuid, "graph",

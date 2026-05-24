@@ -261,6 +261,24 @@ public abstract class DataStorageManager implements AutoCloseable {
             throws DataStorageManagerException;
 
     /**
+     * Issue #650 (review follow-up): cache-block granularity used by the
+     * read path of this storage manager. The IS-side prewarm MUST issue
+     * its {@code prefetchFileRange} RPCs aligned to this block size,
+     * otherwise the file-server's {@code CachingObjectStorage} caches
+     * blocks under one alignment while the reader requests them under
+     * another — the cache hit rate would silently drop to ~0%.
+     *
+     * <p>Default 4 MiB — matches the file-server's default
+     * {@code remote.file.client.block.size} and the IS-side reader's
+     * {@code MULTIPART_BLOCK_SIZE} fallback. Backends with a configurable
+     * block size (e.g. {@code RemoteFileDataStorageManager}) override to
+     * return the effective value.
+     */
+    public int getMultipartBlockSize() {
+        return 4 * 1024 * 1024;
+    }
+
+    /**
      * Issue #650: pre-warms the storage layer's cache for the multipart file
      * at {@code (tableSpace, uuid, fileType)} so subsequent
      * {@link #multipartIndexReaderSupplier} reads hit a populated cache.

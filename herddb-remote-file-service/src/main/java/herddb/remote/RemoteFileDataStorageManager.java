@@ -60,7 +60,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
@@ -1199,10 +1199,25 @@ public class RemoteFileDataStorageManager extends DataStorageManager
             String tableSpace, String uuid, String fileType, long fileSize)
             throws DataStorageManagerException {
         String logicalPath = remoteMultipartPath(tableSpace, uuid, fileType);
-        int writeBlockSize = Math.max(client.getBlockSize(), MULTIPART_BLOCK_SIZE);
+        int writeBlockSize = getMultipartBlockSize();
         return new RemoteRandomAccessReader.Supplier(
                 client, logicalPath, fileSize, writeBlockSize, READ_BUFFER_SIZE,
                 readerStatsLogger, segmentBlockCache);
+    }
+
+    /**
+     * Issue #650 (review follow-up): single source of truth for the
+     * cache-block granularity used by the read path. The IS-side prewarm
+     * also reads this method, so prefetch and read traffic always hit the
+     * same {@code blockSize}-aligned cache entries (and the same file-server
+     * replica under {@link ConsistentHashRouter}). Combining
+     * {@code client.getBlockSize()} with the {@link #MULTIPART_BLOCK_SIZE}
+     * floor guarantees we never alignment-pessimise below 4 MiB even if an
+     * operator configures a smaller gRPC block size.
+     */
+    @Override
+    public int getMultipartBlockSize() {
+        return Math.max(client.getBlockSize(), MULTIPART_BLOCK_SIZE);
     }
 
     /**
@@ -1260,31 +1275,77 @@ public class RemoteFileDataStorageManager extends DataStorageManager
         int succeeded = 0;
         int notFound = 0;
         int failed = 0;
+        int timedOut = 0;
+        boolean interrupted = false;
         for (CompletableFuture<Boolean> f : futures) {
+            if (interrupted) {
+                // Once interrupted we stop awaiting and fail the remaining
+                // futures via cancel(false) (the underlying RPC future is
+                // already racing to completion; cancel without interrupt
+                // lets it finish on its own). Permit-release is wired on
+                // whenComplete so the semaphore is not leaked.
+                f.cancel(false);
+                failed++;
+                continue;
+            }
             try {
-                Boolean ok = f.join();
+                Boolean ok = f.get(PREWARM_PER_BLOCK_TIMEOUT_SECONDS, TimeUnit.SECONDS);
                 if (Boolean.TRUE.equals(ok)) {
                     succeeded++;
                 } else {
                     notFound++;
                 }
-            } catch (CompletionException ce) {
-                // Broad CompletionException catch: best-effort prewarm —
-                // every transport-level failure must downgrade to a logged
-                // warning, never abort the publish path.
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                interrupted = true;
+                LOGGER.log(Level.WARNING,
+                        "prewarmMultipartIndexFile {0}: interrupted while awaiting prefetch"
+                                + " futures — cancelling remaining; succeeded={1}, notFound={2},"
+                                + " failed={3}, blocks={4}",
+                        new Object[]{logicalPath, succeeded, notFound, failed, blockCount});
+            } catch (java.util.concurrent.TimeoutException te) {
+                timedOut++;
+                f.cancel(false);
+                // Per-block timeout: a stuck file-server or saturated S3
+                // connection should not stall segment publish indefinitely.
+                LOGGER.log(Level.WARNING,
+                        "prewarmMultipartIndexFile {0}: per-block prefetch timed out after {1}s"
+                                + " (best-effort): {2}",
+                        new Object[]{logicalPath, PREWARM_PER_BLOCK_TIMEOUT_SECONDS, te.toString()});
+            } catch (ExecutionException ee) {
+                // ExecutionException carries the prefetch RPC's root cause —
+                // log WITH the throwable so the underlying transport / S3
+                // error keeps its stack trace.
                 failed++;
                 LOGGER.log(Level.WARNING,
-                        "prewarmMultipartIndexFile {0}: per-block prefetch failed (best-effort): {1}",
-                        new Object[]{logicalPath, ce.toString()});
+                        "prewarmMultipartIndexFile " + logicalPath
+                                + ": per-block prefetch failed (best-effort)", ee.getCause());
             }
         }
         long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
         LOGGER.log(Level.INFO,
-                "prewarmMultipartIndexFile {0}: blocks={1} (succeeded={2} notFound={3} failed={4})"
-                        + " parallelism={5} in {6} ms",
-                new Object[]{logicalPath, blockCount, succeeded, notFound, failed,
+                "prewarmMultipartIndexFile {0}: blocks={1} (succeeded={2} notFound={3} failed={4}"
+                        + " timedOut={5}) parallelism={6} in {7} ms",
+                new Object[]{logicalPath, blockCount, succeeded, notFound, failed, timedOut,
                         maxInflight, elapsedMs});
+        // Re-assert the interrupt flag right before returning. Some logging
+        // handlers (notably surefire's stderr redirect over a NIO Pipe sink)
+        // silently clear the thread's interrupt status when they write; if
+        // our caller relied on Thread.currentThread().interrupted() to learn
+        // that the prewarm aborted early it would otherwise miss the signal.
+        // Cheap to set; only fires when we actually were interrupted.
+        if (interrupted) {
+            Thread.currentThread().interrupt();
+        }
     }
+
+    /**
+     * Per-block timeout for {@code prewarmMultipartIndexFile} await loop.
+     * Picked to comfortably exceed a typical S3 ranged GET (sub-second on
+     * MinIO / S3) plus a safety margin for slow links, while still keeping
+     * the segment-publish path responsive to a stuck file server.
+     */
+    private static final long PREWARM_PER_BLOCK_TIMEOUT_SECONDS = 60L;
 
     /**
      * Single-object layout (issue #650): one S3 object per logical file, so

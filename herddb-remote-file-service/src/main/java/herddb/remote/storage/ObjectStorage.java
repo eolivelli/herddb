@@ -75,23 +75,30 @@ public interface ObjectStorage extends AutoCloseable {
 
     /**
      * Prefetches a range of bytes into the storage's cache (if any) without
-     * returning the bytes to the caller. The contract matches
-     * {@link #readRange}: backends with a caching tier admit the requested
-     * range into the cache; backends without a cache MUST treat this as a
-     * no-op that completes successfully (otherwise the file-server-side
-     * prefetch RPC would force unnecessary round-trips on caches that don't
-     * exist).
+     * returning the bytes to the caller.
+     *
+     * <p>The returned future has three terminal states:
+     * <ul>
+     *   <li>completes with {@code true} — the range was admitted into the
+     *       cache (or it was already resident);</li>
+     *   <li>completes with {@code false} — the underlying object was
+     *       {@code NOT_FOUND}; nothing was admitted. Backends without a
+     *       cache that nevertheless can cheaply distinguish present vs
+     *       absent SHOULD report this; backends that cannot SHOULD return
+     *       {@code true} (the prefetch contract is best-effort);</li>
+     *   <li>completes exceptionally — a transient I/O / transport error.
+     *       Callers MUST treat this as best-effort and continue.</li>
+     * </ul>
      *
      * <p>The default implementation forwards to {@link #readRange} and
-     * immediately releases the returned {@link ByteBuf}, which is correct
-     * (the cache layer will have admitted the slice) but performs an extra
-     * heap-to-direct copy on the way through. Implementations may override
-     * to skip that copy.
+     * immediately releases the returned {@link ByteBuf}, mapping the
+     * {@link ReadResult.Status} to the tri-state above.
      */
-    default CompletableFuture<Void> prefetchRange(String path, long offset, int length, int blockSize) {
+    default CompletableFuture<Boolean> prefetchRange(String path, long offset, int length, int blockSize) {
         return readRange(path, offset, length, blockSize).thenApply(result -> {
+            ReadResult.Status status = result.status();
             result.release();
-            return (Void) null;
+            return status == ReadResult.Status.FOUND ? Boolean.TRUE : Boolean.FALSE;
         });
     }
 

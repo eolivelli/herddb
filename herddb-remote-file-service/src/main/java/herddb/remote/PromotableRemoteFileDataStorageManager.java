@@ -366,6 +366,11 @@ public class PromotableRemoteFileDataStorageManager extends DataStorageManager {
     }
 
     @Override
+    public int getMultipartBlockSize() {
+        return activeDelegate.getMultipartBlockSize();
+    }
+
+    @Override
     public void deleteMultipartIndexFile(String tableSpace, String uuid, String fileType)
             throws DataStorageManagerException {
         activeDelegate.deleteMultipartIndexFile(tableSpace, uuid, fileType);
