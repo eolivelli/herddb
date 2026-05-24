@@ -600,6 +600,28 @@ for each pending delete:
 
 Segments whose size exceeds ~80% of `maxSegmentSize` are "sealed" — they are preserved verbatim across checkpoints and are only rewritten by graph-merge compaction.
 
+### Multipart segment files: single-object layout
+
+Each segment's graph and map data is stored as a single object in the object store at the logical multipart path `{tableSpace}/{segmentStorageKey}/multipart/{graph|map}` — one S3 (or local) object per logical file, with no per-block sub-keys and no suffix on the key. The `RemoteFileDataStorageManager` exposes this layout through four methods:
+
+- **`writeMultipartIndexFile(tableSpace, uuid, fileType, tempFile, progress)`** uploads the local temp file directly to the configured `directObjectStorage` via `ObjectStorage.uploadFile`. The S3 backend uses CRT's `S3TransferManager.uploadFile(...)` to pipeline parallel S3 Multipart Upload parts on a single HTTP/2 connection; the local backend writes the file in one shot. Direct-S3 upload is enabled at IS startup by `enableDirectUpload(maxInflightBytes)` and is the only multipart write path — the gRPC per-block write path was removed. A dedicated per-DSM semaphore (configured via `indexing.remote.file.client.max.inflight.direct.write.bytes`) bounds the total bytes in flight across concurrent direct uploads so a burst of large compaction outputs cannot exhaust CRT's heap.
+- **`multipartIndexReaderSupplier(tableSpace, uuid, fileType, fileSize)`** opens a `RemoteRandomAccessReader.Supplier` against the file-server's `readFileRange` RPC. Read addressing is `(offset, length)` against the single object. The reader rounds `offset` down to the `MULTIPART_BLOCK_SIZE = 4 MiB` cache-block boundary and the file server fetches that block via a ranged GET against the single object. The block lands in the file-server's local disk cache so subsequent reads anywhere in the same 4 MiB window are pure cache hits.
+- **`prewarmMultipartIndexFile(tableSpace, uuid, fileType, fileSize, blockSize, parallelism)`** issues one `prefetchFileRange` RPC per 4 MiB block of the file. Each RPC routes via `ConsistentHashRouter(path + "#block" + blockIndex)` so prefetches land on the same replica that subsequent `readFileRange` calls for that block will hit. The file-server admits the block into its disk cache without returning any payload bytes to the IS; the response carries no data. Per-block failures degrade to a logged warning and never abort the call — a failed prewarm just means the first query reads miss the cache and load on demand.
+- **`downloadMultipartIndexFile(tableSpace, uuid, fileType, fileSize, destFile)`** streams the single object directly to a local file via `ObjectStorage.downloadFileBulk` — `S3TransferManager.downloadFile` on the S3 backend, default fallback on local storage.
+
+**Block-level sharding.** The file server's `CachingObjectStorage` keys block-cache entries as `path#{blockIndex}` (distinct from the full-file key namespace used by the legacy non-range `read()`/`write()` path). The IS-side client routes each `readFileRange` and `prefetchFileRange` request to the replica selected by `ConsistentHashRouter(path + "#block" + blockIndex)`, so every block has exactly one canonical owner across the replica set. With N replicas each holding ~200 GiB of disk cache, the aggregate cluster-wide cache scales linearly with N; replicas never duplicate cached blocks.
+
+**Cache invalidation.** A `delete(path)` or `uploadFile(path, ...)` call on `CachingObjectStorage` synchronously invalidates the full-file entry AND every block-cache entry under `path#{N}`. Stale blocks from a previous segment generation with the same logical path are therefore evicted before the new content can be admitted on the next miss.
+
+**Prewarm before publish.** `PersistentVectorStore.warmUpNewSegmentsBeforePublish` runs two phases for every freshly-written segment, BEFORE it joins the searchable segment list:
+
+1. **File-server prewarm** — `prewarmFileServerForSegment(seg)` calls `dataStorageManager.prewarmMultipartIndexFile` with 4 MiB block size and the configured parallelism, so every block of the new segment's graph file is resident in the predicted replica's disk cache before the segment becomes searchable. Gated by `setPrewarmFileServer(true)` (default `true`). Configured via `indexing.vector.segment.prewarmFileServer` (default `true`) and `indexing.vector.segment.prewarmParallelism` (default `8`).
+2. **IS-side BFS warmup** — the per-segment block-cache walk over Layer 0 of the HNSW graph that populates the IS's in-process `SegmentBlockCache`.
+
+Combined, the first query reads against a newly-published segment are all cache hits at both the file-server disk cache and the IS-side block cache.
+
+**No mixed-version interop.** This layout is the only multipart format the file server understands. There is no per-block (`{path}.multipart/{N}`) or bulk-suffix (`{path}.bulk`) compatibility path: new clients send `PREFETCH_FILE_RANGE` (op-code 58) which old servers reject as unknown, and old clients send `WRITE_FILE_BLOCK` (op-code 51) which the new server no longer registers. Any segment data on disk in the old layouts is unreadable to the new code path. A cluster upgrade therefore requires a coordinated rollout: stop all IS replicas, upgrade every file-server and IS image together, and re-ingest existing segments — there is no in-place migration.
+
 ### Segment Compaction (graph merge)
 
 > **Note (segmented-v2).** When `indexing.optimizer.enabled=true`, the

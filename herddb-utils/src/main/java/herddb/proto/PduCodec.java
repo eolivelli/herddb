@@ -2186,41 +2186,29 @@ public abstract class PduCodec {
         }
     }
 
-    /** WRITE_FILE_BLOCK: client → server, writes one multipart block. */
-    public abstract static class WriteFileBlockRequest {
+    /**
+     * PREFETCH_FILE_RANGE (issue #650): client → server, asks the file
+     * server to materialise a {@code (offset, length, blockSize)} slice
+     * into its on-disk cache without returning the bytes. Wire layout
+     * mirrors {@link ReadFileRangeRequest}: {@code [hdr][path][long offset]
+     * [int length][int blockSize]}.
+     */
+    public abstract static class PrefetchFileRangeRequest {
 
-        public static ByteBuf write(long messageId, String path, long blockIndex, ByteBuf content) {
-            int contentLen = content.readableBytes();
+        public static ByteBuf write(long messageId, String path, long offset, int length, int blockSize) {
             ByteBuf byteBuf = PooledByteBufAllocator.DEFAULT
                     .directBuffer(
                             VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE
                                     + VINT_LENGTH_SIZE + path.length()
-                                    + ONE_LONG + ONE_INT + contentLen);
+                                    + ONE_LONG + ONE_INT + ONE_INT);
             byteBuf.writeByte(VERSION_3);
             byteBuf.writeByte(Pdu.FLAGS_ISREQUEST);
-            byteBuf.writeByte(Pdu.TYPE_FS_WRITE_FILE_BLOCK);
+            byteBuf.writeByte(Pdu.TYPE_FS_PREFETCH_FILE_RANGE);
             byteBuf.writeLong(messageId);
             ByteBufUtils.writeString(byteBuf, path);
-            byteBuf.writeLong(blockIndex);
-            byteBuf.writeInt(contentLen);
-            byteBuf.writeBytes(content, content.readerIndex(), contentLen);
-            return byteBuf;
-        }
-
-        public static ByteBuf write(long messageId, String path, long blockIndex, byte[] content) {
-            ByteBuf byteBuf = PooledByteBufAllocator.DEFAULT
-                    .directBuffer(
-                            VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE
-                                    + VINT_LENGTH_SIZE + path.length()
-                                    + ONE_LONG + ONE_INT + content.length);
-            byteBuf.writeByte(VERSION_3);
-            byteBuf.writeByte(Pdu.FLAGS_ISREQUEST);
-            byteBuf.writeByte(Pdu.TYPE_FS_WRITE_FILE_BLOCK);
-            byteBuf.writeLong(messageId);
-            ByteBufUtils.writeString(byteBuf, path);
-            byteBuf.writeLong(blockIndex);
-            byteBuf.writeInt(content.length);
-            byteBuf.writeBytes(content);
+            byteBuf.writeLong(offset);
+            byteBuf.writeInt(length);
+            byteBuf.writeInt(blockSize);
             return byteBuf;
         }
 
@@ -2231,7 +2219,7 @@ public abstract class PduCodec {
             return ByteBufUtils.readString(buffer);
         }
 
-        public static long readBlockIndex(Pdu pdu) {
+        public static long readOffset(Pdu pdu) {
             ByteBuf buffer = pdu.buffer;
             buffer.readerIndex(0);
             buffer.skipBytes(VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE);
@@ -2239,33 +2227,82 @@ public abstract class PduCodec {
             return buffer.readLong();
         }
 
-        public static ByteBuf readContent(Pdu pdu) {
+        public static int readLength(Pdu pdu) {
             ByteBuf buffer = pdu.buffer;
             buffer.readerIndex(0);
             buffer.skipBytes(VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE);
             ByteBufUtils.skipArray(buffer);
             buffer.skipBytes(ONE_LONG);
-            int len = buffer.readInt();
-            return buffer.retainedSlice(buffer.readerIndex(), len);
+            return buffer.readInt();
+        }
+
+        public static int readBlockSize(Pdu pdu) {
+            ByteBuf buffer = pdu.buffer;
+            buffer.readerIndex(0);
+            buffer.skipBytes(VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE);
+            ByteBufUtils.skipArray(buffer);
+            buffer.skipBytes(ONE_LONG + ONE_INT);
+            return buffer.readInt();
         }
     }
 
-    /** Response to a {@link WriteFileBlockRequest}: bytes written for that block. */
-    public abstract static class WriteFileBlockResponse {
+    /**
+     * Response to a {@link PrefetchFileRangeRequest}.
+     * Wire layout: {@code [hdr][byte status]}; on {@code status == 2}
+     * (ERROR) a UTF-8 error message follows, framed as a length-prefixed
+     * VARINT string.
+     */
+    public abstract static class PrefetchFileRangeResponse {
 
-        public static ByteBuf write(long messageId, long writtenSize) {
+        /** Cache was successfully populated (or hit). */
+        public static final byte STATUS_OK = 0;
+        /** Object did not exist in the inner storage. */
+        public static final byte STATUS_NOT_FOUND = 1;
+        /** Transient failure; client may retry. */
+        public static final byte STATUS_ERROR = 2;
+
+        public static ByteBuf writeOk(long messageId) {
+            return writeStatus(messageId, STATUS_OK);
+        }
+
+        public static ByteBuf writeNotFound(long messageId) {
+            return writeStatus(messageId, STATUS_NOT_FOUND);
+        }
+
+        public static ByteBuf writeError(long messageId, String errorMsg) {
+            String msg = errorMsg != null ? errorMsg : "";
             ByteBuf byteBuf = PooledByteBufAllocator.DEFAULT
-                    .directBuffer(VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE + ONE_LONG);
+                    .directBuffer(VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE
+                            + ONE_BYTE + VINT_LENGTH_SIZE + msg.length());
             byteBuf.writeByte(VERSION_3);
             byteBuf.writeByte(Pdu.FLAGS_ISRESPONSE);
-            byteBuf.writeByte(Pdu.TYPE_FS_WRITE_FILE_BLOCK);
+            byteBuf.writeByte(Pdu.TYPE_FS_PREFETCH_FILE_RANGE);
             byteBuf.writeLong(messageId);
-            byteBuf.writeLong(writtenSize);
+            byteBuf.writeByte(STATUS_ERROR);
+            ByteBufUtils.writeString(byteBuf, msg);
             return byteBuf;
         }
 
-        public static long readWrittenSize(Pdu pdu) {
-            return pdu.buffer.getLong(VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE);
+        private static ByteBuf writeStatus(long messageId, byte status) {
+            ByteBuf byteBuf = PooledByteBufAllocator.DEFAULT
+                    .directBuffer(VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE + ONE_BYTE);
+            byteBuf.writeByte(VERSION_3);
+            byteBuf.writeByte(Pdu.FLAGS_ISRESPONSE);
+            byteBuf.writeByte(Pdu.TYPE_FS_PREFETCH_FILE_RANGE);
+            byteBuf.writeLong(messageId);
+            byteBuf.writeByte(status);
+            return byteBuf;
+        }
+
+        public static byte readStatus(Pdu pdu) {
+            return pdu.buffer.getByte(VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE);
+        }
+
+        public static String readErrorMessage(Pdu pdu) {
+            ByteBuf buffer = pdu.buffer;
+            buffer.readerIndex(0);
+            buffer.skipBytes(VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE + ONE_BYTE);
+            return ByteBufUtils.readString(buffer);
         }
     }
 

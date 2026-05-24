@@ -649,13 +649,28 @@ public class CachingObjectStorage implements ObjectStorage {
 
     @Override
     public CompletableFuture<Void> write(String path, byte[] content) {
+        // Single-object layout (issue #650): a full-file write replaces the
+        // object at {@code path} in its entirety, so every block-cache entry
+        // at {@code path#{blockIndex}} is now stale and must be evicted
+        // before admitting the new full-file copy.
+        invalidatePathAndBlocks(path);
         return inner.write(path, content).thenCompose(v -> admitToDisk(path, content));
     }
 
+    /**
+     * Single-object uploads use {@link #uploadFile} directly on the inner
+     * storage (zero-copy CRT path on S3). We invalidate stale block-cache
+     * entries for the path because the file content has just been replaced.
+     * We do <em>not</em> admit the upload bytes into the cache here — the
+     * file is on local disk in {@code source} until the caller releases it,
+     * and prewarm via {@code prefetchRange} is the canonical way to populate
+     * the file-server's cache for the new object.
+     */
     @Override
-    public CompletableFuture<Void> writeBlock(String path, long blockIndex, byte[] content) {
-        String blockPath = path + ObjectStorage.MULTIPART_SUFFIX + "/" + blockIndex;
-        return inner.writeBlock(path, blockIndex, content).thenCompose(v -> admitToDisk(blockPath, content));
+    public CompletableFuture<Long> uploadFile(String path, java.nio.file.Path source,
+                                              java.util.function.LongConsumer progress) {
+        invalidatePathAndBlocks(path);
+        return inner.uploadFile(path, source, progress);
     }
 
     @Override
@@ -824,25 +839,114 @@ public class CachingObjectStorage implements ObjectStorage {
     }
 
     /**
-     * Serves a block slice from the disk cache (hit path) or from the inner storage
-     * (miss path), updating hit/miss byte counters for Prometheus metrics (issue #336).
+     * Single-object layout (issue #650): every logical multipart file is one
+     * S3 object at {@code path}. We cache slices of that object at
+     * {@code blockSize}-aligned offsets, keyed by {@link #blockCacheKey(String, long)}
+     * (a synthetic {@code path + "#" + blockIndex} string that lives in a
+     * separate namespace from full-file cache entries used by {@link #read}).
+     *
+     * <p>Cache miss path: we ranged-read exactly one {@code blockSize}-byte
+     * block from {@code inner} and cache the whole block, then slice the
+     * portion the caller asked for. Subsequent reads inside the same block
+     * are cache hits.
      */
     @Override
     public CompletableFuture<ReadResult> readRange(String path, long offset, int length, int blockSize) {
         long blockIndex = offset / blockSize;
         int offsetInBlock = (int) (offset % blockSize);
-        String blockPath = path + ObjectStorage.MULTIPART_SUFFIX + "/" + blockIndex;
-        return tryReadSliceFromDiskAsync(blockPath, offsetInBlock, length)
+        String blockKey = blockCacheKey(path, blockIndex);
+        return tryReadSliceFromDiskAsync(blockKey, offsetInBlock, length)
                 .thenCompose(cached -> {
                     if (cached != null) {
                         // Cache HIT: increment byte counter for Prometheus gauge.
                         hitBytes.addAndGet(length);
                         return CompletableFuture.completedFuture(cached);
                     }
-                    // Cache MISS: increment byte counter and fall through to inner storage.
+                    // Cache MISS: increment byte counter and load one cache-block
+                    // from the inner storage. The inner range read fetches at most
+                    // {@code blockSize} bytes aligned to a block boundary; the
+                    // returned slice may be SHORTER than blockSize for the tail
+                    // block (last cache-block of the file).
                     missBytes.addAndGet(length);
-                    return loadAndCache(blockPath).thenApply(full -> sliceFromFull(full, offsetInBlock, length));
+                    long alignedOffset = blockIndex * (long) blockSize;
+                    return loadAndCacheBlock(path, blockKey, alignedOffset, blockSize)
+                            .thenApply(full -> sliceFromFull(full, offsetInBlock, length));
                 });
+    }
+
+    /**
+     * Cache-key namespace for block slices. Distinct from the full-file
+     * namespace used by {@link #read} so the two never collide; the {@code #}
+     * separator is chosen because object-storage keys must not contain
+     * {@code #} (S3 / MinIO accept the byte but it is reserved as a URL
+     * fragment delimiter and would never appear in a real backend key).
+     */
+    private static String blockCacheKey(String path, long blockIndex) {
+        return path + "#" + blockIndex;
+    }
+
+    /**
+     * Fetches the block-sized chunk at {@code alignedOffset} from the inner
+     * storage, admits it into the cache under {@code blockKey}, and returns
+     * a duplicated {@link ReadResult} for the caller to slice. Deduplicates
+     * concurrent loads of the same block via {@link #inFlightReads}.
+     */
+    private CompletableFuture<ReadResult> loadAndCacheBlock(String path, String blockKey,
+                                                            long alignedOffset, int blockSize) {
+        CompletableFuture<ByteBuf> pending = new CompletableFuture<>();
+        CompletableFuture<ReadResult> resultFuture = pending.thenApply(CachingObjectStorage::wrapDuplicate);
+
+        CompletableFuture<ByteBuf> existing = inFlightReads.putIfAbsent(blockKey, pending);
+        if (existing != null) {
+            return existing.thenApply(CachingObjectStorage::wrapDuplicate);
+        }
+        inner.readRange(path, alignedOffset, blockSize, blockSize).whenComplete((result, err) -> {
+            if (err != null) {
+                try {
+                    pending.completeExceptionally(err);
+                } finally {
+                    inFlightReads.remove(blockKey, pending);
+                }
+                return;
+            }
+            if (result.status() != ReadResult.Status.FOUND) {
+                try {
+                    pending.complete(null);
+                } finally {
+                    inFlightReads.remove(blockKey, pending);
+                }
+                return;
+            }
+            ByteBuf buf = result.byteBuf();
+            // Same refcount discipline as loadAndCache: +1 for admitToDisk, +1
+            // to keep buf alive across followers' retainedDuplicate.
+            buf.retain(2);
+            CompletableFuture<Void> diskWrite = admitToDisk(blockKey, buf);
+            try {
+                diskWrite.whenComplete((v, e) -> {
+                    try {
+                        if (e != null) {
+                            try {
+                                pending.completeExceptionally(e);
+                            } finally {
+                                inFlightReads.remove(blockKey, pending);
+                            }
+                            return;
+                        }
+                        try {
+                            pending.complete(buf);
+                        } finally {
+                            inFlightReads.remove(blockKey, pending);
+                        }
+                    } finally {
+                        buf.release();
+                    }
+                });
+            } finally {
+                result.release();
+            }
+        });
+        return resultFuture;
     }
 
     private CompletableFuture<ReadResult> tryReadSliceFromDiskAsync(String blockPath, int offsetInBlock, int length) {
@@ -937,16 +1041,6 @@ public class CachingObjectStorage implements ObjectStorage {
         }
     }
 
-    @Override
-    public CompletableFuture<Boolean> deleteLogical(String path) {
-        String multipartPrefix = path + ObjectStorage.MULTIPART_SUFFIX + "/";
-        List<String> toInvalidate = new ArrayList<>(diskLru.asMap().keySet());
-        toInvalidate.stream()
-                .filter(k -> k.equals(path) || k.startsWith(multipartPrefix))
-                .forEach(this::invalidateAndDelete);
-        return inner.deleteLogical(path);
-    }
-
     /**
      * Explicit invalidation path: removes the entry from the LRU and synchronously
      * runs the per-tier cleanup. We do not rely on Caffeine's removal listener for
@@ -961,14 +1055,23 @@ public class CachingObjectStorage implements ObjectStorage {
         }
     }
 
-    @Override
-    public CompletableFuture<List<String>> listLogical(String prefix) {
-        return inner.listLogical(prefix);
+    /**
+     * Invalidates every cache entry whose key begins with {@code path} —
+     * both the full-file entry at {@code path} itself (admitted via
+     * {@link #read} / {@link #write}) and every block-cache entry at
+     * {@code path#{blockIndex}} (admitted via {@link #readRange}).
+     */
+    private void invalidatePathAndBlocks(String path) {
+        String blockPrefix = path + "#";
+        List<String> toInvalidate = new ArrayList<>(diskLru.asMap().keySet());
+        toInvalidate.stream()
+                .filter(k -> k.equals(path) || k.startsWith(blockPrefix))
+                .forEach(this::invalidateAndDelete);
     }
 
     @Override
     public CompletableFuture<Boolean> delete(String path) {
-        invalidateAndDelete(path);
+        invalidatePathAndBlocks(path);
         return inner.delete(path);
     }
 
@@ -980,6 +1083,11 @@ public class CachingObjectStorage implements ObjectStorage {
     @Override
     public CompletableFuture<Integer> deleteByPrefix(String prefix) {
         return inner.deleteByPrefix(prefix).thenApply(count -> {
+            // Two key shapes to invalidate: (a) any full-file cache entry whose
+            // path starts with prefix; (b) any block-cache entry whose composite
+            // key {path}#{blockIndex} starts with prefix — these are caught by
+            // the same startsWith() filter because the block-key prefix matches
+            // the same path-prefix.
             List<String> keysToInvalidate = new ArrayList<>(diskLru.asMap().keySet());
             keysToInvalidate.stream()
                     .filter(k -> k.startsWith(prefix))

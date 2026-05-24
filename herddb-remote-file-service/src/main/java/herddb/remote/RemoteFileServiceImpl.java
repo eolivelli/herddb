@@ -97,16 +97,18 @@ public class RemoteFileServiceImpl {
     private final Counter deleteByPrefixErrors;
     private final OpStatsLogger deleteByPrefixLatency;
 
-    private final Counter writeBlockRequests;
-    private final Counter writeBlockErrors;
-    private final Counter writtenBlockBytes;
-    private final OpStatsLogger writeBlockLatency;
-
     private final Counter readRangeRequests;
     private final Counter readRangeErrors;
     private final Counter readRangeNotFound;
     private final Counter readRangeBytes;
     private final OpStatsLogger readRangeLatency;
+
+    /** Issue #650: prefetch RPC counters — fills the cache, returns no payload. */
+    private final Counter prefetchRequests;
+    private final Counter prefetchErrors;
+    private final Counter prefetchNotFound;
+    private final Counter prefetchBytes;
+    private final OpStatsLogger prefetchLatency;
 
     public RemoteFileServiceImpl(ObjectStorage storage) {
         this(storage, NullStatsLogger.INSTANCE, null, null);
@@ -161,16 +163,17 @@ public class RemoteFileServiceImpl {
         this.deleteByPrefixErrors = scope.getCounter("deletebyprefix_errors");
         this.deleteByPrefixLatency = scope.getOpStatsLogger("deletebyprefix_latency");
 
-        this.writeBlockRequests = scope.getCounter("writeblock_requests");
-        this.writeBlockErrors = scope.getCounter("writeblock_errors");
-        this.writtenBlockBytes = scope.getCounter("writeblock_bytes");
-        this.writeBlockLatency = scope.getOpStatsLogger("writeblock_latency");
-
         this.readRangeRequests = scope.getCounter("readrange_requests");
         this.readRangeErrors = scope.getCounter("readrange_errors");
         this.readRangeNotFound = scope.getCounter("readrange_not_found");
         this.readRangeBytes = scope.getCounter("readrange_bytes");
         this.readRangeLatency = scope.getOpStatsLogger("readrange_latency");
+
+        this.prefetchRequests = scope.getCounter("prefetch_requests");
+        this.prefetchErrors = scope.getCounter("prefetch_errors");
+        this.prefetchNotFound = scope.getCounter("prefetch_not_found");
+        this.prefetchBytes = scope.getCounter("prefetch_bytes");
+        this.prefetchLatency = scope.getOpStatsLogger("prefetch_latency");
     }
 
     /**
@@ -184,14 +187,14 @@ public class RemoteFileServiceImpl {
             case Pdu.TYPE_FS_WRITE_FILE:
                 handleWriteFile(pdu, channel);
                 return true;
-            case Pdu.TYPE_FS_WRITE_FILE_BLOCK:
-                handleWriteFileBlock(pdu, channel);
-                return true;
             case Pdu.TYPE_FS_READ_FILE:
                 handleReadFile(pdu, channel);
                 return true;
             case Pdu.TYPE_FS_READ_FILE_RANGE:
                 handleReadFileRange(pdu, channel);
+                return true;
+            case Pdu.TYPE_FS_PREFETCH_FILE_RANGE:
+                handlePrefetchFileRange(pdu, channel);
                 return true;
             case Pdu.TYPE_FS_DELETE_FILE:
                 handleDeleteFile(pdu, channel);
@@ -269,69 +272,6 @@ public class RemoteFileServiceImpl {
                             new Object[]{path, len, elapsedMs(start)});
                     channel.sendReplyMessage(messageId,
                             PduCodec.WriteFileResponse.write(messageId, len));
-                }
-            } finally {
-                ReferenceCountUtil.safeRelease(content);
-            }
-        });
-    }
-
-    // ----------------------------------------------------------------------
-    // WRITE_FILE_BLOCK
-    // ----------------------------------------------------------------------
-
-    private void handleWriteFileBlock(Pdu pdu, Channel channel) {
-        final long messageId = pdu.messageId;
-        final String path;
-        final long blockIndex;
-        final ByteBuf content;
-        try {
-            path = PduCodec.WriteFileBlockRequest.readPath(pdu);
-            blockIndex = PduCodec.WriteFileBlockRequest.readBlockIndex(pdu);
-            content = PduCodec.WriteFileBlockRequest.readContent(pdu);
-        } catch (RuntimeException parseError) {
-            // Broad catch: PDU parse can fail on truncated / malformed frames.
-            pdu.close();
-            sendError(channel, messageId, "malformed WRITE_FILE_BLOCK: " + parseError.getMessage());
-            return;
-        }
-        pdu.close();
-
-        try {
-            runOnLane(writeExecutor, () -> writeFileBlockImpl(messageId, path, blockIndex, content, channel));
-        } catch (RuntimeException dispatchError) {
-            // Broad catch: writeExecutor may reject the task at shutdown or
-            // under saturation; release the retained slice that the lambda
-            // would have owned to avoid a direct-memory leak.
-            ReferenceCountUtil.safeRelease(content);
-            sendError(channel, messageId,
-                    "writeFileBlock dispatch failed: " + dispatchError.getMessage());
-        }
-    }
-
-    private void writeFileBlockImpl(long messageId, String path, long blockIndex,
-                                    ByteBuf content, Channel channel) {
-        long start = System.nanoTime();
-        writeBlockRequests.inc();
-        final int len = content.readableBytes();
-        final byte[] bytes = new byte[len];
-        content.getBytes(content.readerIndex(), bytes);
-        attachCallback(storage.writeBlock(path, blockIndex, bytes), writeExecutor, (v, t) -> {
-            try {
-                long elapsedMicros = TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - start);
-                if (t != null) {
-                    writeBlockErrors.inc();
-                    writeBlockLatency.registerFailedEvent(elapsedMicros, TimeUnit.MICROSECONDS);
-                    LOGGER.log(Level.SEVERE, "writeFileBlock failed for path " + path
-                            + " block " + blockIndex, t);
-                    sendError(channel, messageId, "writeFileBlock failed: " + t.getMessage());
-                } else {
-                    writtenBlockBytes.addCount(len);
-                    writeBlockLatency.registerSuccessfulEvent(elapsedMicros, TimeUnit.MICROSECONDS);
-                    LOGGER.log(Level.FINE, "writeFileBlock path={0} block={1} size={2} time={3}ms",
-                            new Object[]{path, blockIndex, len, elapsedMs(start)});
-                    channel.sendReplyMessage(messageId,
-                            PduCodec.WriteFileBlockResponse.write(messageId, len));
                 }
             } finally {
                 ReferenceCountUtil.safeRelease(content);
@@ -472,6 +412,97 @@ public class RemoteFileServiceImpl {
     }
 
     // ----------------------------------------------------------------------
+    // PREFETCH_FILE_RANGE (issue #650)
+    // ----------------------------------------------------------------------
+    //
+    // Tells the file server to materialise a {@code (offset, length, blockSize)}
+    // slice into its on-disk cache without sending the bytes back to the
+    // client. Used by the IS prewarm phase to populate the file-server cache
+    // before a freshly-written segment is published into the searchable list.
+    // The IS issues one prefetch per {@code blockSize}-aligned block of the
+    // segment so every block lands on the file-server replica predicted by
+    // the {@link herddb.remote.ConsistentHashRouter}.
+
+    private void handlePrefetchFileRange(Pdu pdu, Channel channel) {
+        final long messageId = pdu.messageId;
+        final String path;
+        final long offset;
+        final int length;
+        final int blockSize;
+        try {
+            path = PduCodec.PrefetchFileRangeRequest.readPath(pdu);
+            offset = PduCodec.PrefetchFileRangeRequest.readOffset(pdu);
+            length = PduCodec.PrefetchFileRangeRequest.readLength(pdu);
+            blockSize = PduCodec.PrefetchFileRangeRequest.readBlockSize(pdu);
+        } catch (RuntimeException parseError) {
+            // Broad catch: PDU parse on malformed / truncated frames.
+            pdu.close();
+            sendError(channel, messageId, "malformed PREFETCH_FILE_RANGE: " + parseError.getMessage());
+            return;
+        }
+        pdu.close();
+
+        try {
+            runOnLane(readExecutor, () -> prefetchFileRangeImpl(messageId, path, offset, length, blockSize, channel));
+        } catch (RuntimeException dispatchError) {
+            // Broad catch: readExecutor may reject the task during shutdown
+            // or under saturation; surface as ERROR so the client fails fast.
+            sendError(channel, messageId,
+                    "prefetchFileRange dispatch failed: " + dispatchError.getMessage());
+        }
+    }
+
+    private void prefetchFileRangeImpl(long messageId, String path, long offset, int length,
+                                       int blockSize, Channel channel) {
+        long start = System.nanoTime();
+        prefetchRequests.inc();
+        // Route through the storage's prefetchRange. Backends with a caching
+        // tier (e.g. CachingObjectStorage) admit the block into the disk LRU;
+        // backends without a cache fall through to the default impl which
+        // admits via readRange + immediate release. The future resolves
+        // tri-state: TRUE=admitted, FALSE=not-found, exceptional=error. We
+        // never return bytes — only a status PDU — so the IS-to-file-server
+        // bandwidth used by prewarm is bounded by the response framing, not
+        // by segment size.
+        attachCallback(storage.prefetchRange(path, offset, length, blockSize), readExecutor, (admitted, t) -> {
+            long elapsedMicros = TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - start);
+            if (t != null) {
+                prefetchErrors.inc();
+                prefetchLatency.registerFailedEvent(elapsedMicros, TimeUnit.MICROSECONDS);
+                LOGGER.log(Level.WARNING,
+                        "prefetchFileRange failed for path " + path
+                                + " offset=" + offset + " length=" + length, t);
+                channel.sendReplyMessage(messageId,
+                        PduCodec.PrefetchFileRangeResponse.writeError(messageId,
+                                "prefetchFileRange failed: " + t.getMessage()));
+                return;
+            }
+            prefetchLatency.registerSuccessfulEvent(elapsedMicros, TimeUnit.MICROSECONDS);
+            if (Boolean.TRUE.equals(admitted)) {
+                // Admitted: count the requested length as cached. We use the
+                // request length (not the actual admitted bytes) because the
+                // storage layer only signals success/not-found, not byte counts;
+                // for last-block-of-file requests this is an upper bound (the
+                // tail block is short) but operationally close enough for the
+                // cache-throughput dashboard.
+                prefetchBytes.addCount(length);
+                LOGGER.log(Level.FINE,
+                        "prefetchFileRange path={0} offset={1} length={2} time={3}ms (OK)",
+                        new Object[]{path, offset, length, elapsedMs(start)});
+                channel.sendReplyMessage(messageId,
+                        PduCodec.PrefetchFileRangeResponse.writeOk(messageId));
+            } else {
+                prefetchNotFound.inc();
+                LOGGER.log(Level.FINE,
+                        "prefetchFileRange path={0} offset={1} length={2} time={3}ms (NOT_FOUND)",
+                        new Object[]{path, offset, length, elapsedMs(start)});
+                channel.sendReplyMessage(messageId,
+                        PduCodec.PrefetchFileRangeResponse.writeNotFound(messageId));
+            }
+        });
+    }
+
+    // ----------------------------------------------------------------------
     // DELETE_FILE
     // ----------------------------------------------------------------------
 
@@ -500,7 +531,9 @@ public class RemoteFileServiceImpl {
     private void deleteFileImpl(long messageId, String path, Channel channel) {
         long start = System.nanoTime();
         deleteRequests.inc();
-        attachCallback(storage.deleteLogical(path), writeExecutor, (deleted, t) -> {
+        // Single-object layout (issue #650): one S3 key per logical file, so a
+        // logical delete is just storage.delete(path) — no .multipart/ sweep.
+        attachCallback(storage.delete(path), writeExecutor, (deleted, t) -> {
             long elapsedMicros = TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - start);
             if (t != null) {
                 deleteErrors.inc();
@@ -566,7 +599,7 @@ public class RemoteFileServiceImpl {
         for (int i = 0; i < total; i++) {
             final int idx = i;
             final String path = paths.get(i);
-            attachCallback(storage.deleteLogical(path), writeExecutor, (deleted, t) -> {
+            attachCallback(storage.delete(path), writeExecutor, (deleted, t) -> {
                 if (t != null) {
                     errors.incrementAndGet();
                     String msg = t.getMessage();
@@ -640,7 +673,9 @@ public class RemoteFileServiceImpl {
     private void listFilesImpl(long messageId, String prefix, Channel channel) {
         long start = System.nanoTime();
         listRequests.inc();
-        attachCallback(storage.listLogical(prefix), readExecutor, (paths, t) -> {
+        // Single-object layout (issue #650): one S3 key per logical file, so a
+        // raw list is the same as a logical list — no per-block key collapse.
+        attachCallback(storage.list(prefix), readExecutor, (paths, t) -> {
             long elapsedMicros = TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - start);
             if (t != null) {
                 listErrors.inc();

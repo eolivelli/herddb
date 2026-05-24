@@ -83,12 +83,11 @@ public class S3ObjectStorageTest {
     }
 
     /**
-     * deleteLogical() combines a single-object delete and a multipart-prefix delete.
-     * The single-object delete can hit the NoSuchKey path on GCS even while no multipart
-     * blocks exist; the composed future must still complete successfully.
+     * Single-object layout: delete() on a missing key on GCS returns 404 NoSuchKey;
+     * the future must still complete successfully (idempotent).
      */
     @Test
-    public void deleteLogicalSwallowsNoSuchKeyFromSingleObjectDelete() throws Exception {
+    public void deleteSwallowsNoSuchKeyFromSingleObjectDelete() throws Exception {
         S3AsyncClient client = (S3AsyncClient) Proxy.newProxyInstance(
                 S3AsyncClient.class.getClassLoader(),
                 new Class<?>[] {S3AsyncClient.class},
@@ -112,10 +111,9 @@ public class S3ObjectStorageTest {
                 });
         S3ObjectStorage storage = new S3ObjectStorage(client, "bucket", "prefix/");
 
-        Boolean deleted = storage.deleteLogical("ghost.page").get();
+        Boolean deleted = storage.delete("ghost.page").get();
 
-        // deleteLogical = (blocks > 0) || single-delete; delete() now returns TRUE on 404 to
-        // stay consistent with native S3 (idempotent), so the composed future resolves to TRUE.
+        // delete() returns TRUE on 404 to stay consistent with native S3 (idempotent).
         assertEquals(Boolean.TRUE, deleted);
     }
 

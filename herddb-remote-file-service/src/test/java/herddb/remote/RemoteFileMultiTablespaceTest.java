@@ -65,8 +65,19 @@ public class RemoteFileMultiTablespaceTest {
 
         String nodeId = "localhost";
 
-        try (RemoteFileServer server1 = new RemoteFileServer(0, folder.newFolder("remote1").toPath());
-             RemoteFileServer server2 = new RemoteFileServer(0, folder.newFolder("remote2").toPath())) {
+        // Issue #650: single-object multipart layout. The IS-side data-page
+        // writer (`writeAsMultipart`) uses one single-PDU `client.writeFile`
+        // that routes via `writeChannelForPath(path)` — the whole file lands
+        // on the path's owner server. The IS-side reader, by contrast, routes
+        // each block via `readChannelForBlock(path, blockIdx)`. To make reads
+        // resolve to the same bytes the writer wrote in a multi-server
+        // topology, BOTH file-server replicas must observe the same backing
+        // storage — exactly the production model where every file-server
+        // pod points at the same S3 bucket. We mirror that here by giving
+        // both servers the same data directory.
+        Path sharedFileServerDir = folder.newFolder("remote-shared").toPath();
+        try (RemoteFileServer server1 = new RemoteFileServer(0, sharedFileServerDir);
+             RemoteFileServer server2 = new RemoteFileServer(0, sharedFileServerDir)) {
 
             server1.start();
             server2.start();

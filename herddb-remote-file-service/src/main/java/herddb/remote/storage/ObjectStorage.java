@@ -34,49 +34,73 @@ import java.util.concurrent.CompletableFuture;
  * Abstraction over an object/blob storage backend.
  * Enables local filesystem, S3, or other providers.
  *
- * <p>Multipart files: large files are split into fixed-size blocks stored at
- * {@code {path}.multipart/{blockIndex}}. The logical path is {@code path}.
- * Multipart and single-part files are mutually exclusive for a given logical path.
+ * <p>Single-object layout (issue #650): every logical file is stored as
+ * exactly one object at {@code path}. Large files are still served in
+ * cache-block-sized slices through {@link #readRange(String, long, int, int)},
+ * but the on-storage layout is one key per logical file — no
+ * {@code .multipart/{N}} blocks, no {@code .bulk} suffix. The {@code blockSize}
+ * parameter to {@link #readRange} is a cache-granularity hint only: backends
+ * that wrap a caching tier (e.g. {@code CachingObjectStorage}) align cache
+ * entries to {@code blockSize} boundaries; backends without a cache simply
+ * honour {@code (offset, length)} as raw bytes against the single object.
  *
  * @author enrico.olivelli
  */
 public interface ObjectStorage extends AutoCloseable {
-
-    /** Directory suffix used to store multipart file blocks. */
-    String MULTIPART_SUFFIX = ".multipart";
 
     CompletableFuture<Void> write(String path, byte[] content);
 
     CompletableFuture<ReadResult> read(String path);
 
     /**
-     * Writes one block of a multipart file.
-     * Stored physically at {@code {path}.multipart/{blockIndex}}.
-     */
-    CompletableFuture<Void> writeBlock(String path, long blockIndex, byte[] content);
-
-    /**
-     * Reads a range of bytes from a (possibly multipart) file.
-     * The range must not span two blocks (client responsibility).
+     * Reads a range of bytes from the single object stored at {@code path}.
+     *
+     * <p>Single-object layout: {@code (offset, length)} are absolute byte
+     * coordinates within the one object that backs {@code path}. The
+     * {@code blockSize} parameter is the cache-block granularity used by
+     * caching backends; the contract guarantees that the returned slice
+     * lies entirely within one {@code blockSize}-aligned window
+     * {@code [floor(offset/blockSize)*blockSize, floor(offset/blockSize)*blockSize + blockSize)}.
+     * Callers that need cross-block reads must issue multiple
+     * {@code readRange} calls — this matches the existing
+     * {@link herddb.remote.RemoteFileServiceClient#readFileRangeAsByteBufAsync}
+     * splitting behaviour.
      *
      * @param path      logical file path
-     * @param offset    byte offset in the logical file
+     * @param offset    absolute byte offset in the object
      * @param length    number of bytes to read
-     * @param blockSize size of each block in bytes
+     * @param blockSize cache-block granularity (must be {@code > 0})
      */
     CompletableFuture<ReadResult> readRange(String path, long offset, int length, int blockSize);
 
     /**
-     * Deletes a logical file: if {@code {path}.multipart/} exists all blocks are deleted,
-     * otherwise the single-part file at {@code path} is deleted.
+     * Prefetches a range of bytes into the storage's cache (if any) without
+     * returning the bytes to the caller.
+     *
+     * <p>The returned future has three terminal states:
+     * <ul>
+     *   <li>completes with {@code true} — the range was admitted into the
+     *       cache (or it was already resident);</li>
+     *   <li>completes with {@code false} — the underlying object was
+     *       {@code NOT_FOUND}; nothing was admitted. Backends without a
+     *       cache that nevertheless can cheaply distinguish present vs
+     *       absent SHOULD report this; backends that cannot SHOULD return
+     *       {@code true} (the prefetch contract is best-effort);</li>
+     *   <li>completes exceptionally — a transient I/O / transport error.
+     *       Callers MUST treat this as best-effort and continue.</li>
+     * </ul>
+     *
+     * <p>The default implementation forwards to {@link #readRange} and
+     * immediately releases the returned {@link ByteBuf}, mapping the
+     * {@link ReadResult.Status} to the tri-state above.
      */
-    CompletableFuture<Boolean> deleteLogical(String path);
-
-    /**
-     * Lists logical paths under {@code prefix}, collapsing {@code {path}.multipart/{N}}
-     * entries into their logical path {@code path}.
-     */
-    CompletableFuture<List<String>> listLogical(String prefix);
+    default CompletableFuture<Boolean> prefetchRange(String path, long offset, int length, int blockSize) {
+        return readRange(path, offset, length, blockSize).thenApply(result -> {
+            ReadResult.Status status = result.status();
+            result.release();
+            return status == ReadResult.Status.FOUND ? Boolean.TRUE : Boolean.FALSE;
+        });
+    }
 
     CompletableFuture<Boolean> delete(String path);
 
@@ -92,9 +116,7 @@ public interface ObjectStorage extends AutoCloseable {
      * <p>When {@code append} is {@code false} the destination file is created
      * (or replaced if it already exists). When {@code append} is {@code true}
      * the content is appended to the existing file (or the file is created if
-     * absent). This lets callers reconstruct a multipart logical file by
-     * downloading block 0 with {@code append=false} and all subsequent blocks
-     * with {@code append=true}.
+     * absent).
      *
      * <p>The default implementation falls back to {@link #read(String)} and
      * copies the returned {@link ByteBuf} via a {@link FileChannel}. Override
@@ -145,18 +167,16 @@ public interface ObjectStorage extends AutoCloseable {
     }
 
     /**
-     * Issue #638: uploads {@code source} as a <em>single</em> object stored at
-     * {@code path}, returning the number of bytes written. Backends that
-     * support the S3 Multipart Upload API (e.g. {@link S3ObjectStorage} via
+     * Uploads {@code source} as the single object stored at {@code path},
+     * returning the number of bytes written. Backends that support the S3
+     * Multipart Upload API (e.g. {@link S3ObjectStorage} via
      * {@code S3TransferManager.uploadFile(...)}) override this to pipeline
      * parts in parallel and stream the file zero-copy from disk.
      *
-     * <p>Unlike {@link #writeBlock(String, long, byte[])}, the resulting
-     * storage object lives at {@code path} itself — there is no
-     * {@code .multipart/{N}} suffix. {@link RemoteFileDataStorageManager}
-     * pairs this with the {@code .bulk} key convention so that bulk-uploaded
-     * files coexist with legacy per-block files in the same bucket without
-     * ambiguity.
+     * <p>Single-object layout (issue #650): the resulting storage object
+     * lives at {@code path} itself — no {@code .multipart/{N}} suffix, no
+     * {@code .bulk} suffix. {@code uploadFile} is the only multipart-file
+     * write path; the per-block {@code writeBlock} API was removed in #650.
      *
      * <p>The default implementation reads the whole file into a heap byte
      * array and calls {@link #write(String, byte[])} — fine for unit tests
@@ -188,38 +208,24 @@ public interface ObjectStorage extends AutoCloseable {
     }
 
     /**
-     * Issue #645: tri-state single-key existence probe used by
-     * {@link RemoteFileDataStorageManager} to discover whether a logical
-     * multipart file is stored in the bulk layout
-     * ({@code {logicalPath}.bulk}, a single object) or the legacy per-block
-     * layout ({@code {logicalPath}.multipart/{i}}).
+     * Tri-state single-key existence probe.
      *
      * <p>Backends with a cheap presence probe (S3 {@code HEAD}, local file
      * {@code exists()}) should override; the default falls back to
      * {@link #read(String)} which materialises the whole object — correct,
      * but inefficient.
      *
-     * <p><b>Contract (tightened in issue #645):</b> the returned future has
-     * exactly three terminal states, and callers MUST honour the distinction:
+     * <p><b>Contract (issue #645):</b> the returned future has exactly three
+     * terminal states, and callers MUST honour the distinction:
      * <ul>
      *   <li>completes with {@code true} — the object is present;</li>
      *   <li>completes with {@code false} — the object is <em>definitively</em>
      *       absent (e.g. S3 {@code NoSuchKey} / HTTP 404, local file does not
-     *       exist). A {@code false} answer is a strong signal that the caller
-     *       may take an alternate code path safely;</li>
+     *       exist);</li>
      *   <li>completes exceptionally — the existence could not be determined
      *       (transient I/O error, network timeout, HTTP 5xx, generic SDK
-     *       error). Callers that rely on a definitive answer to decide a read
-     *       layout MUST treat this as an error and not silently fall through
-     *       to a different layout — see issue #645 for the failure mode that
-     *       motivated this contract.</li>
+     *       error).</li>
      * </ul>
-     *
-     * <p>Before issue #645 the default implementation collapsed every
-     * exception into {@code false}. That silently misrouted reads of
-     * direct-S3-uploaded files through the gRPC file-server on restart and
-     * crash-looped the indexing service. The new default propagates non
-     * {@code NOT_FOUND} errors exceptionally.
      */
     default CompletableFuture<Boolean> existsObject(String path) {
         return read(path).thenApply(result -> {
@@ -243,8 +249,8 @@ public interface ObjectStorage extends AutoCloseable {
     }
 
     /**
-     * Issue #638: downloads a single-object bulk file at {@code path}
-     * directly to {@code dest}, replacing any existing file. Symmetric to
+     * Downloads the single object at {@code path} directly to {@code dest},
+     * replacing any existing file. Symmetric to
      * {@link #uploadFile(String, Path, java.util.function.LongConsumer)}.
      *
      * <p>The default implementation delegates to

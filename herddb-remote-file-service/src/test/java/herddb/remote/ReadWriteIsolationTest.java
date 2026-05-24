@@ -86,16 +86,16 @@ public class ReadWriteIsolationTest {
         server.start();
         client = new RemoteFileServiceClient(Arrays.asList("localhost:" + server.getPort()));
 
-        // Pre-write a multipart target file so the read phase has something
-        // to fetch. Written block-by-block via writeFileBlockAsync so it
-        // lands on the server in the same layout we'll read from.
-        byte[] block = new byte[BLOCK_SIZE];
+        // Pre-write a target file so the read phase has something to fetch.
+        // Single-object layout (issue #650): the whole file is uploaded in
+        // one shot via writeFile.
+        byte[] full = new byte[BLOCK_SIZE * FILE_BLOCKS];
         for (int i = 0; i < FILE_BLOCKS; i++) {
-            for (int j = 0; j < block.length; j++) {
-                block[j] = (byte) ((i + j) & 0xff);
+            for (int j = 0; j < BLOCK_SIZE; j++) {
+                full[i * BLOCK_SIZE + j] = (byte) ((i + j) & 0xff);
             }
-            client.writeFileBlockAsync(TARGET_PATH, i, block).get(30, TimeUnit.SECONDS);
         }
+        client.writeFile(TARGET_PATH, full);
     }
 
     @After
@@ -123,8 +123,11 @@ public class ReadWriteIsolationTest {
             long nextBlock = 0;
             while (!stopWrites.get()) {
                 try {
-                    CompletableFuture<Void> f =
-                            client.writeFileBlockAsync(WRITE_NOISE_PATH, nextBlock, writeBlock);
+                    // Single-object layout: each iteration overwrites the noise
+                    // file with a fresh BLOCK_SIZE byte payload. Generates the
+                    // same write-path pressure as the legacy per-block path.
+                    CompletableFuture<Long> f =
+                            client.writeFileAsync(WRITE_NOISE_PATH + "." + nextBlock, writeBlock);
                     f.get(30, TimeUnit.SECONDS);
                     writeCount.incrementAndGet();
                     nextBlock++;

@@ -180,12 +180,6 @@ public class InMemoryBlockCacheObjectStorage implements ObjectStorage {
     }
 
     @Override
-    public CompletableFuture<Void> writeBlock(String path, long blockIndex, byte[] content) {
-        cache.invalidate(new BlockKey(path, blockIndex));
-        return inner.writeBlock(path, blockIndex, content);
-    }
-
-    @Override
     public CompletableFuture<ReadResult> readRange(String path, long offset, int length, int blockSize) {
         long blockIndex = offset / blockSize;
         int offsetInBlock = (int) (offset % blockSize);
@@ -309,17 +303,6 @@ public class InMemoryBlockCacheObjectStorage implements ObjectStorage {
             }
         });
         return out;
-    }
-
-    @Override
-    public CompletableFuture<Boolean> deleteLogical(String path) {
-        invalidateAllBlocksOf(path);
-        return inner.deleteLogical(path);
-    }
-
-    @Override
-    public CompletableFuture<List<String>> listLogical(String prefix) {
-        return inner.listLogical(prefix);
     }
 
     @Override

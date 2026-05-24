@@ -25,7 +25,6 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import io.github.jbellis.jvector.disk.RandomAccessReader;
 import io.github.jbellis.jvector.disk.ReaderSupplier;
-import java.io.ByteArrayInputStream;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.List;
@@ -73,7 +72,7 @@ public class RemoteRandomAccessReaderTest {
     @Test
     public void testSeekAndReadFully() throws Exception {
         byte[] data = seqBytes(BLOCK_SIZE * 2 + 20);
-        client.writeMultipartFile("ts/idx/graph", new ByteArrayInputStream(data), BLOCK_SIZE);
+        client.writeFile("ts/idx/graph", data);
 
         try (RemoteRandomAccessReader reader =
                 new RemoteRandomAccessReader(client, "ts/idx/graph", data.length, BLOCK_SIZE)) {
@@ -92,7 +91,7 @@ public class RemoteRandomAccessReaderTest {
     @Test
     public void testCrossBlockRead() throws Exception {
         byte[] data = seqBytes(BLOCK_SIZE * 2 + 10);
-        client.writeMultipartFile("ts/idx/cross", new ByteArrayInputStream(data), BLOCK_SIZE);
+        client.writeFile("ts/idx/cross", data);
 
         try (RemoteRandomAccessReader reader =
                 new RemoteRandomAccessReader(client, "ts/idx/cross", data.length, BLOCK_SIZE)) {
@@ -112,7 +111,7 @@ public class RemoteRandomAccessReaderTest {
         int value = 0x01020304;
         byte[] block = new byte[BLOCK_SIZE];
         block[0] = 0x01; block[1] = 0x02; block[2] = 0x03; block[3] = 0x04;
-        client.writeMultipartFile("ts/idx/int", new ByteArrayInputStream(block), BLOCK_SIZE);
+        client.writeFile("ts/idx/int", block);
 
         try (RemoteRandomAccessReader reader =
                 new RemoteRandomAccessReader(client, "ts/idx/int", BLOCK_SIZE, BLOCK_SIZE)) {
@@ -130,7 +129,7 @@ public class RemoteRandomAccessReaderTest {
         block[1] = (byte) (bits >>> 16);
         block[2] = (byte) (bits >>> 8);
         block[3] = (byte) bits;
-        client.writeMultipartFile("ts/idx/float", new ByteArrayInputStream(block), BLOCK_SIZE);
+        client.writeFile("ts/idx/float", block);
 
         try (RemoteRandomAccessReader reader =
                 new RemoteRandomAccessReader(client, "ts/idx/float", BLOCK_SIZE, BLOCK_SIZE)) {
@@ -146,7 +145,7 @@ public class RemoteRandomAccessReaderTest {
         for (int i = 0; i < 8; i++) {
             block[i] = (byte) (expected >>> (56 - i * 8));
         }
-        client.writeMultipartFile("ts/idx/long", new ByteArrayInputStream(block), BLOCK_SIZE);
+        client.writeFile("ts/idx/long", block);
 
         try (RemoteRandomAccessReader reader =
                 new RemoteRandomAccessReader(client, "ts/idx/long", BLOCK_SIZE, BLOCK_SIZE)) {
@@ -158,7 +157,7 @@ public class RemoteRandomAccessReaderTest {
     @Test
     public void testSupplierCreatesIndependentReaders() throws Exception {
         byte[] data = seqBytes(BLOCK_SIZE + 10);
-        client.writeMultipartFile("ts/idx/supplier", new ByteArrayInputStream(data), BLOCK_SIZE);
+        client.writeFile("ts/idx/supplier", data);
 
         ReaderSupplier supplier = new RemoteRandomAccessReader.Supplier(client, "ts/idx/supplier", data.length, BLOCK_SIZE);
         try (RandomAccessReader r1 = supplier.get();
@@ -177,7 +176,7 @@ public class RemoteRandomAccessReaderTest {
     @Test
     public void testLength() throws Exception {
         byte[] data = seqBytes(150);
-        client.writeMultipartFile("ts/idx/len", new ByteArrayInputStream(data), BLOCK_SIZE);
+        client.writeFile("ts/idx/len", data);
 
         RemoteRandomAccessReader reader = new RemoteRandomAccessReader(client, "ts/idx/len", data.length, BLOCK_SIZE);
         assertEquals(150, reader.length());
@@ -214,7 +213,7 @@ public class RemoteRandomAccessReaderTest {
     private byte[] writeReadFullyFile(String path) throws Exception {
         // 3 write blocks + partial tail ⇒ 200 bytes, spans >>= 2 buffer windows.
         byte[] data = seqBytes(READFULLY_WRITE_BLOCK * 3 + 8);
-        client.writeMultipartFile(path, new ByteArrayInputStream(data), READFULLY_WRITE_BLOCK);
+        client.writeFile(path, data);
         return data;
     }
 
@@ -322,8 +321,7 @@ public class RemoteRandomAccessReaderTest {
 
             byte[] data = seqBytes(BLOCK_SIZE * 3 + 7); // 199 bytes across 4 blocks
             // Write multipart file using the same block size
-            smallBlockClient.writeMultipartFile("ts1/uuid1/multipart/graph",
-                    new ByteArrayInputStream(data), BLOCK_SIZE);
+            smallBlockClient.writeFile("ts1/uuid1/multipart/graph", data);
 
             // ReadReplicaDataStorageManager: only the client is needed for multipart reads
             ReadReplicaDataStorageManager replica = new ReadReplicaDataStorageManager(
@@ -401,8 +399,7 @@ public class RemoteRandomAccessReaderTest {
             data[i] = (byte) i;
         }
 
-        client.writeMultipartFile("ts/idx/accessors", new ByteArrayInputStream(data),
-                READFULLY_WRITE_BLOCK);
+        client.writeFile("ts/idx/accessors", data);
         try (RemoteRandomAccessReader reader = openReadFullyReader("ts/idx/accessors", data.length)) {
             int[] actualInts = new int[expectedInts.length];
             reader.seek(0);
@@ -450,7 +447,7 @@ public class RemoteRandomAccessReaderTest {
     @Test
     public void testCloseIsIdempotent() throws Exception {
         byte[] data = seqBytes(BLOCK_SIZE);
-        client.writeMultipartFile("ts/idx/close", new ByteArrayInputStream(data), BLOCK_SIZE);
+        client.writeFile("ts/idx/close", data);
 
         RemoteRandomAccessReader reader = new RemoteRandomAccessReader(
                 client, "ts/idx/close", data.length, BLOCK_SIZE);

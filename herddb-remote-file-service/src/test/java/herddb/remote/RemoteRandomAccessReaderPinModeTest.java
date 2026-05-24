@@ -25,7 +25,6 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 import herddb.index.vector.PinModeReaderSupplier;
 import io.github.jbellis.jvector.disk.RandomAccessReader;
-import java.io.ByteArrayInputStream;
 import java.util.List;
 import org.apache.bookkeeper.stats.NullStatsLogger;
 import org.junit.After;
@@ -63,7 +62,7 @@ public class RemoteRandomAccessReaderPinModeTest {
         for (int i = 0; i < data.length; i++) {
             data[i] = (byte) (i & 0xFF);
         }
-        client.writeMultipartFile(PATH, new ByteArrayInputStream(data), BLOCK_SIZE);
+        client.writeFile(PATH, data);
     }
 
     @After

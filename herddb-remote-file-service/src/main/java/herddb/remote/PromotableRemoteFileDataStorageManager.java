@@ -358,6 +358,19 @@ public class PromotableRemoteFileDataStorageManager extends DataStorageManager {
     }
 
     @Override
+    public void prewarmMultipartIndexFile(String tableSpace, String uuid, String fileType,
+                                          long fileSize, int blockSize, int parallelism)
+            throws DataStorageManagerException {
+        activeDelegate.prewarmMultipartIndexFile(tableSpace, uuid, fileType, fileSize,
+                blockSize, parallelism);
+    }
+
+    @Override
+    public int getMultipartBlockSize() {
+        return activeDelegate.getMultipartBlockSize();
+    }
+
+    @Override
     public void deleteMultipartIndexFile(String tableSpace, String uuid, String fileType)
             throws DataStorageManagerException {
         activeDelegate.deleteMultipartIndexFile(tableSpace, uuid, fileType);

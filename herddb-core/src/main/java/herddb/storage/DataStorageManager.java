@@ -261,6 +261,57 @@ public abstract class DataStorageManager implements AutoCloseable {
             throws DataStorageManagerException;
 
     /**
+     * Issue #650 (review follow-up): cache-block granularity used by the
+     * read path of this storage manager. The IS-side prewarm MUST issue
+     * its {@code prefetchFileRange} RPCs aligned to this block size,
+     * otherwise the file-server's {@code CachingObjectStorage} caches
+     * blocks under one alignment while the reader requests them under
+     * another — the cache hit rate would silently drop to ~0%.
+     *
+     * <p>Default 4 MiB — matches the file-server's default
+     * {@code remote.file.client.block.size} and the IS-side reader's
+     * {@code MULTIPART_BLOCK_SIZE} fallback. Backends with a configurable
+     * block size (e.g. {@code RemoteFileDataStorageManager}) override to
+     * return the effective value.
+     */
+    public int getMultipartBlockSize() {
+        return 4 * 1024 * 1024;
+    }
+
+    /**
+     * Issue #650: pre-warms the storage layer's cache for the multipart file
+     * at {@code (tableSpace, uuid, fileType)} so subsequent
+     * {@link #multipartIndexReaderSupplier} reads hit a populated cache.
+     * Default implementation is a no-op: backends without an out-of-process
+     * cache (local-file storage, in-memory storage) gain nothing from
+     * prewarm. The remote-file backend overrides this to issue parallel
+     * {@code prefetchFileRange} RPCs against the file-server, populating
+     * each replica's local disk cache for the blocks it owns under the
+     * existing {@link herddb.remote.ConsistentHashRouter} sharding scheme.
+     *
+     * <p>{@code blockSize} is the cache-block granularity (typically
+     * {@code MULTIPART_BLOCK_SIZE = 4 MiB}). {@code parallelism} bounds the
+     * number of concurrent prefetch RPCs in flight per call; the method
+     * returns when every block has been admitted (or its RPC has failed
+     * best-effort). Per-block failures are logged at WARNING and do not
+     * abort the prewarm — mirrors the existing {@code warmUpSegment}
+     * semantics: a failed prewarm just means the first query reads will
+     * miss the cache and load on demand.
+     *
+     * @param tableSpace   storage tablespace
+     * @param uuid         segment storage key
+     * @param fileType     "graph", "map", etc.
+     * @param fileSize     total bytes in the multipart file (used to compute block count)
+     * @param blockSize    cache-block granularity in bytes (must be {@code > 0})
+     * @param parallelism  maximum number of concurrent prefetch RPCs (must be {@code > 0})
+     */
+    public void prewarmMultipartIndexFile(String tableSpace, String uuid, String fileType,
+                                          long fileSize, int blockSize, int parallelism)
+            throws DataStorageManagerException {
+        // Default: no-op. Backends with an out-of-process cache override.
+    }
+
+    /**
      * Deletes a multipart index file and all its blocks. Idempotent — must not
      * throw if the file does not exist.
      */

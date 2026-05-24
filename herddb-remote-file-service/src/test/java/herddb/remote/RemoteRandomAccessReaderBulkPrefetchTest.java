@@ -29,7 +29,6 @@ import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 import herddb.index.vector.BulkPrefetchReaderSupplier;
 import io.github.jbellis.jvector.disk.RandomAccessReader;
-import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.List;
@@ -87,7 +86,7 @@ public class RemoteRandomAccessReaderBulkPrefetchTest {
         for (int i = 0; i < TOTAL_SIZE; i++) {
             payload[i] = (byte) (i & 0xFF);
         }
-        client.writeMultipartFile(PATH, new ByteArrayInputStream(payload), WRITE_BLOCK_SIZE);
+        client.writeFile(PATH, payload);
     }
 
     @After

@@ -26,7 +26,6 @@ import io.netty.buffer.PooledByteBufAllocator;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
@@ -209,61 +208,47 @@ public class S3ObjectStorage implements ObjectStorage {
     }
 
     @Override
-    public CompletableFuture<Void> writeBlock(String path, long blockIndex, byte[] content) {
-        String blockKey = toKey(path + ObjectStorage.MULTIPART_SUFFIX + "/" + blockIndex);
-        PutObjectRequest request = PutObjectRequest.builder()
-                .bucket(bucket)
-                .key(blockKey)
-                .build();
-        return client.putObject(request, AsyncRequestBody.fromBytes(content))
-                .thenApply(resp -> (Void) null);
-    }
-
-    @Override
     public CompletableFuture<ReadResult> readRange(String path, long offset, int length, int blockSize) {
-        long blockIndex = offset / blockSize;
-        int offsetInBlock = (int) (offset % blockSize);
-        // Each block is a separate S3 object starting at byte 0.
-        // Download the whole block object and return the requested slice.
+        // Single-object layout (issue #650): one S3 object per logical file.
+        // We issue an HTTP Range GET on that single object: bytes={offset}-{end-1}.
+        // The {@code blockSize} parameter is the cache-block granularity used
+        // by upstream caching tiers (see {@link CachingObjectStorage}); at the
+        // S3 layer we honour {@code (offset, length)} verbatim.
         if (s3ReadRequests != null) {
             s3ReadRequests.inc();
         }
         final long startNanos = System.nanoTime();
-        return read(path + ObjectStorage.MULTIPART_SUFFIX + "/" + blockIndex)
-                .thenApply(result -> {
-                    try {
-                        if (result.status() == ReadResult.Status.NOT_FOUND) {
-                            if (s3ReadLatency != null) {
-                                s3ReadLatency.registerFailedEvent(System.nanoTime() - startNanos, TimeUnit.NANOSECONDS);
-                            }
-                            return ReadResult.notFound();
-                        }
-                        ByteBuf blockBuf = result.byteBuf();
-                        int blockLength = blockBuf.readableBytes();
-                        int from = offsetInBlock;
-                        int to = Math.min(from + length, blockLength);
-                        if (from >= blockLength) {
-                            if (s3ReadLatency != null) {
-                                s3ReadLatency.registerFailedEvent(System.nanoTime() - startNanos, TimeUnit.NANOSECONDS);
-                            }
-                            return ReadResult.notFound();
-                        }
-                        // Create pooled slice without copying
-                        ByteBuf sliceBuf = PooledByteBufAllocator.DEFAULT.directBuffer(to - from);
-                        sliceBuf.writeBytes(blockBuf, blockBuf.readerIndex() + from, to - from);
+        if (length <= 0) {
+            if (s3ReadLatency != null) {
+                s3ReadLatency.registerSuccessfulEvent(System.nanoTime() - startNanos, TimeUnit.NANOSECONDS);
+            }
+            return CompletableFuture.completedFuture(ReadResult.notFound());
+        }
+        long endInclusive = offset + (long) length - 1L;
+        String rangeHeader = "bytes=" + offset + "-" + endInclusive;
+        GetObjectRequest request = GetObjectRequest.builder()
+                .bucket(bucket)
+                .key(toKey(path))
+                .range(rangeHeader)
+                .build();
+        return client.getObject(request, AsyncResponseTransformer.toBytes())
+                .thenApply(response -> {
+                    byte[] data = response.asByteArray();
+                    if (data.length == 0) {
                         if (s3ReadLatency != null) {
-                            s3ReadLatency.registerSuccessfulEvent(System.nanoTime() - startNanos, TimeUnit.NANOSECONDS);
+                            s3ReadLatency.registerFailedEvent(System.nanoTime() - startNanos, TimeUnit.NANOSECONDS);
                         }
-                        if (s3ReadRequests != null) {
-                            s3ReadRequests.inc();
-                        }
-                        if (s3ReadBytes != null) {
-                            s3ReadBytes.inc();
-                        }
-                        return ReadResult.found(sliceBuf);
-                    } finally {
-                        result.release();
+                        return ReadResult.notFound();
                     }
+                    ByteBuf buf = PooledByteBufAllocator.DEFAULT.directBuffer(data.length);
+                    buf.writeBytes(data);
+                    if (s3ReadLatency != null) {
+                        s3ReadLatency.registerSuccessfulEvent(System.nanoTime() - startNanos, TimeUnit.NANOSECONDS);
+                    }
+                    if (s3ReadBytes != null) {
+                        s3ReadBytes.addCount(data.length);
+                    }
+                    return ReadResult.found(buf);
                 })
                 .exceptionally(t -> {
                     if (s3ReadLatency != null) {
@@ -273,39 +258,18 @@ public class S3ObjectStorage implements ObjectStorage {
                     if (cause instanceof NoSuchKeyException) {
                         return ReadResult.notFound();
                     }
+                    // S3 returns 416 (Requested Range Not Satisfiable) when {@code offset}
+                    // is at or beyond end-of-object. Surface as NOT_FOUND so callers can
+                    // treat past-EOF reads symmetrically with missing objects.
+                    if (cause instanceof software.amazon.awssdk.awscore.exception.AwsServiceException
+                            && ((software.amazon.awssdk.awscore.exception.AwsServiceException) cause).statusCode() == 416) {
+                        return ReadResult.notFound();
+                    }
                     if (cause instanceof RuntimeException) {
                         throw (RuntimeException) cause;
                     }
                     throw new RuntimeException(cause);
                 });
-    }
-
-    @Override
-    public CompletableFuture<Boolean> deleteLogical(String path) {
-        // Delete multipart blocks and the single-part file in parallel
-        String multipartPrefix = path + ObjectStorage.MULTIPART_SUFFIX + "/";
-        CompletableFuture<Integer> deletedBlocks = deleteByPrefix(multipartPrefix);
-        CompletableFuture<Boolean> deletedSingle = delete(path);
-        return deletedBlocks.thenCombine(deletedSingle, (blocks, single) -> blocks > 0 || single);
-    }
-
-    @Override
-    public CompletableFuture<List<String>> listLogical(String prefix) {
-        return list(prefix).thenApply(paths -> {
-            LinkedHashSet<String> logical = new LinkedHashSet<>();
-            for (String p : paths) {
-                int mpIdx = p.indexOf(ObjectStorage.MULTIPART_SUFFIX + "/");
-                if (mpIdx >= 0) {
-                    String logicalPath = p.substring(0, mpIdx);
-                    if (logicalPath.startsWith(prefix)) {
-                        logical.add(logicalPath);
-                    }
-                } else {
-                    logical.add(p);
-                }
-            }
-            return new ArrayList<>(logical);
-        });
     }
 
     @Override

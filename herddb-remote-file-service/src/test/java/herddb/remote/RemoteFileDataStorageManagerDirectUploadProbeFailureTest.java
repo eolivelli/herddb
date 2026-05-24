@@ -112,14 +112,14 @@ public class RemoteFileDataStorageManagerDirectUploadProbeFailureTest {
         return dsm;
     }
 
-    /**
-     * Issue #645 — primary regression: when the HEAD probe always fails
-     * (transient MinIO outage, network partition), the
-     * {@code downloadMultipartIndexFile} read path MUST throw rather
-     * than silently fall back to the gRPC per-block path. The latter
-     * is the broken behaviour that produced the
-     * "Block not found" crash-loop in Run 9.
-     */
+    // downloadThrowsWhenProbeAlwaysFails was removed in issue #650:
+    // downloadMultipartIndexFile no longer issues a HEAD probe before the
+    // download (the bulk-layout-probe gate was removed along with the .bulk
+    // suffix). Download failures now surface directly from
+    // downloadFileBulk; the HEAD failure mode is irrelevant to the read
+    // path and is covered for {@code multipartIndexFileExists} by
+    // {@link #existsCheckDoesNotThrowOnProbeFailure}.
+    @org.junit.Ignore("issue #650: download no longer issues a HEAD probe")
     @Test
     public void downloadThrowsWhenProbeAlwaysFails() throws Exception {
         // First, write the file via a healthy backing storage so the
@@ -185,6 +185,10 @@ public class RemoteFileDataStorageManagerDirectUploadProbeFailureTest {
      * {@code RemoteRandomAccessReader.fetchBlockFromRemote} →
      * "Block not found".
      */
+    // readerSupplierThrowsWhenProbeAlwaysFails: see comment on
+    // downloadThrowsWhenProbeAlwaysFails — the HEAD probe gate is gone in
+    // issue #650.
+    @org.junit.Ignore("issue #650: readerSupplier no longer issues a HEAD probe")
     @Test
     public void readerSupplierThrowsWhenProbeAlwaysFails() throws Exception {
         Path objectsDir = tmpFolder.newFolder("objects").toPath();
@@ -269,6 +273,7 @@ public class RemoteFileDataStorageManagerDirectUploadProbeFailureTest {
      * allow subsequent reads to succeed. This guards against an over-eager
      * cache or sticky-error state.
      */
+    @org.junit.Ignore("issue #650: download path no longer gates on HEAD probe")
     @Test
     public void readSucceedsAfterTransientHeadOutageClears() throws Exception {
         Path objectsDir = tmpFolder.newFolder("objects").toPath();
@@ -374,23 +379,8 @@ public class RemoteFileDataStorageManagerDirectUploadProbeFailureTest {
         }
 
         @Override
-        public CompletableFuture<Void> writeBlock(String path, long blockIndex, byte[] content) {
-            return delegate.writeBlock(path, blockIndex, content);
-        }
-
-        @Override
         public CompletableFuture<ReadResult> readRange(String path, long offset, int length, int blockSize) {
             return delegate.readRange(path, offset, length, blockSize);
-        }
-
-        @Override
-        public CompletableFuture<Boolean> deleteLogical(String path) {
-            return delegate.deleteLogical(path);
-        }
-
-        @Override
-        public CompletableFuture<List<String>> listLogical(String prefix) {
-            return delegate.listLogical(prefix);
         }
 
         @Override
@@ -475,23 +465,8 @@ public class RemoteFileDataStorageManagerDirectUploadProbeFailureTest {
         }
 
         @Override
-        public CompletableFuture<Void> writeBlock(String path, long blockIndex, byte[] content) {
-            return delegate.writeBlock(path, blockIndex, content);
-        }
-
-        @Override
         public CompletableFuture<ReadResult> readRange(String path, long offset, int length, int blockSize) {
             return delegate.readRange(path, offset, length, blockSize);
-        }
-
-        @Override
-        public CompletableFuture<Boolean> deleteLogical(String path) {
-            return delegate.deleteLogical(path);
-        }
-
-        @Override
-        public CompletableFuture<List<String>> listLogical(String prefix) {
-            return delegate.listLogical(prefix);
         }
 
         @Override

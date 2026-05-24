@@ -25,7 +25,6 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
-import java.io.ByteArrayInputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -158,20 +157,20 @@ public class RemoteFileServiceTest {
     }
 
     @Test
-    public void testWriteFileBlockAndReadFileRange() {
-        byte[] block0 = new byte[100];
-        byte[] block1 = new byte[60];
+    public void testWriteFileAndReadFileRange() {
+        // Single-object layout (issue #650): the whole file lives at one path,
+        // and readFileRange returns slices addressed by absolute byte offsets.
+        byte[] full = new byte[160];
         for (int i = 0; i < 100; i++) {
-            block0[i] = (byte) i;
+            full[i] = (byte) i;
         }
         for (int i = 0; i < 60; i++) {
-            block1[i] = (byte) (i + 100);
+            full[100 + i] = (byte) (i + 100);
         }
 
-        client.writeFileBlock("ts1/uuid1/multipart/graph", 0, block0);
-        client.writeFileBlock("ts1/uuid1/multipart/graph", 1, block1);
+        client.writeFile("ts1/uuid1/multipart/graph", full);
 
-        // Read a range within block 0 (offset=10, length=20, blockSize=100)
+        // Read a range within the first 100 bytes (offset=10, length=20, blockSize=100)
         byte[] got0 = client.readFileRange("ts1/uuid1/multipart/graph", 10, 20, 100);
         assertNotNull(got0);
         assertEquals(20, got0.length);
@@ -179,7 +178,7 @@ public class RemoteFileServiceTest {
             assertEquals((byte) (10 + i), got0[i]);
         }
 
-        // Read start of block 1 (offset=100, length=5, blockSize=100)
+        // Read at offset=100 (length=5, blockSize=100)
         byte[] got1 = client.readFileRange("ts1/uuid1/multipart/graph", 100, 5, 100);
         assertNotNull(got1);
         assertEquals(5, got1.length);
@@ -187,22 +186,20 @@ public class RemoteFileServiceTest {
             assertEquals((byte) (100 + i), got1[i]);
         }
 
-        // Missing block
+        // Past the end
         byte[] missing = client.readFileRange("ts1/uuid1/multipart/graph", 500, 10, 100);
         assertNull(missing);
     }
 
     @Test
-    public void testWriteMultipartFileAndRoundTrip() throws Exception {
+    public void testWriteFileAndRoundTrip() throws Exception {
         int blockSize = 64;
         byte[] data = new byte[blockSize * 2 + 30];
         for (int i = 0; i < data.length; i++) {
             data[i] = (byte) (i & 0xFF);
         }
 
-        long written = client.writeMultipartFile("ts1/uuid1/largefile",
-                new ByteArrayInputStream(data), blockSize);
-        assertEquals(data.length, written);
+        client.writeFile("ts1/uuid1/largefile", data);
 
         byte[] b0 = client.readFileRange("ts1/uuid1/largefile", 0, blockSize, blockSize);
         assertNotNull(b0);
@@ -230,8 +227,7 @@ public class RemoteFileServiceTest {
     public void testMultipartListAndDelete() throws Exception {
         int blockSize = 32;
         byte[] data = new byte[blockSize * 3];
-        client.writeMultipartFile("ts1/uuid2/graphfile",
-                new ByteArrayInputStream(data), blockSize);
+        client.writeFile("ts1/uuid2/graphfile", data);
         client.writeFileAsync("ts1/uuid2/plain.page", "x".getBytes()).get(5, TimeUnit.SECONDS);
 
         // listFiles should return logical paths (deduped)

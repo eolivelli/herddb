@@ -72,7 +72,14 @@ public class RemoteFileDataStorageManagerProbeAndPurgeTest {
 
     @Before
     public void setUp() throws Exception {
-        server = new RemoteFileServer(0, folder.newFolder("remote").toPath());
+        // Single-object layout (issue #650): writeMultipartIndexFile always
+        // dispatches through directObjectStorage.uploadFile, so wire a local
+        // backend that points at THE SAME directory the file-server reads
+        // from. In production both ends point at the same S3 bucket; here
+        // we share a local directory so reads-via-gRPC and writes-via-direct
+        // observe the same objects.
+        Path sharedDir = folder.newFolder("remote").toPath();
+        server = new RemoteFileServer(0, sharedDir);
         server.start();
         client = new RemoteFileServiceClient(Arrays.asList("localhost:" + server.getPort()));
         storage = new RemoteFileDataStorageManager(
@@ -81,6 +88,12 @@ public class RemoteFileDataStorageManagerProbeAndPurgeTest {
                 1000,
                 client);
         storage.start();
+        herddb.remote.storage.LocalObjectStorage backing =
+                new herddb.remote.storage.LocalObjectStorage(
+                        sharedDir,
+                        java.util.concurrent.Executors.newCachedThreadPool());
+        storage.setDirectObjectStorage(backing);
+        storage.enableDirectUpload(16L * 1024 * 1024);
     }
 
     @After
@@ -248,17 +261,23 @@ public class RemoteFileDataStorageManagerProbeAndPurgeTest {
      */
     @Test(timeout = 30_000)
     public void probeReturnsTrueOnPartialBlockZeroAtLeast4Bytes() throws Exception {
-        // Write just block-0 directly via the lower-level writeFileBlock RPC
-        // — that bypasses the multipart writer's "all blocks or none"
-        // semantics and reproduces the Phase B "upload failed after
-        // block-0" failure mode the issue #617 operator path covers.
-        // Must match remoteMultipartPath: tableSpace/uuid/multipart/fileType.
+        // Single-object layout (issue #650): write the partial payload as the
+        // ONE object at logicalPath via the directObjectStorage (the same
+        // backend multipartIndexFileExists probes). This reproduces the Phase
+        // B "upload truncated" failure mode without the now-removed per-block
+        // write RPC.
         String logicalPath = "ts1/uuid-partial/multipart/graph";
-        byte[] partial = new byte[16]; // > 4 bytes; the probe reads 4 bytes
+        byte[] partial = new byte[16]; // > 4 bytes; the probe checks existence
         for (int i = 0; i < partial.length; i++) {
             partial[i] = (byte) i;
         }
-        client.writeFileBlock(logicalPath, 0L, partial);
+        // Reach the same direct storage backend the DSM probes via setDirectObjectStorage.
+        java.lang.reflect.Field f = RemoteFileDataStorageManager.class
+                .getDeclaredField("directObjectStorage");
+        f.setAccessible(true);
+        herddb.remote.storage.ObjectStorage direct =
+                (herddb.remote.storage.ObjectStorage) f.get(storage);
+        direct.write(logicalPath, partial).get();
 
         // Sanity: the multipart writer would have written multiple blocks
         // for a real graph file. Here only block-0 is present — yet the
