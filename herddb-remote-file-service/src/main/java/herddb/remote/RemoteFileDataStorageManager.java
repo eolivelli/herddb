@@ -1030,25 +1030,36 @@ public class RemoteFileDataStorageManager extends DataStorageManager
 
     /**
      * Single-object layout (issue #650): writes the temp file as a single
-     * S3 object at the logical multipart path. Requires
-     * {@link #setDirectObjectStorage} to have been wired and
-     * {@link #enableDirectUpload} to have been called — direct-S3 is now
-     * the only multipart write path. CRT's {@code S3TransferManager}
-     * pipelines parallel S3 Multipart Upload parts on the same HTTP/2
-     * connection; on failure the CRT client internally aborts the upload
-     * so no orphan parts are left in the bucket.
+     * S3 (or file-server-backed) object at the logical multipart path. Two
+     * dispatch paths:
+     * <ol>
+     *   <li><b>Direct-S3 fast path</b> — when
+     *       {@link #setDirectObjectStorage} has been wired AND
+     *       {@link #enableDirectUpload} called, CRT's
+     *       {@code S3TransferManager.uploadFile(...)} pipelines parallel
+     *       S3 Multipart Upload parts on the same HTTP/2 connection. This
+     *       is the production path; on failure CRT internally aborts the
+     *       multipart upload so no orphan parts are left in the bucket.</li>
+     *   <li><b>Single-PDU gRPC fallback</b> — when direct-S3 is not
+     *       configured, the file content is uploaded in one
+     *       {@code RemoteFileServiceClient.writeFile} PDU. The file-server
+     *       writes it as a single object via
+     *       {@link ObjectStorage#write(String, byte[])}. Bounded by the
+     *       Netty frame size (so segments larger than the configured
+     *       Netty maxMessageSize must use direct-S3); the fallback exists
+     *       so dev/test deployments with a local file server can write
+     *       multipart files without a direct-S3 wiring, mirroring the
+     *       single-PDU path already used by {@code writeIndexPage}.</li>
+     * </ol>
      */
     @Override
     public String writeMultipartIndexFile(String tableSpace, String uuid, String fileType,
                                           Path tempFile, LongConsumer progress)
             throws IOException, DataStorageManagerException {
-        if (!supportsDirectMultipartUpload()) {
-            throw new UnsupportedOperationException(
-                    "Direct S3 not configured on this RemoteFileDataStorageManager — "
-                            + "multipart writes require directObjectStorage + enableDirectUpload "
-                            + "(issue #650 dropped the gRPC per-block write path).");
-        }
         String logicalPath = remoteMultipartPath(tableSpace, uuid, fileType);
+        if (!supportsDirectMultipartUpload()) {
+            return writeMultipartIndexFileViaGrpc(logicalPath, tempFile, progress);
+        }
         final ObjectStorage storage = this.directObjectStorage;
         final long fileSize = Files.size(tempFile);
         // Reserve permits before launching the upload. A zero-byte file
@@ -1081,6 +1092,39 @@ public class RemoteFileDataStorageManager extends DataStorageManager
             }
             throw new IOException("multipart upload failed for " + logicalPath, cause);
         }
+    }
+
+    /**
+     * Single-PDU gRPC fallback for {@link #writeMultipartIndexFile} —
+     * reads the temp file in full, sends it as one
+     * {@code RemoteFileServiceClient.writeFile} PDU, the file-server
+     * stores it via {@link ObjectStorage#write(String, byte[])}. Mirrors
+     * the wire pattern already used by {@code writeIndexPage} for index
+     * pages. Bounded by the Netty frame size; production multipart files
+     * must use the direct-S3 path instead.
+     */
+    private String writeMultipartIndexFileViaGrpc(String logicalPath, Path tempFile,
+                                                  LongConsumer progress) throws IOException {
+        long fileSize = Files.size(tempFile);
+        // Defensive: a 4 GiB ByteBuf would not even fit in Netty's int-sized
+        // length prefix; fail fast with an actionable message.
+        if (fileSize > Integer.MAX_VALUE) {
+            throw new IOException(
+                    "multipart file too large for gRPC fallback (" + fileSize
+                            + " bytes); configure indexing.s3.direct.enabled=true"
+                            + " to use the direct-S3 upload path");
+        }
+        long startNanos = System.nanoTime();
+        byte[] content = Files.readAllBytes(tempFile);
+        client.writeFile(logicalPath, content);
+        if (progress != null && content.length > 0) {
+            progress.accept(content.length);
+        }
+        LOGGER.log(Level.INFO,
+                "writeMultipartIndexFile(grpc): {0} uploaded {1} bytes in {2} ms",
+                new Object[]{logicalPath, content.length,
+                        TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos)});
+        return logicalPath;
     }
 
     /**
