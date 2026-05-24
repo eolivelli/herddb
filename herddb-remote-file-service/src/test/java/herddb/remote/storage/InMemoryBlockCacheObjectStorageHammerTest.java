@@ -173,23 +173,22 @@ public class InMemoryBlockCacheObjectStorageHammerTest {
                                 int pathIdx = rnd.nextInt(PATHS);
                                 int mode = tick++ & 0x3;
                                 switch (mode) {
-                                    case 0: {
-                                        int b = rnd.nextInt(DISTINCT_BLOCKS);
-                                        cache.writeBlock(path(pathIdx), b,
-                                                makeTaggedBlock(path(pathIdx), b)).get();
-                                        break;
-                                    }
+                                    case 0:
                                     case 1: {
                                         // Full-path write invalidates every
                                         // cached block for this path.
                                         cache.write(path(pathIdx),
                                                 makeTaggedBlock(path(pathIdx), 0)).get();
+                                        // Re-seed so readers can still find
+                                        // something afterwards.
+                                        for (int b = 0; b < DISTINCT_BLOCKS; b++) {
+                                            inner.putBlock(path(pathIdx), b,
+                                                    makeTaggedBlock(path(pathIdx), b));
+                                        }
                                         break;
                                     }
                                     case 2: {
-                                        cache.deleteLogical(path(pathIdx)).get();
-                                        // Re-seed so readers can still find
-                                        // something afterwards.
+                                        cache.delete(path(pathIdx)).get();
                                         for (int b = 0; b < DISTINCT_BLOCKS; b++) {
                                             inner.putBlock(path(pathIdx), b,
                                                     makeTaggedBlock(path(pathIdx), b));
@@ -361,6 +360,13 @@ public class InMemoryBlockCacheObjectStorageHammerTest {
      * zero leaks after {@code cache.close()}.
      */
     static class TrackingFake implements ObjectStorage {
+        // Single-object layout: store one byte[] per (path, blockIndex) pair under
+        // a synthetic key, then assemble slices in readRange. This preserves the
+        // putBlock(path, idx, bytes) seeding semantics the hammer uses while
+        // mapping each block to a per-block storage object (one per blockIndex).
+        // Production single-object layout has ONE object per path; here we keep
+        // distinct objects per (path, blockIndex) so the hammer can seed dense
+        // sparse block grids cheaply.
         final Map<String, byte[]> blocks = new ConcurrentHashMap<>();
         final AtomicInteger readRangeCalls = new AtomicInteger();
         final ConcurrentLinkedQueue<ByteBuf> allocations = new ConcurrentLinkedQueue<>();
@@ -370,13 +376,13 @@ public class InMemoryBlockCacheObjectStorageHammerTest {
         }
 
         private static String key(String path, long blockIndex) {
-            return path + ObjectStorage.MULTIPART_SUFFIX + "/" + blockIndex;
+            return path + "@@" + blockIndex;
         }
 
         @Override
         public CompletableFuture<Void> write(String path, byte[] content) {
-            // Mimic a logical "clear multipart" by dropping every block of this path.
-            String prefix = path + ObjectStorage.MULTIPART_SUFFIX + "/";
+            // Mimic a logical "clear" by dropping every block of this path.
+            String prefix = path + "@@";
             List<String> toDrop = new ArrayList<>();
             for (String k : blocks.keySet()) {
                 if (k.startsWith(prefix)) {
@@ -390,12 +396,6 @@ public class InMemoryBlockCacheObjectStorageHammerTest {
         @Override
         public CompletableFuture<ReadResult> read(String path) {
             return CompletableFuture.completedFuture(ReadResult.notFound());
-        }
-
-        @Override
-        public CompletableFuture<Void> writeBlock(String path, long blockIndex, byte[] content) {
-            blocks.put(key(path, blockIndex), content);
-            return CompletableFuture.completedFuture(null);
         }
 
         @Override
@@ -420,26 +420,17 @@ public class InMemoryBlockCacheObjectStorageHammerTest {
         }
 
         @Override
-        public CompletableFuture<Boolean> deleteLogical(String path) {
-            String prefix = path + ObjectStorage.MULTIPART_SUFFIX + "/";
+        public CompletableFuture<Boolean> delete(String path) {
+            // Drop all blocks of this path.
+            String prefix = path + "@@";
             List<String> toDrop = new ArrayList<>();
             for (String k : blocks.keySet()) {
-                if (k.startsWith(prefix)) {
+                if (k.startsWith(prefix) || k.equals(path)) {
                     toDrop.add(k);
                 }
             }
             toDrop.forEach(blocks::remove);
             return CompletableFuture.completedFuture(!toDrop.isEmpty());
-        }
-
-        @Override
-        public CompletableFuture<List<String>> listLogical(String prefix) {
-            return CompletableFuture.completedFuture(new ArrayList<>());
-        }
-
-        @Override
-        public CompletableFuture<Boolean> delete(String path) {
-            return CompletableFuture.completedFuture(blocks.remove(path) != null);
         }
 
         @Override
@@ -451,8 +442,8 @@ public class InMemoryBlockCacheObjectStorageHammerTest {
         public CompletableFuture<Integer> deleteByPrefix(String prefix) {
             List<String> toDrop = new ArrayList<>();
             for (String k : blocks.keySet()) {
-                int mp = k.indexOf(ObjectStorage.MULTIPART_SUFFIX + "/");
-                String logical = mp >= 0 ? k.substring(0, mp) : k;
+                int sep = k.indexOf("@@");
+                String logical = sep >= 0 ? k.substring(0, sep) : k;
                 if (logical.startsWith(prefix)) {
                     toDrop.add(k);
                 }
@@ -460,8 +451,8 @@ public class InMemoryBlockCacheObjectStorageHammerTest {
             toDrop.forEach(blocks::remove);
             int distinct = (int) toDrop.stream()
                     .map(k -> {
-                        int mp = k.indexOf(ObjectStorage.MULTIPART_SUFFIX + "/");
-                        return mp >= 0 ? k.substring(0, mp) : k;
+                        int sep = k.indexOf("@@");
+                        return sep >= 0 ? k.substring(0, sep) : k;
                     }).distinct().count();
             return CompletableFuture.completedFuture(distinct);
         }

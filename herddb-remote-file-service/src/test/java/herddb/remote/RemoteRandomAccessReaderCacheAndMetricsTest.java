@@ -25,7 +25,6 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 import herddb.utils.VectorSearchRequestContext;
 import io.github.jbellis.jvector.disk.ReaderSupplier;
-import java.io.ByteArrayInputStream;
 import java.util.List;
 import org.apache.bookkeeper.test.TestStatsProvider;
 import org.junit.After;
@@ -88,7 +87,7 @@ public class RemoteRandomAccessReaderCacheAndMetricsTest {
     @Test
     public void clientReadCountersReflectActualRpcCallsAndBytes() throws Exception {
         byte[] data = seqBytes(BLOCK_SIZE * 3);
-        client.writeMultipartFile("ts/idx/one", new ByteArrayInputStream(data), BLOCK_SIZE);
+        client.writeFile("ts/idx/one", data);
 
         try (RemoteRandomAccessReader reader = new RemoteRandomAccessReader(
                 client, "ts/idx/one", data.length, BLOCK_SIZE, BLOCK_SIZE,
@@ -108,7 +107,7 @@ public class RemoteRandomAccessReaderCacheAndMetricsTest {
     @Test
     public void perRequestContextIsPopulatedByReadsInsideBeginEnd() throws Exception {
         byte[] data = seqBytes(BLOCK_SIZE * 2);
-        client.writeMultipartFile("ts/idx/ctx", new ByteArrayInputStream(data), BLOCK_SIZE);
+        client.writeFile("ts/idx/ctx", data);
 
         VectorSearchRequestContext ctx;
         try (RemoteRandomAccessReader reader = new RemoteRandomAccessReader(
@@ -130,7 +129,7 @@ public class RemoteRandomAccessReaderCacheAndMetricsTest {
     @Test
     public void perRequestContextIsNotTouchedOutsideBeginEnd() throws Exception {
         byte[] data = seqBytes(BLOCK_SIZE);
-        client.writeMultipartFile("ts/idx/no-ctx", new ByteArrayInputStream(data), BLOCK_SIZE);
+        client.writeFile("ts/idx/no-ctx", data);
 
         try (RemoteRandomAccessReader reader = new RemoteRandomAccessReader(
                 client, "ts/idx/no-ctx", data.length, BLOCK_SIZE, BLOCK_SIZE,
@@ -144,7 +143,7 @@ public class RemoteRandomAccessReaderCacheAndMetricsTest {
     @Test
     public void secondReaderShareCacheAndSeesHits() throws Exception {
         byte[] data = seqBytes(BLOCK_SIZE * 3);
-        client.writeMultipartFile("ts/idx/shared", new ByteArrayInputStream(data), BLOCK_SIZE);
+        client.writeFile("ts/idx/shared", data);
 
         SegmentBlockCache cache = new SegmentBlockCache(1_000_000);
 
@@ -183,7 +182,7 @@ public class RemoteRandomAccessReaderCacheAndMetricsTest {
     @Test
     public void cacheInvalidatePathForcesReloadFromRemote() throws Exception {
         byte[] data = seqBytes(BLOCK_SIZE * 2);
-        client.writeMultipartFile("ts/idx/inv", new ByteArrayInputStream(data), BLOCK_SIZE);
+        client.writeFile("ts/idx/inv", data);
 
         SegmentBlockCache cache = new SegmentBlockCache(1_000_000);
         ReaderSupplier supplier = new RemoteRandomAccessReader.Supplier(

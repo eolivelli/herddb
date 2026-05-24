@@ -119,16 +119,10 @@ public class RemoteFileDataStorageManagerDirectDownloadTest {
      */
     private String writeBlocksToStorage(String tableSpace, String uuid, String fileType,
                                         byte[] data) throws Exception {
-        // Must match RemoteFileDataStorageManager.remoteMultipartPath(tableSpace, uuid, fileType)
+        // Must match RemoteFileDataStorageManager.remoteMultipartPath(tableSpace, uuid, fileType).
+        // Single-object layout (issue #650): the whole file lives at logicalPath.
         String logicalPath = tableSpace + "/" + uuid + "/multipart/" + fileType;
-        int numBlocks = (int) Math.ceil((double) data.length / BLOCK_SIZE);
-        for (int i = 0; i < numBlocks; i++) {
-            int start = i * BLOCK_SIZE;
-            int end = Math.min(start + BLOCK_SIZE, data.length);
-            byte[] block = new byte[end - start];
-            System.arraycopy(data, start, block, 0, block.length);
-            objectStorage.writeBlock(logicalPath, i, block).get();
-        }
+        objectStorage.write(logicalPath, data).get();
         return logicalPath;
     }
 

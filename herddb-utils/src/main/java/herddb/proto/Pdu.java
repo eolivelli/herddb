@@ -62,14 +62,19 @@ public class Pdu implements AutoCloseable {
     // and disambiguate via FLAGS_ISREQUEST / FLAGS_ISRESPONSE.
     // ---------------------------------------------------------------------
     public static final byte TYPE_FS_WRITE_FILE = 50;
-    public static final byte TYPE_FS_WRITE_FILE_BLOCK = 51;
+    // Op-code 51 (TYPE_FS_WRITE_FILE_BLOCK) was retired in issue #650 along
+    // with the per-block multipart layout; the slot is intentionally left
+    // unused. Servers receiving a 51 op-code today will respond with the
+    // generic "unknown op-code" path in RemoteFileServiceImpl#handle.
     public static final byte TYPE_FS_READ_FILE = 52;
     public static final byte TYPE_FS_READ_FILE_RANGE = 53;
     public static final byte TYPE_FS_DELETE_FILE = 54;
     public static final byte TYPE_FS_DELETE_FILES = 55;
     public static final byte TYPE_FS_LIST_FILES = 56;
     public static final byte TYPE_FS_DELETE_BY_PREFIX = 57;
-    // 58, 59 reserved for future file-server data ops.
+    /** Issue #650: prefetch a (path, offset, length, blockSize) slice into the file-server cache. */
+    public static final byte TYPE_FS_PREFETCH_FILE_RANGE = 58;
+    // 59 reserved for future file-server data ops.
     public static final byte TYPE_FS_GET_SERVER_INFO = 60;
     public static final byte TYPE_FS_RESIZE_DISK_CACHE = 61;
     // 62..69 reserved for future file-server admin ops.

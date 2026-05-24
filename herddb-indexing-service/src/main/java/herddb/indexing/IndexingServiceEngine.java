@@ -429,6 +429,9 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
      * A value of {@code 0} disables warmup.
      */
     private long warmupBytesPerSegment;
+    /** Issue #650: file-server cache prewarm configuration. */
+    private boolean prewarmFileServer;
+    private int prewarmParallelism;
 
     /**
      * Whether the post-Phase-C warmup runs on a dedicated executor
@@ -1002,6 +1005,11 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                 // start(); the factory lambda runs later (tailer-driven), so the
                 // field is always populated by the time this executes.
                 store.setWarmupBytesPerSegment(this.warmupBytesPerSegment);
+                // Issue #650: wire the file-server cache prewarm settings so
+                // every new segment is prewarmed end-to-end (file-server disk
+                // cache + IS-side BlockCache) before it becomes searchable.
+                store.setPrewarmFileServer(this.prewarmFileServer);
+                store.setPrewarmFileServerParallelism(this.prewarmParallelism);
                 // Issue #578: set the frontier-pin BFS budget:
                 //   -1  = mirror warmupBytesPerSegment (the default sentinel in
                 //         PersistentVectorStore); used when the frontier region is
@@ -1243,6 +1251,28 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                 new Object[]{warmupBytesPerSegment,
                         warmupBytesPerSegment > 0 ? "enabled" : "disabled",
                         warmupAsync ? "async" : "sync"});
+
+        // Issue #650: file-server cache prewarm — pre-populates the file
+        // server's local disk cache for every block of every new segment
+        // before it becomes searchable, so the first query reads hit a warm
+        // cache.
+        this.prewarmFileServer = config.getBoolean(
+                IndexingServerConfiguration.PROPERTY_VECTOR_SEGMENT_PREWARM_FILE_SERVER,
+                IndexingServerConfiguration.PROPERTY_VECTOR_SEGMENT_PREWARM_FILE_SERVER_DEFAULT);
+        this.prewarmParallelism = config.getInt(
+                IndexingServerConfiguration.PROPERTY_VECTOR_SEGMENT_PREWARM_PARALLELISM,
+                IndexingServerConfiguration.PROPERTY_VECTOR_SEGMENT_PREWARM_PARALLELISM_DEFAULT);
+        if (prewarmParallelism <= 0) {
+            LOGGER.log(Level.WARNING,
+                    "vector index prewarmParallelism must be > 0 (got {0}); falling back to default {1}",
+                    new Object[]{prewarmParallelism,
+                            IndexingServerConfiguration.PROPERTY_VECTOR_SEGMENT_PREWARM_PARALLELISM_DEFAULT});
+            this.prewarmParallelism =
+                    IndexingServerConfiguration.PROPERTY_VECTOR_SEGMENT_PREWARM_PARALLELISM_DEFAULT;
+        }
+        LOGGER.log(Level.INFO,
+                "vector index prewarmFileServer: {0} (parallelism={1})",
+                new Object[]{prewarmFileServer ? "enabled" : "disabled", prewarmParallelism});
 
         // Initialize components (watermark store is loaded later, after the
         // tablespace UUID is resolved, because a remote-backed watermark store

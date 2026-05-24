@@ -151,7 +151,9 @@ public class CachingObjectStorageSlabTest {
         for (int i = 0; i < block.length; i++) {
             block[i] = (byte) (i & 0xFF);
         }
-        caching.writeBlock("big.page", 0, block).get();
+        // Single-object layout: store block in inner and admit via readRange.
+        inner.data.put("big.page", block);
+        caching.readRange("big.page", 0, 1, 4096).get().release();
 
         // The block fits in the large tier (5000 < 64K) but not in the small tier (5000 > 4K).
         // It MUST go into the large tier — verify by reading a slice and checking the bytes.

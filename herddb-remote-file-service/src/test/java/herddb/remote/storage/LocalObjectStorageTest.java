@@ -120,20 +120,20 @@ public class LocalObjectStorageTest {
     }
 
     @Test
-    public void testWriteBlockReadRange() throws Exception {
-        byte[] block0 = new byte[100];
-        byte[] block1 = new byte[80];
+    public void testWriteReadRange() throws Exception {
+        // Single-object layout: write the whole file in one shot, then readRange
+        // returns slices of that one object.
+        byte[] full = new byte[180];
         for (int i = 0; i < 100; i++) {
-            block0[i] = (byte) i;
+            full[i] = (byte) i;
         }
         for (int i = 0; i < 80; i++) {
-            block1[i] = (byte) (i + 100);
+            full[100 + i] = (byte) (i + 100);
         }
 
-        storage.writeBlock("ts1/uuid1/graph", 0, block0).get();
-        storage.writeBlock("ts1/uuid1/graph", 1, block1).get();
+        storage.write("ts1/uuid1/graph", full).get();
 
-        // Read a range within block 0
+        // Read a range within the first 100 bytes
         ReadResult r0 = storage.readRange("ts1/uuid1/graph", 10, 20, 100).get();
         try {
             assertEquals(ReadResult.Status.FOUND, r0.status());
@@ -146,7 +146,7 @@ public class LocalObjectStorageTest {
             r0.release();
         }
 
-        // Read first 5 bytes of block 1
+        // Read first 5 bytes of the second half (offset 100)
         ReadResult r1 = storage.readRange("ts1/uuid1/graph", 100, 5, 100).get();
         try {
             assertEquals(ReadResult.Status.FOUND, r1.status());
@@ -159,7 +159,7 @@ public class LocalObjectStorageTest {
             r1.release();
         }
 
-        // Read missing block
+        // Read past the end
         ReadResult missing = storage.readRange("ts1/uuid1/graph", 200, 10, 100).get();
         try {
             assertEquals(ReadResult.Status.NOT_FOUND, missing.status());
@@ -169,13 +169,12 @@ public class LocalObjectStorageTest {
     }
 
     @Test
-    public void testDeleteLogical() throws Exception {
+    public void testDeleteSingleObject() throws Exception {
         storage.write("ts1/uuid1/plain.page", "plain".getBytes()).get();
-        storage.writeBlock("ts1/uuid1/multi", 0, "block0".getBytes()).get();
-        storage.writeBlock("ts1/uuid1/multi", 1, "block1".getBytes()).get();
+        storage.write("ts1/uuid1/multi", "data".getBytes()).get();
 
-        assertTrue(storage.deleteLogical("ts1/uuid1/multi").get());
-        assertFalse(storage.deleteLogical("ts1/uuid1/multi").get()); // already gone
+        assertTrue(storage.delete("ts1/uuid1/multi").get());
+        assertFalse(storage.delete("ts1/uuid1/multi").get()); // already gone
 
         // plain file unaffected
         ReadResult r = storage.read("ts1/uuid1/plain.page").get();
@@ -187,13 +186,11 @@ public class LocalObjectStorageTest {
     }
 
     @Test
-    public void testListLogical() throws Exception {
+    public void testListSingleObjects() throws Exception {
         storage.write("ts1/uuid1/a.page", "a".getBytes()).get();
-        storage.writeBlock("ts1/uuid1/bigfile", 0, "b0".getBytes()).get();
-        storage.writeBlock("ts1/uuid1/bigfile", 1, "b1".getBytes()).get();
-        storage.writeBlock("ts1/uuid1/bigfile", 2, "b2".getBytes()).get();
+        storage.write("ts1/uuid1/bigfile", "abc".getBytes()).get();
 
-        List<String> logical = storage.listLogical("ts1/").get();
+        List<String> logical = storage.list("ts1/").get();
         assertEquals(2, logical.size());
         assertTrue(logical.contains("ts1/uuid1/a.page"));
         assertTrue(logical.contains("ts1/uuid1/bigfile"));
@@ -268,7 +265,7 @@ public class LocalObjectStorageTest {
         for (int i = 0; i < 100; i++) {
             data[i] = (byte) i;
         }
-        storage.writeBlock("ts1/uuid1/graph", 0, data).get();
+        storage.write("ts1/uuid1/graph", data).get();
 
         // Request beyond file size
         ReadResult result = storage.readRange("ts1/uuid1/graph", 150, 10, 100).get();
@@ -280,11 +277,11 @@ public class LocalObjectStorageTest {
     }
 
     @Test
-    public void testReadRangeMissingBlock() throws Exception {
+    public void testReadRangePastEnd() throws Exception {
         byte[] data = new byte[100];
-        storage.writeBlock("ts1/uuid1/graph", 0, data).get();
+        storage.write("ts1/uuid1/graph", data).get();
 
-        // Try to read from a block that doesn't exist
+        // Request past end of the single object
         ReadResult result = storage.readRange("ts1/uuid1/graph", 200, 10, 100).get();
         try {
             assertEquals(ReadResult.Status.NOT_FOUND, result.status());

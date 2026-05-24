@@ -113,51 +113,27 @@ public class CachingObjectStorageTest {
         }
 
         @Override
-        public CompletableFuture<Void> writeBlock(String path, long blockIndex, byte[] content) {
-            data.put(path + ObjectStorage.MULTIPART_SUFFIX + "/" + blockIndex, content);
-            return CompletableFuture.completedFuture(null);
-        }
-
-        @Override
         public CompletableFuture<ReadResult> readRange(String path, long offset, int length, int blockSize) {
-            long blockIndex = offset / blockSize;
-            int offsetInBlock = (int) (offset % blockSize);
-            byte[] block = data.get(path + ObjectStorage.MULTIPART_SUFFIX + "/" + blockIndex);
-            if (block == null) {
+            // Single-object layout: (offset, length) addresses the one object at path.
+            // The contract guarantees the slice stays within a single blockSize-aligned window,
+            // but we don't depend on that here — we simply slice the stored bytes.
+            // readCalls is incremented on EVERY inner fetch (read() or readRange()) so the
+            // cache-hit-vs-miss assertions in the tests work uniformly regardless of which
+            // entry-point the cache uses to fault a block in.
+            readCalls.incrementAndGet();
+            byte[] full = data.get(path);
+            if (full == null) {
                 return CompletableFuture.completedFuture(ReadResult.notFound());
             }
-            int end = Math.min(offsetInBlock + length, block.length);
-            byte[] sliceBytes = Arrays.copyOfRange(block, offsetInBlock, end);
+            if (offset >= full.length) {
+                return CompletableFuture.completedFuture(ReadResult.notFound());
+            }
+            int start = (int) offset;
+            int end = Math.min(start + length, full.length);
+            byte[] sliceBytes = Arrays.copyOfRange(full, start, end);
             io.netty.buffer.ByteBuf buf = io.netty.buffer.PooledByteBufAllocator.DEFAULT.directBuffer(sliceBytes.length);
             buf.writeBytes(sliceBytes);
             return CompletableFuture.completedFuture(ReadResult.found(buf));
-        }
-
-        @Override
-        public CompletableFuture<Boolean> deleteLogical(String path) {
-            String multipartPrefix = path + ObjectStorage.MULTIPART_SUFFIX + "/";
-            boolean removed = data.remove(path) != null;
-            List<String> blocks = new ArrayList<>();
-            for (String key : data.keySet()) {
-                if (key.startsWith(multipartPrefix)) {
-                    blocks.add(key);
-                }
-            }
-            blocks.forEach(data::remove);
-            return CompletableFuture.completedFuture(removed || !blocks.isEmpty());
-        }
-
-        @Override
-        public CompletableFuture<List<String>> listLogical(String prefix) {
-            java.util.LinkedHashSet<String> logical = new java.util.LinkedHashSet<>();
-            for (String key : data.keySet()) {
-                if (!key.startsWith(prefix)) {
-                    continue;
-                }
-                int mp = key.indexOf(ObjectStorage.MULTIPART_SUFFIX + "/");
-                logical.add(mp >= 0 ? key.substring(0, mp) : key);
-            }
-            return CompletableFuture.completedFuture(new ArrayList<>(logical));
         }
 
         @Override
@@ -350,12 +326,13 @@ public class CachingObjectStorageTest {
         FakeObjectStorage inner = new FakeObjectStorage();
         CachingObjectStorage caching = build(inner, 10 * 1024 * 1024);
 
-        // Prime the cache with a block of known content.
+        // Prime the cache with a block of known content via the inner storage + initial readRange.
         byte[] block = new byte[4096];
         for (int i = 0; i < block.length; i++) {
             block[i] = (byte) (i & 0xFF);
         }
-        caching.writeBlock("big.page", 0, block).get();
+        inner.data.put("big.page", block);
+        caching.readRange("big.page", 0, 1, 4096).get().release(); // admit block 0 into cache
 
         int readsBefore = inner.readCalls.get();
         ReadResult result = caching.readRange("big.page", 1000, 16, 4096).get();
@@ -544,14 +521,13 @@ public class CachingObjectStorageTest {
         for (int i = 0; i < block.length; i++) {
             block[i] = (byte) (i & 0xFF);
         }
-        caching.writeBlock("big.page", 0, block).get();
+        // Prime cache via initial readRange.
+        inner.data.put("big.page", block);
+        caching.readRange("big.page", 0, 1, 4096).get().release();
 
-        // Manually delete the cache file
-        Path file = caching.cacheFilePath("big.page.multipart/0");
+        // Manually delete the cache file (block 0 lives under blockCacheKey "big.page#0")
+        Path file = caching.cacheFilePath("big.page#0");
         Files.deleteIfExists(file);
-
-        // Inner should have the block
-        inner.data.put("big.page.multipart/0", block);
 
         // readRange should recover and fall through to inner
         ReadResult result = caching.readRange("big.page", 1000, 16, 4096).get();
@@ -578,12 +554,17 @@ public class CachingObjectStorageTest {
             block1[i] = (byte) (i & 0xFF);
         }
 
-        caching.writeBlock("multi.page", 0, block0).get();
-        caching.writeBlock("multi.page", 1, block1).get();
+        // Single-object layout: store a concatenated file in inner and admit blocks via readRange.
+        byte[] full = new byte[block0.length + block1.length];
+        System.arraycopy(block0, 0, full, 0, block0.length);
+        System.arraycopy(block1, 0, full, block0.length, block1.length);
+        inner.data.put("multi.page", full);
+        caching.readRange("multi.page", 0, 1, 1024).get().release(); // admit block 0
+        caching.readRange("multi.page", 1024, 1, 1024).get().release(); // admit block 1
 
-        // Verify both blocks are resident in the cache (in some tier).
-        assertTrue("block 0 should be cached", caching.isInCache("multi.page.multipart/0"));
-        assertTrue("block 1 should be cached", caching.isInCache("multi.page.multipart/1"));
+        // Verify both blocks are resident in the cache (block keys use the "#N" format).
+        assertTrue("block 0 should be cached", caching.isInCache("multi.page#0"));
+        assertTrue("block 1 should be cached", caching.isInCache("multi.page#1"));
 
         // Verify reads work
         ReadResult r0 = caching.readRange("multi.page", 0, 100, 1024).get();
@@ -730,10 +711,14 @@ public class CachingObjectStorageTest {
             block1[i] = (byte) ((i + 100) & 0xFF);
         }
 
-        // Write block 0 to cache
-        caching.writeBlock("big.page", 0, block0).get();
-        // Block 1 is only in inner
-        inner.data.put("big.page.multipart/1", block1);
+        // Single-object layout: concat the two blocks into one object in inner,
+        // then admit block 0 into the cache via an explicit readRange. Block 1
+        // remains in inner only.
+        byte[] full = new byte[block0.length + block1.length];
+        System.arraycopy(block0, 0, full, 0, block0.length);
+        System.arraycopy(block1, 0, full, block0.length, block1.length);
+        inner.data.put("big.page", full);
+        caching.readRange("big.page", 0, 1, 4096).get().release(); // admit block 0
 
         // Read from cached block 0 (should not call inner)
         int innerReadsBefore = inner.readCalls.get();
@@ -784,7 +769,7 @@ public class CachingObjectStorageTest {
             block[i] = (byte) (i & 0xFF);
         }
         // Write block to inner so a readRange will go to inner on first access.
-        inner.data.put("counters.page.multipart/0", block);
+        inner.data.put("counters.page", block);
 
         // First readRange → cache MISS: missBytes must be incremented by the requested length.
         int readLen = 128;

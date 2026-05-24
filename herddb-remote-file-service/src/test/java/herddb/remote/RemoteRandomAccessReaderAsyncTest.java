@@ -25,7 +25,6 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.fail;
 import herddb.utils.VectorSearchRequestContext;
 import io.netty.util.ResourceLeakDetector;
-import java.io.ByteArrayInputStream;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -104,7 +103,7 @@ public class RemoteRandomAccessReaderAsyncTest {
     @Test
     public void testSingleBlockReadMatchesSync() throws Exception {
         byte[] data = seqBytes(BLOCK_SIZE * 3);
-        client.writeMultipartFile("ts/idx/g1", new ByteArrayInputStream(data), BLOCK_SIZE);
+        client.writeFile("ts/idx/g1", data);
 
         try (RemoteRandomAccessReader reader =
                 new RemoteRandomAccessReader(client, "ts/idx/g1", data.length, BLOCK_SIZE)) {
@@ -126,7 +125,7 @@ public class RemoteRandomAccessReaderAsyncTest {
     @Test
     public void testCrossBlockReadMatchesSync() throws Exception {
         byte[] data = seqBytes(BLOCK_SIZE * 4);
-        client.writeMultipartFile("ts/idx/g2", new ByteArrayInputStream(data), BLOCK_SIZE);
+        client.writeFile("ts/idx/g2", data);
 
         try (RemoteRandomAccessReader reader =
                 new RemoteRandomAccessReader(client, "ts/idx/g2", data.length, BLOCK_SIZE)) {
@@ -148,7 +147,7 @@ public class RemoteRandomAccessReaderAsyncTest {
     @Test
     public void testThreeBlockReadMatchesSync() throws Exception {
         byte[] data = seqBytes(BLOCK_SIZE * 5);
-        client.writeMultipartFile("ts/idx/g3", new ByteArrayInputStream(data), BLOCK_SIZE);
+        client.writeFile("ts/idx/g3", data);
 
         try (RemoteRandomAccessReader reader =
                 new RemoteRandomAccessReader(client, "ts/idx/g3", data.length, BLOCK_SIZE)) {
@@ -171,7 +170,7 @@ public class RemoteRandomAccessReaderAsyncTest {
     public void testReadAtEndOfFileMatchesSync() throws Exception {
         // Use a file that ends mid-block so the last block is smaller than BLOCK_SIZE
         byte[] data = seqBytes(BLOCK_SIZE * 2 + 13);
-        client.writeMultipartFile("ts/idx/g4", new ByteArrayInputStream(data), BLOCK_SIZE);
+        client.writeFile("ts/idx/g4", data);
 
         try (RemoteRandomAccessReader reader =
                 new RemoteRandomAccessReader(client, "ts/idx/g4", data.length, BLOCK_SIZE)) {
@@ -197,7 +196,7 @@ public class RemoteRandomAccessReaderAsyncTest {
     @Test
     public void testReadRangeAsyncDoesNotChangePosition() throws Exception {
         byte[] data = seqBytes(BLOCK_SIZE * 3);
-        client.writeMultipartFile("ts/idx/pos", new ByteArrayInputStream(data), BLOCK_SIZE);
+        client.writeFile("ts/idx/pos", data);
 
         try (RemoteRandomAccessReader reader =
                 new RemoteRandomAccessReader(client, "ts/idx/pos", data.length, BLOCK_SIZE)) {
@@ -216,7 +215,7 @@ public class RemoteRandomAccessReaderAsyncTest {
     @Test
     public void testMultipleAsyncReadsDoNotChangePosition() throws Exception {
         byte[] data = seqBytes(BLOCK_SIZE * 4);
-        client.writeMultipartFile("ts/idx/pos2", new ByteArrayInputStream(data), BLOCK_SIZE);
+        client.writeFile("ts/idx/pos2", data);
 
         try (RemoteRandomAccessReader reader =
                 new RemoteRandomAccessReader(client, "ts/idx/pos2", data.length, BLOCK_SIZE)) {
@@ -252,7 +251,7 @@ public class RemoteRandomAccessReaderAsyncTest {
     public void testConcurrentAsyncAndSyncReads() throws Exception {
         final int numBlocks = 8;
         byte[] data = seqBytes(BLOCK_SIZE * numBlocks);
-        client.writeMultipartFile("ts/idx/conc", new ByteArrayInputStream(data), BLOCK_SIZE);
+        client.writeFile("ts/idx/conc", data);
 
         SegmentBlockCache cache = new SegmentBlockCache(BLOCK_SIZE * 4L);
         AtomicReference<Throwable> syncError = new AtomicReference<>();
@@ -324,7 +323,7 @@ public class RemoteRandomAccessReaderAsyncTest {
     @Test
     public void testAsyncReadHitsBlockCacheAfterSyncFill() throws Exception {
         byte[] data = seqBytes(BLOCK_SIZE * 2);
-        client.writeMultipartFile("ts/idx/cache", new ByteArrayInputStream(data), BLOCK_SIZE);
+        client.writeFile("ts/idx/cache", data);
 
         SegmentBlockCache cache = new SegmentBlockCache(BLOCK_SIZE * 4L);
         try (RemoteRandomAccessReader reader = new RemoteRandomAccessReader(
@@ -348,7 +347,7 @@ public class RemoteRandomAccessReaderAsyncTest {
     @Test
     public void testAsyncReadWithDisabledCacheMatchesSync() throws Exception {
         byte[] data = seqBytes(BLOCK_SIZE * 3);
-        client.writeMultipartFile("ts/idx/nocache", new ByteArrayInputStream(data), BLOCK_SIZE);
+        client.writeFile("ts/idx/nocache", data);
 
         // Disabled cache: pass-through, every read goes to the network
         try (RemoteRandomAccessReader reader = new RemoteRandomAccessReader(
@@ -374,7 +373,7 @@ public class RemoteRandomAccessReaderAsyncTest {
     @Test
     public void testReadRangeAsyncZeroLengthReturnsEmpty() throws Exception {
         byte[] data = seqBytes(BLOCK_SIZE);
-        client.writeMultipartFile("ts/idx/zero", new ByteArrayInputStream(data), BLOCK_SIZE);
+        client.writeFile("ts/idx/zero", data);
 
         try (RemoteRandomAccessReader reader =
                 new RemoteRandomAccessReader(client, "ts/idx/zero", data.length, BLOCK_SIZE)) {
@@ -387,7 +386,7 @@ public class RemoteRandomAccessReaderAsyncTest {
     @Test
     public void testReadRangeAsyncPastEofFails() throws Exception {
         byte[] data = seqBytes(BLOCK_SIZE);
-        client.writeMultipartFile("ts/idx/eof", new ByteArrayInputStream(data), BLOCK_SIZE);
+        client.writeFile("ts/idx/eof", data);
 
         try (RemoteRandomAccessReader reader =
                 new RemoteRandomAccessReader(client, "ts/idx/eof", data.length, BLOCK_SIZE)) {
@@ -415,7 +414,7 @@ public class RemoteRandomAccessReaderAsyncTest {
     @Test
     public void testMultiBlockPartialFailureReleasesAllBuffers() throws Exception {
         byte[] data = seqBytes(BLOCK_SIZE * 2);
-        client.writeMultipartFile("ts/idx/partial", new ByteArrayInputStream(data), BLOCK_SIZE);
+        client.writeFile("ts/idx/partial", data);
 
         // Warm block 0 into the cache using the working server
         SegmentBlockCache cache = new SegmentBlockCache(BLOCK_SIZE * 4L);
@@ -473,7 +472,7 @@ public class RemoteRandomAccessReaderAsyncTest {
     @Test
     public void testMultiBlockUpdatesVectorSearchRequestContextStats() throws Exception {
         byte[] data = seqBytes(BLOCK_SIZE * 3);
-        client.writeMultipartFile("ts/idx/ctxmulti", new ByteArrayInputStream(data), BLOCK_SIZE);
+        client.writeFile("ts/idx/ctxmulti", data);
 
         SegmentBlockCache cache = new SegmentBlockCache(BLOCK_SIZE * 8L);
         try (RemoteRandomAccessReader reader = new RemoteRandomAccessReader(

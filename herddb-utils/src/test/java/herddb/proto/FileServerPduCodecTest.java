@@ -97,28 +97,51 @@ public class FileServerPduCodecTest {
     }
 
     @Test
-    public void writeFileBlockRoundtrip() throws IOException {
-        byte[] payload = "block-bytes".getBytes();
-        ByteBuf buf = PduCodec.WriteFileBlockRequest.write(11L, "p", 3L, payload);
+    public void prefetchFileRangeRoundtrip() throws IOException {
+        ByteBuf buf = PduCodec.PrefetchFileRangeRequest.write(
+                11L, "ts/uuid/multipart/graph", 4096L, 65536, 4 * 1024 * 1024);
         try (Pdu pdu = PduCodec.decodePdu(buf)) {
-            assertEquals(Pdu.TYPE_FS_WRITE_FILE_BLOCK, pdu.type);
-            assertEquals("p", PduCodec.WriteFileBlockRequest.readPath(pdu));
-            assertEquals(3L, PduCodec.WriteFileBlockRequest.readBlockIndex(pdu));
-            ByteBuf content = PduCodec.WriteFileBlockRequest.readContent(pdu);
-            try {
-                assertArrayEquals(payload, readByteArray(content));
-            } finally {
-                content.release();
-            }
+            assertEquals(Pdu.TYPE_FS_PREFETCH_FILE_RANGE, pdu.type);
+            assertTrue(pdu.isRequest());
+            assertEquals(11L, pdu.messageId);
+            assertEquals("ts/uuid/multipart/graph",
+                    PduCodec.PrefetchFileRangeRequest.readPath(pdu));
+            assertEquals(4096L, PduCodec.PrefetchFileRangeRequest.readOffset(pdu));
+            assertEquals(65536, PduCodec.PrefetchFileRangeRequest.readLength(pdu));
+            assertEquals(4 * 1024 * 1024,
+                    PduCodec.PrefetchFileRangeRequest.readBlockSize(pdu));
         }
     }
 
     @Test
-    public void writeFileBlockResponseRoundtrip() throws IOException {
-        ByteBuf buf = PduCodec.WriteFileBlockResponse.write(11L, 4096L);
+    public void prefetchFileRangeResponseOkRoundtrip() throws IOException {
+        ByteBuf buf = PduCodec.PrefetchFileRangeResponse.writeOk(42L);
         try (Pdu pdu = PduCodec.decodePdu(buf)) {
-            assertEquals(Pdu.TYPE_FS_WRITE_FILE_BLOCK, pdu.type);
-            assertEquals(4096L, PduCodec.WriteFileBlockResponse.readWrittenSize(pdu));
+            assertEquals(Pdu.TYPE_FS_PREFETCH_FILE_RANGE, pdu.type);
+            assertTrue(pdu.isResponse());
+            assertEquals(42L, pdu.messageId);
+            assertEquals(PduCodec.PrefetchFileRangeResponse.STATUS_OK,
+                    PduCodec.PrefetchFileRangeResponse.readStatus(pdu));
+        }
+    }
+
+    @Test
+    public void prefetchFileRangeResponseNotFoundRoundtrip() throws IOException {
+        ByteBuf buf = PduCodec.PrefetchFileRangeResponse.writeNotFound(43L);
+        try (Pdu pdu = PduCodec.decodePdu(buf)) {
+            assertEquals(PduCodec.PrefetchFileRangeResponse.STATUS_NOT_FOUND,
+                    PduCodec.PrefetchFileRangeResponse.readStatus(pdu));
+        }
+    }
+
+    @Test
+    public void prefetchFileRangeResponseErrorRoundtrip() throws IOException {
+        ByteBuf buf = PduCodec.PrefetchFileRangeResponse.writeError(44L, "S3 5xx");
+        try (Pdu pdu = PduCodec.decodePdu(buf)) {
+            assertEquals(PduCodec.PrefetchFileRangeResponse.STATUS_ERROR,
+                    PduCodec.PrefetchFileRangeResponse.readStatus(pdu));
+            assertEquals("S3 5xx",
+                    PduCodec.PrefetchFileRangeResponse.readErrorMessage(pdu));
         }
     }
 

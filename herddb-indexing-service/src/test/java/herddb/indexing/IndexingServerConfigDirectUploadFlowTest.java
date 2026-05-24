@@ -241,17 +241,8 @@ public class IndexingServerConfigDirectUploadFlowTest {
         @Override public CompletableFuture<ReadResult> read(String path) {
             return CompletableFuture.completedFuture(ReadResult.notFound());
         }
-        @Override public CompletableFuture<Void> writeBlock(String p, long i, byte[] c) {
-            return CompletableFuture.completedFuture(null);
-        }
         @Override public CompletableFuture<ReadResult> readRange(String p, long o, int l, int b) {
             return CompletableFuture.completedFuture(ReadResult.notFound());
-        }
-        @Override public CompletableFuture<Boolean> deleteLogical(String path) {
-            return CompletableFuture.completedFuture(Boolean.TRUE);
-        }
-        @Override public CompletableFuture<List<String>> listLogical(String prefix) {
-            return CompletableFuture.completedFuture(new ArrayList<>());
         }
         @Override public CompletableFuture<Boolean> delete(String path) {
             return CompletableFuture.completedFuture(Boolean.TRUE);

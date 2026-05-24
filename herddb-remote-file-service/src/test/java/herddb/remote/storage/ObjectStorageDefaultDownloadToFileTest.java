@@ -69,24 +69,8 @@ public class ObjectStorageDefaultDownloadToFileTest {
             }
 
             @Override
-            public CompletableFuture<Void> writeBlock(String path, long blockIndex,
-                    byte[] content) {
-                throw new UnsupportedOperationException();
-            }
-
-            @Override
             public CompletableFuture<ReadResult> readRange(String path, long offset,
                     int length, int blockSize) {
-                throw new UnsupportedOperationException();
-            }
-
-            @Override
-            public CompletableFuture<Boolean> deleteLogical(String path) {
-                throw new UnsupportedOperationException();
-            }
-
-            @Override
-            public CompletableFuture<List<String>> listLogical(String prefix) {
                 throw new UnsupportedOperationException();
             }
 

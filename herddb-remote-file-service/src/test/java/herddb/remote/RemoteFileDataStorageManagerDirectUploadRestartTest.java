@@ -22,11 +22,9 @@ package herddb.remote;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 import herddb.remote.storage.LocalObjectStorage;
-import io.github.jbellis.jvector.disk.RandomAccessReader;
 import io.github.jbellis.jvector.disk.ReaderSupplier;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -203,28 +201,17 @@ public class RemoteFileDataStorageManagerDirectUploadRestartTest {
             assertArrayEquals("download must reconstruct original bytes",
                     payload, Files.readAllBytes(dest));
 
-            // multipartIndexReaderSupplier must return a MappedChunkReader
-            // (the bulk-layout reader supplier), NOT a RemoteRandomAccessReader
-            // backed by the gRPC client.
+            // Single-object layout (issue #650): the supplier is always a
+            // RemoteRandomAccessReader.Supplier backed by the gRPC client —
+            // the bulk-layout-specific MappedChunkReader path was removed
+            // along with the .bulk suffix. The end-to-end read via the
+            // supplier requires a live RemoteFileServer (not available in
+            // this unit test, which uses an empty stub client); that path
+            // is covered by RemoteRandomAccessReaderTest. Here we only pin
+            // that the supplier is non-null and downloads still work.
             ReaderSupplier supplier = dsmB.multipartIndexReaderSupplier(
                     "ts", "uuid-restart-1", "graph", payload.length);
             assertNotNull(supplier);
-            String className = supplier.getClass().getName();
-            assertTrue("supplier must be MappedChunkReader-backed, was "
-                            + className,
-                    className.contains("MappedChunkReader"));
-
-            // The reader must serve the file: read a 4-byte window from
-            // offset 0 and compare against the original payload.
-            try (RandomAccessReader reader = supplier.get()) {
-                reader.seek(0L);
-                byte[] head = new byte[4];
-                reader.readFully(head);
-                byte[] expected = new byte[4];
-                System.arraycopy(payload, 0, expected, 0, 4);
-                assertArrayEquals("first 4 bytes read via supplier must match",
-                        expected, head);
-            }
         } finally {
             dsmB.close();
         }
@@ -282,69 +269,11 @@ public class RemoteFileDataStorageManagerDirectUploadRestartTest {
         }
     }
 
-    /**
-     * Issue #645: an installation that has a mix of legacy per-block
-     * files (written before direct-S3 was enabled) and direct-S3 bulk
-     * files (written after) must route reads correctly after restart.
-     * The bulk probe must answer {@code true} for the direct files and
-     * {@code false} for the legacy ones; the read paths must follow.
-     *
-     * <p>The legacy file is materialised by writing per-block content
-     * directly into the {@link LocalObjectStorage} (mirroring what the
-     * old gRPC write path would have produced); the bulk file is written
-     * via the normal direct-upload API on DSM A.
-     */
-    @Test
-    public void mixedLegacyAndBulkFilesSurviveRestart() throws Exception {
-        // Direct-S3 bulk file via DSM A's normal direct-upload path.
-        byte[] bulkPayload = randomBytes(2048, 7L);
-        Path bulkSrc = writeTempFile("mixed-bulk.bin", bulkPayload);
-        dsmA.writeMultipartIndexFile("ts", "uuid-bulk", "graph", bulkSrc, null);
-
-        // Legacy per-block file: write the blocks directly via the backing
-        // object storage so DSM A's bulk-write path is never invoked for
-        // this logical path. Reuse the storage instance bound to DSM A so
-        // the blocks live in the same directory.
-        byte[] legacyPayload = randomBytes(1024, 9L);
-        String legacyLogical = "ts/uuid-legacy/multipart/graph";
-        objectStorageA.writeBlock(legacyLogical, 0L, legacyPayload).get();
-
-        // Pre-condition: legacy .bulk variant must NOT exist (so the probe
-        // will route to gRPC). For this test we cannot exercise the gRPC
-        // path (no real file server is running) — but we can assert the
-        // probe answers {@code false} correctly, which is the only thing
-        // the routing decision depends on.
-        assertFalse("legacy .bulk object must be absent before restart",
-                objectStorageA.existsObject(legacyLogical + ".bulk").get());
-
-        dsmA.close();
-        dsmA = null;
-
-        RemoteFileDataStorageManager dsmB = spawnRestartDsm();
-        try {
-            // Bulk file: probe must say true and download must succeed.
-            Path bulkOut = tmpFolder.newFile("mixed-bulk-out.bin").toPath();
-            dsmB.downloadMultipartIndexFile("ts", "uuid-bulk", "graph",
-                    bulkPayload.length, bulkOut);
-            assertArrayEquals("bulk file must round-trip",
-                    bulkPayload, Files.readAllBytes(bulkOut));
-
-            // Legacy file: the bulk probe must answer false on the fresh
-            // DSM. We invoke multipartIndexFileExists which is the
-            // lenient-probe entry point — the bulk check returns false,
-            // then the gRPC presence check runs (fast-failing on the
-            // empty stub) and also returns false. The key behaviour we
-            // pin: the bulk probe must NOT incorrectly say true for a
-            // file that only has the legacy layout.
-            boolean legacyVisible = dsmB.multipartIndexFileExists(
-                    "ts", "uuid-legacy", "graph");
-            assertFalse("legacy file must not be reachable as bulk on the fresh DSM"
-                            + " (no gRPC server in this unit test)",
-                    legacyVisible);
-        } finally {
-            dsmB.close();
-        }
-    }
+    // mixedLegacyAndBulkFilesSurviveRestart was removed in issue #650: the
+    // legacy per-block vs .bulk dual-layout distinction the test pinned no
+    // longer exists. Every multipart index file is now stored as one object
+    // at logicalPath (single-object layout), so the routing decision the test
+    // covered is moot.
 
     /**
      * Issue #645: a cold-start restart that immediately reads many files
@@ -378,27 +307,27 @@ public class RemoteFileDataStorageManagerDirectUploadRestartTest {
         try {
             assertEquals("no probes before any read", 0, countingStorage.headCount());
 
-            // First read: 1 HEAD probe.
+            // Single-object layout (issue #650): downloadMultipartIndexFile
+            // streams directly via downloadFileBulk — it does NOT issue a HEAD
+            // probe (the bulk-layout probe cache was removed with the .bulk
+            // suffix). Three back-to-back reads must therefore produce zero
+            // HEAD probes.
             Path out1 = tmpFolder.newFile("cached-out1.bin").toPath();
             dsmB.downloadMultipartIndexFile(
                     "ts", "uuid-cached", "graph", payload.length, out1);
-            assertEquals("first read issues exactly one HEAD",
-                    1, countingStorage.headCount());
-
-            // Second + third reads: must hit the cache, no new HEADs.
             Path out2 = tmpFolder.newFile("cached-out2.bin").toPath();
             dsmB.downloadMultipartIndexFile(
                     "ts", "uuid-cached", "graph", payload.length, out2);
             Path out3 = tmpFolder.newFile("cached-out3.bin").toPath();
             dsmB.downloadMultipartIndexFile(
                     "ts", "uuid-cached", "graph", payload.length, out3);
-            assertEquals("second and third reads must be probe-cache hits",
-                    1, countingStorage.headCount());
+            assertEquals("downloads must not issue HEAD probes",
+                    0, countingStorage.headCount());
 
-            // multipartIndexFileExists on the same logical path must also
-            // be a cache hit.
+            // multipartIndexFileExists DOES issue a HEAD probe (one per call,
+            // no caching with single-object layout).
             assertTrue(dsmB.multipartIndexFileExists("ts", "uuid-cached", "graph"));
-            assertEquals("multipartIndexFileExists must be a cache hit",
+            assertEquals("multipartIndexFileExists issues exactly one HEAD per call",
                     1, countingStorage.headCount());
         } finally {
             dsmB.close();

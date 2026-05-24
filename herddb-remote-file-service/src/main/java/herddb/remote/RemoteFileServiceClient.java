@@ -37,7 +37,6 @@ import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.util.ReferenceCountUtil;
 import io.netty.util.concurrent.FastThreadLocalThread;
 import java.io.IOException;
-import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -877,63 +876,47 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
      * natural backpressure that protects concurrent reads on the shared
      * event-loop pool.
      */
-    public CompletableFuture<Void> writeFileBlockAsync(String path, long blockIndex, byte[] content) {
-        Runnable releaseOnce = reserveInflightWriteBytes(content.length);
-        return writeFileBlockAsyncPreacquired(path, blockIndex, content, releaseOnce);
-    }
+    // writeFileBlock / writeFileBlockAsync were removed in issue #650.
+    // Multipart writes now upload a single S3 object via {@code ObjectStorage.uploadFile}
+    // (zero-copy CRT path). The IS no longer streams blocks through the file server
+    // for multipart writes; gRPC traffic during the write path drops to zero in
+    // direct-S3 mode.
 
     /**
-     * Internal helper used by {@link #writeMultipartFile}: writes one block
-     * using an already-acquired inflight-write reservation.
+     * Issue #650: asks the file server to prefetch a {@code (offset, length, blockSize)}
+     * range into its on-disk cache without returning the bytes to this client.
+     * Routes via the same {@link ConsistentHashRouter} key as
+     * {@link #readFileRangeAsByteBufAsync} so prewarm primes the cache on the
+     * same server that subsequent reads will hit.
      *
-     * <p>The caller acquires the reservation via {@link #reserveInflightWriteBytes}
-     * and tracks the returned {@code releaseOnce} runnable in its own list so that,
-     * when {@code writeMultipartFile} catches an exception, it can immediately
-     * release permits for every block that was dispatched but not yet complete
-     * (issue #575). The runnable is idempotent (backed by {@link
-     * java.util.concurrent.atomic.AtomicBoolean}): calling it again in the
-     * {@code whenComplete} hook of the returned future is a safe no-op.
+     * <p>The future completes with {@code true} when the file-server admitted
+     * the slice into its cache (or it was already resident), and {@code false}
+     * when the underlying object is missing. Transient I/O failures complete
+     * exceptionally — callers MUST treat that as best-effort and continue,
+     * mirroring the existing {@code warmUpSegment} semantics.
      */
-    private CompletableFuture<Void> writeFileBlockAsyncPreacquired(
-            String path, long blockIndex, byte[] content, Runnable releaseOnce) {
+    public CompletableFuture<Boolean> prefetchFileRangeAsync(String path, long offset, int length, int blockSizeArg) {
         ServerChannel ch;
         try {
-            ch = writeChannelForBlock(path, blockIndex);
+            ch = readChannelForBlock(path, offset / blockSizeArg);
         } catch (RuntimeException e) {
-            releaseOnce.run();
             return failed(e);
         }
-        CompletableFuture<Void> result = sendRequest(ch,
-                requestId -> PduCodec.WriteFileBlockRequest.write(requestId, path, blockIndex, content),
+        return sendRequest(ch,
+                requestId -> PduCodec.PrefetchFileRangeRequest.write(requestId, path, offset, length, blockSizeArg),
                 pdu -> {
-                    PduCodec.WriteFileBlockResponse.readWrittenSize(pdu); // ignored
-                    return (Void) null;
+                    byte status = PduCodec.PrefetchFileRangeResponse.readStatus(pdu);
+                    if (status == PduCodec.PrefetchFileRangeResponse.STATUS_OK) {
+                        return Boolean.TRUE;
+                    }
+                    if (status == PduCodec.PrefetchFileRangeResponse.STATUS_NOT_FOUND) {
+                        return Boolean.FALSE;
+                    }
+                    // STATUS_ERROR — surface the server's message so prewarm
+                    // logging can pinpoint the failure.
+                    throw new RuntimeException("prefetchFileRange failed: "
+                            + PduCodec.PrefetchFileRangeResponse.readErrorMessage(pdu));
                 });
-        return result.whenComplete((v, err) -> releaseOnce.run());
-    }
-
-    /**
-     * Writes one block of a multipart file from a ByteBuf. Not retried.
-     * Caller still owns {@code content} and must release after completion.
-     * Acquires/releases the in-flight write-bytes reservation (issue #468)
-     * symmetrically to the {@code byte[]} overload.
-     */
-    public CompletableFuture<Void> writeFileBlockAsync(String path, long blockIndex, ByteBuf content) {
-        Runnable releaseOnce = reserveInflightWriteBytes(content.readableBytes());
-        ServerChannel ch;
-        try {
-            ch = writeChannelForBlock(path, blockIndex);
-        } catch (RuntimeException e) {
-            releaseOnce.run();
-            return failed(e);
-        }
-        CompletableFuture<Void> result = sendRequest(ch,
-                requestId -> PduCodec.WriteFileBlockRequest.write(requestId, path, blockIndex, content),
-                pdu -> {
-                    PduCodec.WriteFileBlockResponse.readWrittenSize(pdu);
-                    return (Void) null;
-                });
-        return result.whenComplete((v, err) -> releaseOnce.run());
     }
 
     public CompletableFuture<byte[]> readFileRangeAsync(String path, long offset, int length, int blockSizeArg) {
@@ -1140,93 +1123,11 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
         return result.whenComplete((buf, err) -> releaseOnce.run());
     }
 
-    /**
-     * Streaming multipart write helper. Reads from {@code in} in
-     * {@code blockSizeArg}-sized blocks and dispatches each as a parallel
-     * {@link #writeFileBlockAsync(String, long, byte[])} call. Returns the
-     * total bytes written.
-     *
-     * <p>Issue #575: each block's inflight-write permit is acquired in this
-     * loop and tracked in {@code blockReleasers}. On any exception the catch
-     * blocks immediately call every tracked releaser so that permits are
-     * returned right away, instead of waiting for the individual block futures
-     * to time out (which can take up to {@code clientTimeoutSeconds} — up to
-     * 30 min by default). Each releaser is idempotent, so a later call from
-     * the {@code whenComplete} hook of a block future is a safe no-op.
-     */
-    public long writeMultipartFile(String path, InputStream in, int blockSizeArg) throws IOException {
-        long total = 0;
-        long blockIndex = 0;
-        List<CompletableFuture<Void>> futures = new ArrayList<>();
-        // Track one releaser per dispatched block so we can return all permits
-        // immediately on failure (issue #575).
-        List<Runnable> blockReleasers = new ArrayList<>();
-        byte[] buf = new byte[blockSizeArg];
-        while (true) {
-            int read = readFully(in, buf, 0, blockSizeArg);
-            if (read <= 0) {
-                break;
-            }
-            byte[] block = new byte[read];
-            System.arraycopy(buf, 0, block, 0, read);
-            // Acquire the reservation here so the caller can release it
-            // immediately on failure (see catch blocks below).
-            Runnable releaseOnce = reserveInflightWriteBytes(block.length);
-            blockReleasers.add(releaseOnce);
-            futures.add(writeFileBlockAsyncPreacquired(path, blockIndex, block, releaseOnce));
-            blockIndex++;
-            total += read;
-            if (read < blockSizeArg) {
-                break;
-            }
-        }
-        try {
-            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            // Release permits for every block that was dispatched but has not
-            // yet completed its network call (issue #575). Releasers already
-            // fired via whenComplete are idempotent no-ops.
-            releaseBlockPermits(blockReleasers);
-            throw new IOException("Interrupted while writing multipart " + path, e);
-        } catch (ExecutionException e) {
-            // Release permits for every still-pending block immediately so the
-            // inflight-write semaphore is not held for the full network timeout
-            // (issue #575). Releasers that already fired via whenComplete are
-            // idempotent no-ops.
-            releaseBlockPermits(blockReleasers);
-            Throwable cause = e.getCause();
-            if (cause instanceof IOException) {
-                throw (IOException) cause;
-            }
-            throw new IOException("multipart write failed for " + path, cause);
-        }
-        return total;
-    }
-
-    /**
-     * Releases the inflight-write permits for all dispatched blocks after a
-     * {@link #writeMultipartFile} failure (issue #575). Each runnable is
-     * idempotent: if a block's {@code whenComplete} already fired and released
-     * its permits, calling the runnable again is a safe no-op.
-     */
-    private static void releaseBlockPermits(List<Runnable> blockReleasers) {
-        for (Runnable r : blockReleasers) {
-            r.run();
-        }
-    }
-
-    private static int readFully(InputStream in, byte[] buf, int off, int len) throws IOException {
-        int total = 0;
-        while (total < len) {
-            int read = in.read(buf, off + total, len - total);
-            if (read < 0) {
-                break;
-            }
-            total += read;
-        }
-        return total;
-    }
+    // writeMultipartFile (the streaming gRPC multipart write helper) was
+    // removed in issue #650. Multipart writes now go through
+    // {@code ObjectStorage.uploadFile} (S3 Multipart Upload via the CRT
+    // S3TransferManager) — one single S3 object per logical file, no
+    // file-server round-trip on the write path.
 
     public CompletableFuture<Integer> deleteByPrefixAsync(String prefix) {
         // Issue #551 forensics: log every prefix-delete request. Prefix
@@ -1385,16 +1286,13 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
         return getUnchecked(deleteByPrefixAsync(prefix));
     }
 
-    public void writeFileBlock(String path, long blockIndex, byte[] content) {
-        getUnchecked(writeFileBlockAsync(path, blockIndex, content));
-    }
-
     public void writeFile(String path, ByteBuf content) {
         getUnchecked(writeFileAsync(path, content));
     }
 
-    public void writeFileBlock(String path, long blockIndex, ByteBuf content) {
-        getUnchecked(writeFileBlockAsync(path, blockIndex, content));
+    /** Sync variant of {@link #prefetchFileRangeAsync}. */
+    public boolean prefetchFileRange(String path, long offset, int length, int blockSizeArg) {
+        return getUnchecked(prefetchFileRangeAsync(path, offset, length, blockSizeArg));
     }
 
     public ByteBuf readFileAsByteBuf(String path) {

@@ -891,6 +891,38 @@ public class PersistentVectorStore extends AbstractVectorStore {
     final AtomicLong warmedSegmentsBulkPrefetchOnly = new AtomicLong();
 
     // -------------------------------------------------------------------------
+    // File-server cache prewarm (issue #650)
+    // -------------------------------------------------------------------------
+
+    /**
+     * When {@code true}, the file-server's on-disk cache is pre-populated for
+     * every block of newly-written segments via the
+     * {@code prefetchFileRange} RPC, before the segment is published into the
+     * searchable {@link #segments} list. Default {@code true}. Set via
+     * {@link #setPrewarmFileServer(boolean)} from
+     * {@code IndexingServiceEngine}'s
+     * {@code indexing.vector.segment.prewarmFileServer} configuration key.
+     */
+    private volatile boolean prewarmFileServerEnabled = true;
+
+    /**
+     * Maximum number of concurrent {@code prefetchFileRange} RPCs in flight
+     * per prewarm call. Higher values reduce wall-clock prewarm latency at
+     * the cost of more concurrent S3 round-trips from the file-server.
+     * Default 8. Set via {@link #setPrewarmFileServerParallelism(int)} from
+     * {@code indexing.vector.segment.prewarmParallelism}.
+     */
+    private volatile int prewarmFileServerParallelism = 8;
+
+    /**
+     * Counter: total number of segments prewarmed by this store since start
+     * (issue #650). One increment per successful prewarm call —
+     * complements {@link #warmedSegmentsTotal} (which counts IS-side BFS
+     * warmups). Exposed for tests and Prometheus dashboards.
+     */
+    final AtomicLong prewarmedSegmentsTotal = new AtomicLong();
+
+    // -------------------------------------------------------------------------
     // PQ codebook cache (issue #281)
     // -------------------------------------------------------------------------
 
@@ -6059,18 +6091,50 @@ public class PersistentVectorStore extends AbstractVectorStore {
      * freshly-built segments BEFORE the segments are published into the
      * searchable {@link #segments} list.
      *
-     * <p>No-op when warmup is disabled ({@code warmupBytesPerSegment <= 0}).
-     * Best-effort: per-segment I/O errors are swallowed inside
-     * {@link #warmUpSegment} / {@link #warmUpSegmentBfs} and never abort the
+     * <p>Two phases (issue #650):
+     * <ol>
+     *   <li><b>File-server prewarm</b> — for each new segment, issue
+     *       {@code prefetchFileRange} RPCs covering every block of the
+     *       segment's graph file so the file-server's local disk cache holds
+     *       every block before the segment becomes searchable. Best-effort:
+     *       per-block failures degrade to a cold first query, never break
+     *       correctness. Gated by {@link #prewarmFileServerEnabled}.</li>
+     *   <li><b>IS-side BFS warmup</b> — the original issue #569 path:
+     *       walk the HNSW entry-frontier on Layer 0 to warm the IS's
+     *       {@link herddb.remote.SegmentBlockCache}. Gated by
+     *       {@link #warmupBytesPerSegment} {@code > 0}.</li>
+     * </ol>
+     *
+     * <p>Best-effort: per-segment I/O errors are swallowed inside
+     * {@link #warmUpSegment} / {@link #warmUpSegmentBfs} /
+     * {@link #prewarmFileServerForSegment} and never abort the
      * checkpoint or compaction.
      */
     private void warmUpNewSegmentsBeforePublish(List<VectorSegment> newSegments,
                                                 String context) {
-        long budget = this.warmupBytesPerSegment;
-        if (budget <= 0 || newSegments == null || newSegments.isEmpty()) {
+        if (newSegments == null || newSegments.isEmpty()) {
             return;
         }
         long startMs = System.currentTimeMillis();
+        // Phase 1: file-server prewarm. Pre-populates the file-server's
+        // ~200 GiB local disk cache (per replica) with every block of every
+        // new segment so the first query reads are all cache hits.
+        if (prewarmFileServerEnabled) {
+            int prewarmed = 0;
+            for (VectorSegment seg : newSegments) {
+                if (prewarmFileServerForSegment(seg)) {
+                    prewarmed++;
+                }
+            }
+            if (prewarmed > 0) {
+                prewarmedSegmentsTotal.addAndGet(prewarmed);
+            }
+        }
+        // Phase 2: IS-side BFS warmup of the SegmentBlockCache (issue #569).
+        long budget = this.warmupBytesPerSegment;
+        if (budget <= 0) {
+            return;
+        }
         int warmed = 0;
         long totalNodes = 0;
         for (VectorSegment seg : newSegments) {
@@ -6087,6 +6151,82 @@ public class PersistentVectorStore extends AbstractVectorStore {
                     new Object[]{indexName, warmed, context, totalNodes,
                             System.currentTimeMillis() - startMs});
         }
+    }
+
+    /**
+     * Issue #650: pre-warms the file-server's on-disk cache for every block
+     * of {@code seg}'s graph file via the
+     * {@code prefetchFileRange} RPC. Each prefetch lands on the file-server
+     * replica chosen by the {@link herddb.remote.ConsistentHashRouter} for
+     * that block index, so subsequent {@code readFileRange} requests for
+     * the same block always hit the cache on the same replica.
+     *
+     * <p>Best-effort: per-block failures are logged at WARNING inside the
+     * storage layer and do not abort the call. Returns {@code true} when
+     * the prewarm dispatched at least one prefetch (i.e. the segment had a
+     * non-zero graph file and the data-storage manager supports prewarm);
+     * {@code false} for zero-byte segments or storage backends without a
+     * file-server cache (the default {@code DataStorageManager.prewarmMultipartIndexFile}
+     * is a no-op).
+     */
+    boolean prewarmFileServerForSegment(VectorSegment seg) {
+        if (seg == null || seg.graphFileSize <= 0L) {
+            return false;
+        }
+        String segUuid = segmentStorageKey(seg);
+        int parallelism = Math.max(1, this.prewarmFileServerParallelism);
+        // 4 MiB cache-block granularity — matches RemoteFileDataStorageManager's
+        // MULTIPART_BLOCK_SIZE / file-server CachingObjectStorage block-key
+        // alignment. A larger value would mean fewer-but-larger prefetch RPCs;
+        // smaller would mean more round-trips. 4 MiB is the existing pipeline
+        // sweet spot.
+        final int blockSize = 4 * 1024 * 1024;
+        try {
+            dataStorageManager.prewarmMultipartIndexFile(
+                    tableSpaceUUID, segUuid, "graph",
+                    seg.graphFileSize, blockSize, parallelism);
+            return true;
+        } catch (DataStorageManagerException e) {
+            // Best-effort prewarm: a failure here just means the first query
+            // reads will miss the cache. Log and continue — never abort the
+            // publish path.
+            LOGGER.log(Level.WARNING,
+                    "prewarmFileServerForSegment {0}: prewarm failed for segment {1} "
+                            + "(best-effort, queries will warm on demand): {2}",
+                    new Object[]{indexName, seg.segmentId, e.toString()});
+            return false;
+        } catch (RuntimeException e) {
+            // Broad RuntimeException catch is required because the file-server
+            // client surfaces transport-level failures as unchecked exceptions
+            // (timeouts, no-server-available, etc.). Per the same best-effort
+            // contract, log and continue.
+            LOGGER.log(Level.WARNING,
+                    "prewarmFileServerForSegment {0}: transport error for segment {1} "
+                            + "(best-effort, queries will warm on demand): {2}",
+                    new Object[]{indexName, seg.segmentId, e.toString()});
+            return false;
+        }
+    }
+
+    /**
+     * Configures whether {@link #warmUpNewSegmentsBeforePublish} issues
+     * {@code prefetchFileRange} RPCs to pre-populate the file-server's cache
+     * for newly-written segments. See {@link #prewarmFileServerEnabled}.
+     */
+    public void setPrewarmFileServer(boolean enabled) {
+        this.prewarmFileServerEnabled = enabled;
+    }
+
+    /**
+     * Configures the maximum number of concurrent prewarm RPCs per call.
+     * See {@link #prewarmFileServerParallelism}.
+     */
+    public void setPrewarmFileServerParallelism(int parallelism) {
+        if (parallelism <= 0) {
+            throw new IllegalArgumentException(
+                    "prewarmFileServerParallelism must be > 0, got " + parallelism);
+        }
+        this.prewarmFileServerParallelism = parallelism;
     }
 
     /**

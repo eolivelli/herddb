@@ -215,27 +215,13 @@ public class LocalObjectStorage implements ObjectStorage {
     }
 
     @Override
-    public CompletableFuture<Void> writeBlock(String path, long blockIndex, byte[] content) {
-        String blockPath = path + ObjectStorage.MULTIPART_SUFFIX + "/" + blockIndex;
-        Path target = resolvePath(blockPath);
-        Path parentDir = target.getParent();
-        CompletableFuture<Void> result = new CompletableFuture<>();
-        knownDirectories.get(parentDir).thenAccept(v -> {
-            doWriteFile(blockPath, target, content, result);
-        }).exceptionally(t -> {
-            LOGGER.log(Level.SEVERE, "writeBlock failed to create directory for path " + blockPath, t);
-            result.completeExceptionally(t);
-            return null;
-        });
-        return result;
-    }
-
-    @Override
     public CompletableFuture<ReadResult> readRange(String path, long offset, int length, int blockSize) {
-        long blockIndex = offset / blockSize;
-        int offsetInBlock = (int) (offset % blockSize);
-        String blockPath = path + ObjectStorage.MULTIPART_SUFFIX + "/" + blockIndex;
-        Path target = resolvePath(blockPath);
+        // Single-object layout (issue #650): offset is an absolute byte
+        // coordinate within the one file at {@code path}. The {@code blockSize}
+        // hint is unused at this layer — it only matters to caching backends
+        // that align cache slices to block boundaries; raw file reads honour
+        // the (offset, length) pair directly.
+        Path target = resolvePath(path);
         if (diskReadRequests != null) {
             diskReadRequests.inc();
         }
@@ -248,7 +234,7 @@ public class LocalObjectStorage implements ObjectStorage {
 
             // Get file size from the open channel (cheaper than separate stat syscall)
             long fileSize = channel.size();
-            int available = (int) (fileSize - offsetInBlock);
+            long available = fileSize - offset;
             if (available <= 0) {
                 try {
                     channel.close();
@@ -259,11 +245,11 @@ public class LocalObjectStorage implements ObjectStorage {
                 }
                 return CompletableFuture.completedFuture(ReadResult.notFound());
             }
-            int toRead = Math.min(length, available);
+            int toRead = (int) Math.min((long) length, available);
             // Allocate direct pooled ByteBuf for zero-copy efficient I/O
             ByteBuf byteBuf = PooledByteBufAllocator.DEFAULT.directBuffer(toRead);
             ByteBuffer nioBuffer = byteBuf.nioBuffer(0, toRead);
-            channel.read(nioBuffer, offsetInBlock, null, new CompletionHandler<Integer, Void>() {
+            channel.read(nioBuffer, offset, null, new CompletionHandler<Integer, Void>() {
                 @Override
                 public void completed(Integer bytesRead, Void attachment) {
                     try {
@@ -310,70 +296,6 @@ public class LocalObjectStorage implements ObjectStorage {
             result.completeExceptionally(t);
         }
         return result;
-    }
-
-    @Override
-    public CompletableFuture<Boolean> deleteLogical(String path) {
-        return CompletableFuture.supplyAsync(() -> {
-            Path multipartDir = resolvePath(path + ObjectStorage.MULTIPART_SUFFIX);
-            if (Files.isDirectory(multipartDir)) {
-                try {
-                    deleteRecursive(multipartDir);
-                    return true;
-                } catch (IOException e) {
-                    throw new RuntimeException(e);
-                }
-            }
-            try {
-                return Files.deleteIfExists(resolvePath(path));
-            } catch (IOException e) {
-                throw new RuntimeException(e);
-            }
-        }, metadataExecutor);
-    }
-
-    private void deleteRecursive(Path dir) throws IOException {
-        Files.walk(dir)
-                .sorted((a, b) -> -a.compareTo(b))
-                .forEach(p -> {
-                    try {
-                        Files.deleteIfExists(p);
-                    } catch (IOException e) {
-                        throw new RuntimeException(e);
-                    }
-                });
-    }
-
-    @Override
-    public CompletableFuture<List<String>> listLogical(String prefix) {
-        return CompletableFuture.supplyAsync(() -> {
-            java.util.LinkedHashSet<String> logical = new java.util.LinkedHashSet<>();
-            try {
-                if (!Files.exists(baseDirectory)) {
-                    return new ArrayList<>(logical);
-                }
-                Files.walk(baseDirectory)
-                        .filter(p -> Files.isRegularFile(p) || Files.isDirectory(p))
-                        .forEach(p -> {
-                            String relative = baseDirectory.relativize(p).toString().replace('\\', '/');
-                            // Convert multipart block entries to logical paths
-                            int mpIdx = relative.indexOf(ObjectStorage.MULTIPART_SUFFIX + "/");
-                            if (mpIdx >= 0) {
-                                String logicalPath = relative.substring(0, mpIdx);
-                                if (logicalPath.startsWith(prefix)) {
-                                    logical.add(logicalPath);
-                                }
-                            } else if (Files.isRegularFile(p) && !relative.endsWith(ObjectStorage.MULTIPART_SUFFIX)) {
-                                if (relative.startsWith(prefix)) {
-                                    logical.add(relative);
-                                }
-                            }
-                        });
-            } catch (IOException e) {
-                throw new RuntimeException(e);
-            }
-            return new ArrayList<>(logical);
-        }, metadataExecutor);
     }
 
     @Override

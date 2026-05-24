@@ -135,15 +135,18 @@ public class RemoteFileDataStorageManagerDirectUploadTest {
         assertEquals("logical path must match the per-block path convention",
                 "ts/uuid-1/multipart/graph", logicalPath);
 
-        // The single .bulk key must be the only S3 object that was created.
+        // Single-object layout (issue #650): the upload lands at logicalPath
+        // — no .bulk suffix, no .multipart/{N} per-block keys.
         assertEquals("exactly one upload expected",
                 1, objectStorage.uploadCount.get());
-        assertTrue("bulk key must be present",
-                objectStorage.objects.containsKey("ts/uuid-1/multipart/graph.bulk"));
+        assertTrue("logical-path key must be present",
+                objectStorage.objects.containsKey("ts/uuid-1/multipart/graph"));
+        assertFalse("no .bulk key must be written",
+                objectStorage.objects.keySet().stream().anyMatch(k -> k.endsWith(".bulk")));
         assertFalse("no per-block keys must be written",
                 objectStorage.objects.keySet().stream().anyMatch(k -> k.contains(".multipart/")));
         assertArrayEquals("uploaded bytes must match source",
-                payload, objectStorage.objects.get("ts/uuid-1/multipart/graph.bulk"));
+                payload, objectStorage.objects.get("ts/uuid-1/multipart/graph"));
     }
 
     /**
@@ -206,28 +209,31 @@ public class RemoteFileDataStorageManagerDirectUploadTest {
                 dsm.writeMultipartIndexFile("ts", "uuid-fail", "graph", tempFile, null));
         assertNotNull(ioe.getMessage());
 
-        assertTrue("cleanup delete on .bulk must have been invoked",
-                objectStorage.deletedKeys.contains("ts/uuid-fail/multipart/graph.bulk"));
+        // Single-object layout (issue #650): on upload failure the DSM no
+        // longer issues a best-effort cleanup delete on the logical key —
+        // the S3 Multipart Upload's abort step handles part cleanup, and a
+        // failed PUT leaves no object behind. The only invariant the test
+        // pins now is permit release.
         assertEquals("permits must be released back to full after the failure",
                 capacity, dsm.availableDirectInflightUploadBytes());
     }
 
     /**
-     * After a direct upload, {@code multipartIndexFileExists} returns true
-     * without issuing any further round-trip because the layout-probe cache
-     * was populated by the upload itself.
+     * After a direct upload, {@code multipartIndexFileExists} must return true.
+     * Single-object layout (issue #650): the now-removed layout-probe cache is
+     * gone — every probe issues exactly one HEAD against the direct backend.
      */
     @Test
-    public void multipartIndexFileExistsHitsBulkLayoutCacheAfterUpload() throws Exception {
+    public void multipartIndexFileExistsAfterUpload() throws Exception {
         dsm.enableDirectUpload(16L * 1024 * 1024);
         Path tempFile = writeTempFile("exists.bin", new byte[50]);
         dsm.writeMultipartIndexFile("ts", "uuid-exists", "graph", tempFile, null);
 
         long beforeProbes = objectStorage.existsCount.get();
-        assertTrue("file must exist via the bulk cache",
+        assertTrue("file must exist after upload",
                 dsm.multipartIndexFileExists("ts", "uuid-exists", "graph"));
-        assertEquals("no HEAD probe should have been issued — cache must be primed",
-                beforeProbes, objectStorage.existsCount.get());
+        assertEquals("exactly one HEAD probe per call",
+                beforeProbes + 1, objectStorage.existsCount.get());
     }
 
     /**
@@ -259,24 +265,28 @@ public class RemoteFileDataStorageManagerDirectUploadTest {
     }
 
     /**
-     * {@code deleteMultipartIndexFile} must delete the bulk key, drop the
-     * probe-cache entry, and remove any cached local file.
+     * Single-object layout (issue #650): {@code deleteMultipartIndexFile}
+     * dispatches the delete via the file-server gRPC client (not the direct
+     * object storage), so the file-server's caching tier also invalidates.
+     * This unit test runs against an empty stub client, so we only verify
+     * that delete() does not throw and that subsequent existence probes go
+     * out to the storage (no probe-cache to short-circuit them).
      */
     @Test
-    public void deleteRemovesBulkObjectAndClearsCaches() throws Exception {
+    public void deleteIsIdempotentAndProbeIsRequeried() throws Exception {
         dsm.enableDirectUpload(16L * 1024 * 1024);
         Path src = writeTempFile("del.bin", new byte[256]);
         dsm.writeMultipartIndexFile("ts", "uuid-del", "graph", src, null);
         assertTrue(dsm.multipartIndexFileExists("ts", "uuid-del", "graph"));
 
+        // delete() must not throw — the gRPC client has no server but
+        // RuntimeExceptions are logged and swallowed by the DSM.
         dsm.deleteMultipartIndexFile("ts", "uuid-del", "graph");
+        dsm.deleteMultipartIndexFile("ts", "uuid-del", "graph"); // idempotent
 
-        assertTrue("bulk object must be deleted",
-                objectStorage.deletedKeys.contains("ts/uuid-del/multipart/graph.bulk"));
-        // Prime a fresh probe: existsObject must be queried again because the
-        // cache entry was dropped. Set an explicit "absent" response and
-        // verify the result.
-        objectStorage.objects.remove("ts/uuid-del/multipart/graph.bulk");
+        // The single-object layout has no probe-cache; manually remove the
+        // backing object and verify a fresh probe re-queries the storage.
+        objectStorage.objects.remove("ts/uuid-del/multipart/graph");
         long beforeProbes = objectStorage.existsCount.get();
         assertFalse(dsm.multipartIndexFileExists("ts", "uuid-del", "graph"));
         assertTrue("probe must re-query the storage after delete",
@@ -322,82 +332,11 @@ public class RemoteFileDataStorageManagerDirectUploadTest {
         assertEquals(newCap, dsm.maxDirectInflightUploadBytes());
     }
 
-    /**
-     * Simulates a write/probe race that, before the fix in issue #638, could
-     * permanently pin a logical path as "not bulk" in the cache:
-     *
-     * <ol>
-     *   <li>Writer removes the cache entry (start of writeMultipartIndexFile).</li>
-     *   <li>Concurrent probe fires {@code isBulkLayout()} — the bulk object is not
-     *       yet present, so it gets {@code false} from the storage.</li>
-     *   <li>Writer's upload completes and puts {@code true} into the cache.</li>
-     *   <li>Probe must NOT have overwritten the {@code true} with a stale
-     *       {@code false}.</li>
-     * </ol>
-     *
-     * <p>After the fix, {@code isBulkLayout()} only caches positive results: a
-     * {@code false} probe is returned without touching the cache. So even if a
-     * probe sees a transient {@code false} during an upload, the post-upload
-     * {@code true} that the writer places into the cache is never overwritten.
-     * The next probe hits the cache and correctly returns {@code true}.
-     */
-    @Test
-    public void cacheRaceWriteThenProbeDoesNotPinNegativeResult() throws Exception {
-        dsm.enableDirectUpload(16L * 1024 * 1024);
-        String tableSpace = "ts";
-        String uuid = "race-probe";
-        String fileType = "graph";
-        String logicalPath = tableSpace + "/" + uuid + "/multipart/" + fileType;
-        String bulkKey = logicalPath + ".bulk";
-
-        byte[] payload = new byte[128];
-        Path tempFile = writeTempFile("race.bin", payload);
-
-        // Step 1: Simulate a probe that fires BEFORE the upload and returns false
-        // (the .bulk object does not exist yet). Because isBulkLayout only caches
-        // positives, this false result must not be cached.
-        assertFalse("pre-upload probe must return false (object absent)",
-                objectStorage.existsObject(bulkKey).get());
-        // Manually simulate what isBulkLayout does: it checked storage and got
-        // false, then returned without caching. We assert no positive entry exists.
-        assertFalse("no positive cache entry must be present before write",
-                objectStorage.objects.containsKey(bulkKey));
-
-        // Step 2: Writer uploads the file (caches the positive result).
-        dsm.writeMultipartIndexFile(tableSpace, uuid, fileType, tempFile, null);
-        assertTrue("bulk object must exist after upload",
-                objectStorage.objects.containsKey(bulkKey));
-
-        // Step 3: The probe-then-write race. We verify that the upload's put(TRUE)
-        // is not overwritten by a stale probe: call multipartIndexFileExists which
-        // goes through isBulkLayout() and must return true WITHOUT issuing a new
-        // HEAD (the cache was set to true by the write, and only positives are cached).
-        long probesBefore = objectStorage.existsCount.get();
-        assertTrue("post-upload probe must return true via cache (no HEAD round-trip)",
-                dsm.multipartIndexFileExists(tableSpace, uuid, fileType));
-        assertEquals("cache must be hit — no new existsObject call",
-                probesBefore, objectStorage.existsCount.get());
-
-        // Step 4: Simulate a stale false probe arriving AFTER the write completes.
-        // In the buggy version this would call bulkLayoutCache.put(logicalPath, false)
-        // and overwrite the TRUE. In the fixed version, false probes are not cached,
-        // so the TRUE remains. We emulate this by removing the object from storage
-        // (so the next real probe would return false) but the cache still returns true.
-        objectStorage.objects.remove(bulkKey);
-        // A fresh isBulkLayout call (via multipartIndexFileExists) should still return
-        // true from cache — it must NOT re-probe the storage.
-        probesBefore = objectStorage.existsCount.get();
-        assertTrue("cached true must survive object removal (cache hit)",
-                dsm.multipartIndexFileExists(tableSpace, uuid, fileType));
-        assertEquals("cache must be hit — still no new existsObject call",
-                probesBefore, objectStorage.existsCount.get());
-
-        // Step 5: After deleteMultipartIndexFile clears the cache, a fresh probe
-        // returns false (object was removed in step 4).
-        dsm.deleteMultipartIndexFile(tableSpace, uuid, fileType);
-        assertFalse("after cache clear and object removal, probe must return false",
-                dsm.multipartIndexFileExists(tableSpace, uuid, fileType));
-    }
+    // cacheRaceWriteThenProbeDoesNotPinNegativeResult was removed in issue #650:
+    // the layout-probe cache it pinned (bulkLayoutCache + positive-only caching)
+    // no longer exists. With single-object layout the probe issues a HEAD against
+    // the single object at logicalPath on every call — there is no negative cache
+    // entry that could be incorrectly pinned.
 
     /**
      * {@code disableDirectUpload} flips support off and zeros the gauges.
@@ -509,23 +448,8 @@ public class RemoteFileDataStorageManagerDirectUploadTest {
         }
 
         @Override
-        public CompletableFuture<Void> writeBlock(String path, long blockIndex, byte[] content) {
-            throw new UnsupportedOperationException("writeBlock must not be called on direct-upload path");
-        }
-
-        @Override
         public CompletableFuture<ReadResult> readRange(String path, long offset, int length, int blockSize) {
             throw new UnsupportedOperationException("readRange must not be called on direct-upload path");
-        }
-
-        @Override
-        public CompletableFuture<Boolean> deleteLogical(String path) {
-            throw new UnsupportedOperationException("deleteLogical not used in this test");
-        }
-
-        @Override
-        public CompletableFuture<List<String>> listLogical(String prefix) {
-            return CompletableFuture.completedFuture(new ArrayList<>(objects.keySet()));
         }
 
         @Override

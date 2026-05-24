@@ -226,6 +226,34 @@ public final class IndexingServerConfiguration {
     public static final boolean PROPERTY_VECTOR_SEGMENT_CACHE_WARMUP_ASYNC_DEFAULT = true;
 
     /**
+     * Issue #650: when {@code true} (the default) the post-write pre-publish
+     * step issues {@code prefetchFileRange} RPCs to the file-server for
+     * every block of each new segment's graph file, so the file-server's
+     * disk cache holds every block before the segment becomes searchable.
+     * This is what makes "no cache misses after checkpoint and compaction"
+     * hold in steady state, provided the file-server's
+     * {@code fileServer.s3.cacheMaxBytes} is sized for the working set.
+     *
+     * <p>Set to {@code false} to disable the prewarm entirely — useful for
+     * deployments that prefer eventual cache fill via query traffic, or in
+     * dev/test setups without a file-server.
+     */
+    public static final String PROPERTY_VECTOR_SEGMENT_PREWARM_FILE_SERVER =
+            "indexing.vector.segment.prewarmFileServer";
+    public static final boolean PROPERTY_VECTOR_SEGMENT_PREWARM_FILE_SERVER_DEFAULT = true;
+
+    /**
+     * Issue #650: maximum number of concurrent {@code prefetchFileRange}
+     * RPCs in flight per prewarm call. Higher values reduce wall-clock
+     * prewarm latency at the cost of more concurrent S3 round-trips from
+     * the file-server. Default 8 — a sweet spot for typical 4 MiB
+     * cache-blocks over a CRT HTTP/2 connection pool.
+     */
+    public static final String PROPERTY_VECTOR_SEGMENT_PREWARM_PARALLELISM =
+            "indexing.vector.segment.prewarmParallelism";
+    public static final int PROPERTY_VECTOR_SEGMENT_PREWARM_PARALLELISM_DEFAULT = 8;
+
+    /**
      * Byte budget for the frontier (pinned) region of the
      * {@link herddb.remote.SegmentBlockCache} (issue #578).
      *

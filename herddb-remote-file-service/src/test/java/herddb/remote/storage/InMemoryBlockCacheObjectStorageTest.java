@@ -160,7 +160,11 @@ public class InMemoryBlockCacheObjectStorageTest {
             }
 
             byte[] updated = makeBlock(99, BLOCK_SIZE);
-            cache.writeBlock("path/c", 0, updated).get();
+            // Single-object layout: write() invalidates ALL cached blocks for this path,
+            // and the inner storage is re-seeded explicitly so the next readRange returns
+            // the updated bytes.
+            cache.write("path/c", new byte[]{0}).get();
+            inner.putBlock("path/c", 0, updated);
 
             ReadResult r = cache.readRange("path/c", 0, 16, BLOCK_SIZE).get();
             try {
@@ -212,7 +216,7 @@ public class InMemoryBlockCacheObjectStorageTest {
             ReadResult r3 = cache.readRange("path/other", 0, 16, BLOCK_SIZE).get();
             r3.release();
 
-            cache.deleteLogical("path/e").get();
+            cache.delete("path/e").get();
 
             // Unrelated path stays cached.
             int before = inner.readRangeCalls.get();
@@ -375,23 +379,25 @@ public class InMemoryBlockCacheObjectStorageTest {
         }
 
         private static String key(String path, long blockIndex) {
-            return path + ObjectStorage.MULTIPART_SUFFIX + "/" + blockIndex;
+            // Per-block synthetic key (NOT exposed to the cache). The cache addresses
+            // the storage by (path, offset, length) only; readRange below maps the
+            // requested offset back to a (path, blockIndex) seed.
+            return path + "@@" + blockIndex;
         }
 
         @Override
         public CompletableFuture<Void> write(String path, byte[] content) {
+            // Mimic a logical "clear" by dropping every block of this path. The
+            // cache fires an invalidate on write(), so the storage doesn't need
+            // to retain anything.
+            String prefix = path + "@@";
+            blocks.keySet().removeIf(k -> k.startsWith(prefix));
             return CompletableFuture.completedFuture(null);
         }
 
         @Override
         public CompletableFuture<ReadResult> read(String path) {
             return CompletableFuture.completedFuture(ReadResult.notFound());
-        }
-
-        @Override
-        public CompletableFuture<Void> writeBlock(String path, long blockIndex, byte[] content) {
-            blocks.put(key(path, blockIndex), content);
-            return CompletableFuture.completedFuture(null);
         }
 
         @Override
@@ -433,26 +439,17 @@ public class InMemoryBlockCacheObjectStorageTest {
         }
 
         @Override
-        public CompletableFuture<Boolean> deleteLogical(String path) {
-            String prefix = path + ObjectStorage.MULTIPART_SUFFIX + "/";
+        public CompletableFuture<Boolean> delete(String path) {
+            // Drop all blocks of this path.
+            String prefix = path + "@@";
             List<String> toDrop = new ArrayList<>();
             for (String k : blocks.keySet()) {
-                if (k.startsWith(prefix)) {
+                if (k.startsWith(prefix) || k.equals(path)) {
                     toDrop.add(k);
                 }
             }
             toDrop.forEach(blocks::remove);
             return CompletableFuture.completedFuture(!toDrop.isEmpty());
-        }
-
-        @Override
-        public CompletableFuture<List<String>> listLogical(String prefix) {
-            return CompletableFuture.completedFuture(new ArrayList<>());
-        }
-
-        @Override
-        public CompletableFuture<Boolean> delete(String path) {
-            return CompletableFuture.completedFuture(blocks.remove(path) != null);
         }
 
         @Override
@@ -464,19 +461,17 @@ public class InMemoryBlockCacheObjectStorageTest {
         public CompletableFuture<Integer> deleteByPrefix(String prefix) {
             List<String> toDrop = new ArrayList<>();
             for (String k : blocks.keySet()) {
-                // Keys are stored as "<path>.multipart/<idx>"; match the logical prefix.
-                int mp = k.indexOf(ObjectStorage.MULTIPART_SUFFIX + "/");
-                String logical = mp >= 0 ? k.substring(0, mp) : k;
+                int sep = k.indexOf("@@");
+                String logical = sep >= 0 ? k.substring(0, sep) : k;
                 if (logical.startsWith(prefix)) {
                     toDrop.add(k);
                 }
             }
             toDrop.forEach(blocks::remove);
-            // Distinct logical paths removed.
             int distinct = (int) toDrop.stream()
                     .map(k -> {
-                        int mp = k.indexOf(ObjectStorage.MULTIPART_SUFFIX + "/");
-                        return mp >= 0 ? k.substring(0, mp) : k;
+                        int sep = k.indexOf("@@");
+                        return sep >= 0 ? k.substring(0, sep) : k;
                     }).distinct().count();
             return CompletableFuture.completedFuture(distinct);
         }
